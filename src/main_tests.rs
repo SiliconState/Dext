@@ -11660,15 +11660,15 @@ fn read_image_wire_contracts_are_current_turn_only_and_sessions_are_path_only() 
         },
     ];
 
-    let anthropic =
-        anthropic_wire_messages(&agent.history, false, &disclosure_target).expect("Anthropic wire");
+    let anthropic = anthropic_wire_messages(&agent.history, false, &disclosure_target, None)
+        .expect("Anthropic wire");
     assert_eq!(anthropic[1]["content"][0]["type"], "text");
     assert_eq!(anthropic[3]["content"][0]["type"], "image");
     assert_eq!(
         anthropic[3]["content"][0]["source"]["media_type"],
         "image/jpeg"
     );
-    let cached = anthropic_wire_messages(&agent.history, true, &disclosure_target)
+    let cached = anthropic_wire_messages(&agent.history, true, &disclosure_target, None)
         .expect("Anthropic cached wire");
     assert!(
         cached
@@ -11678,8 +11678,37 @@ fn read_image_wire_contracts_are_current_turn_only_and_sessions_are_path_only() 
             .all(|block| block.get("cache_control").is_none())
     );
 
+    let mut later_history = agent.history.clone();
+    later_history.push(Message {
+        role: "assistant".to_string(),
+        content: vec![Block::Text {
+            text: "follow-up response".to_string(),
+        }],
+    });
+    later_history.push(Message {
+        role: "user".to_string(),
+        content: vec![tool_result_block("later-call", "follow-up result", None)],
+    });
+    let later_cached =
+        anthropic_wire_messages(&later_history, true, &disclosure_target, None).unwrap();
+    let mut reached_image = false;
+    let mut prefix_markers = 0;
+    for block in later_cached
+        .iter()
+        .flat_map(|message| message["content"].as_array().unwrap())
+    {
+        reached_image |= block["type"] == "image";
+        if reached_image {
+            assert!(block.get("cache_control").is_none());
+        } else {
+            prefix_markers += usize::from(block.get("cache_control").is_some());
+        }
+    }
+    assert!(reached_image);
+    assert_eq!(prefix_markers, 1);
+
     let switched_target = format!("{disclosure_target}-different");
-    let switched = anthropic_wire_messages(&agent.history, false, &switched_target)
+    let switched = anthropic_wire_messages(&agent.history, false, &switched_target, None)
         .expect("switched target wire");
     assert!(switched.iter().all(|message| {
         !message["content"]
@@ -11719,8 +11748,8 @@ fn read_image_wire_contracts_are_current_turn_only_and_sessions_are_path_only() 
 
     agent.prompt_scan_epoch = agent.prompt_scan_epoch.wrapping_add(1);
     let next_turn_target = agent.image_disclosure_target();
-    let next_turn =
-        anthropic_wire_messages(&agent.history, false, &next_turn_target).expect("next-turn wire");
+    let next_turn = anthropic_wire_messages(&agent.history, false, &next_turn_target, None)
+        .expect("next-turn wire");
     assert!(next_turn.iter().all(|message| {
         !message["content"]
             .as_array()
@@ -11772,14 +11801,350 @@ fn read_image_wire_contracts_are_current_turn_only_and_sessions_are_path_only() 
         .load_session_from_path(&session)
         .expect("restore session");
     let restored_target = restored.image_disclosure_target();
-    let restored_wire =
-        anthropic_wire_messages(&restored.history, false, &restored_target).expect("restored wire");
+    let restored_wire = anthropic_wire_messages(&restored.history, false, &restored_target, None)
+        .expect("restored wire");
     assert!(restored_wire.iter().all(|message| {
         !message["content"]
             .as_array()
             .is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "image"))
     }));
 
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn interrupted_image_approval_digest_never_creates_a_reference() {
+    struct InterruptingApprovalSink(Arc<AtomicBool>);
+    impl EventSink for InterruptingApprovalSink {
+        fn emit(&mut self, _event: AgentEvent) {}
+        fn request_permission(&mut self, _name: &str, _input: &Value) -> Choice {
+            self.0.store(true, Ordering::Relaxed);
+            Choice::Once
+        }
+        fn local_auth_prompt(&mut self, _tool: &str, _message: &str) {}
+    }
+    let root = temp_test_dir("image-approval-interrupt");
+    let png = root.join("sample.png");
+    write_test_png(&png, [12, 34, 56, 255]);
+    let mut agent = test_agent(&root);
+    let profile = built_in_provider_profiles()
+        .into_iter()
+        .find(|profile| profile.id == "glm")
+        .unwrap();
+    agent.provider_id = "glm".to_string();
+    agent.model = "glm-5.3-flash".to_string();
+    agent.provider_profile = Some(profile);
+    agent.session_enabled = false;
+    agent.set_sink(Box::new(InterruptingApprovalSink(agent.interrupt.clone())));
+    let mut turn_state = orchestrator::TurnRuntimeState::new();
+    let _ = agent
+        .execute_tool_round(ToolRoundContext {
+            tool_calls: vec![(
+                "interrupt-image".to_string(),
+                "read_image".to_string(),
+                json!({"path": png}),
+            )],
+            iterations: 1,
+            turn_id: "interrupt-image-turn".to_string(),
+            objective_apply_fixes_allowed: false,
+            turn_state: &mut turn_state,
+            denied_signatures: HashSet::new(),
+            hooks_approval_decided: true,
+            hooks_approved: false,
+        })
+        .await;
+    assert!(agent.interrupt.load(Ordering::Relaxed));
+    assert!(
+        agent
+            .history
+            .iter()
+            .flat_map(|message| &message.content)
+            .all(|block| !matches!(block, Block::ImageReference { .. }))
+    );
+    assert_eq!(agent.successful_images_this_turn, 0);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn read_image_dispatch_forwards_native_interrupt() {
+    let root = temp_test_dir("read-image-dispatch-interrupt");
+    let png = root.join("sample.png");
+    write_test_png(&png, [12, 34, 56, 255]);
+    let mut input = json!({"path": png});
+    input[image::APPROVED_SOURCE_SHA256_FIELD] =
+        image::approval_digest(&root, &input, None).unwrap().into();
+    let interrupt = AtomicBool::new(true);
+    let result = execute_tool_with_cache_for_context(
+        "read_image",
+        &input,
+        &root,
+        Some(&interrupt),
+        None,
+        None,
+        None,
+        ContextMode::Standard,
+    );
+    assert!(result.unwrap_err().contains("interrupted"));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn anthropic_cache_prefix_never_includes_live_images() {
+    let mut wire = vec![
+        json!({"role":"user", "content":[{"type":"text", "text":"before"}]}),
+        json!({"role":"user", "content":[{"type":"text", "text":"before image"}, {"type":"image", "source":{}}, {"type":"text", "text":"after image"}]}),
+        json!({"role":"assistant", "content":[{"type":"text", "text":"later answer"}]}),
+        json!({"role":"user", "content":[{"type":"tool_result", "tool_use_id":"call", "content":"later result"}]}),
+    ];
+    set_sliding_message_cache_breakpoint(&mut wire);
+    let flattened: Vec<_> = wire
+        .iter()
+        .flat_map(|message| message["content"].as_array().unwrap())
+        .collect();
+    assert_eq!(flattened[1]["cache_control"]["type"], "ephemeral");
+    assert!(
+        flattened[2..]
+            .iter()
+            .all(|block| block.get("cache_control").is_none())
+    );
+    let mut starts_with_image = wire[1..].to_vec();
+    starts_with_image[0]["content"]
+        .as_array_mut()
+        .unwrap()
+        .remove(0);
+    set_sliding_message_cache_breakpoint(&mut starts_with_image);
+    assert!(
+        starts_with_image
+            .iter()
+            .flat_map(|message| message["content"].as_array().unwrap())
+            .all(|block| block.get("cache_control").is_none())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn image_request_construction_keeps_single_worker_interrupt_task_schedulable() {
+    let root = temp_test_dir("image-request-scheduler");
+    let png = root.join("large.png");
+    ::image::RgbImage::from_pixel(4_000, 4_000, ::image::Rgb([12, 34, 56]))
+        .save_with_format(&png, ::image::ImageFormat::Png)
+        .unwrap();
+    let mut agent = test_agent(&root);
+    let reference = image::ImageReference {
+        path: png.to_string_lossy().into_owned(),
+        media_type: "image/jpeg".to_string(),
+        width: 1_568,
+        height: 1_568,
+        source_sha256: sha256_hex_bytes(&std::fs::read(&png).unwrap()),
+    };
+    agent.history = vec![Message {
+        role: "user".to_string(),
+        content: vec![image_reference_block(
+            reference,
+            agent.image_disclosure_target(),
+        )],
+    }];
+    let interrupt = agent.interrupt.clone();
+    let timer = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        interrupt.store(true, Ordering::Relaxed);
+    });
+    let result = tokio::spawn(async move {
+        agent.build_streaming_request_interruptible("system", "", &[], &[], "session", None)
+    })
+    .await
+    .unwrap();
+    timer.await.unwrap();
+    assert!(result.unwrap_err().to_string().contains("interrupted"));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn read_image_serialization_observes_interrupt_on_every_contract() {
+    let root = temp_test_dir("read-image-serialize-interrupt");
+    let png = root.join("sample.png");
+    write_test_png(&png, [12, 34, 56, 255]);
+    let mut agent = test_agent(&root);
+    let target = agent.image_disclosure_target();
+    agent.history = vec![Message {
+        role: "user".to_string(),
+        content: vec![image_reference_for_test(&png, &target)],
+    }];
+    agent.interrupt.store(true, Ordering::Relaxed);
+    let reference = block_image_reference(&agent.history[0].content[0])
+        .unwrap()
+        .0;
+    assert!(
+        active_image_wire(&reference, Some(agent.interrupt.as_ref()))
+            .unwrap_err()
+            .contains("interrupted")
+    );
+    let anthropic = anthropic_wire_messages(
+        &agent.history,
+        false,
+        &target,
+        Some(agent.interrupt.as_ref()),
+    )
+    .unwrap();
+    assert!(
+        !serde_json::to_string(&anthropic)
+            .unwrap()
+            .contains("base64")
+    );
+    assert!(
+        !serde_json::to_string(&agent.history_to_oai_messages("system"))
+            .unwrap()
+            .contains("data:image")
+    );
+    assert!(
+        !serde_json::to_string(&agent.history_to_openai_responses_input())
+            .unwrap()
+            .contains("data:image")
+    );
+    assert!(
+        !serde_json::to_string(&agent.history_to_chatgpt_input())
+            .unwrap()
+            .contains("data:image")
+    );
+    for contract in [
+        RequestContract::AnthropicMessages,
+        RequestContract::OpenAiChatCompletions,
+        RequestContract::OpenAiResponses,
+        RequestContract::ChatGptResponses,
+    ] {
+        let mut profile = built_in_provider_profiles().remove(0);
+        profile.request_contract = Some(contract);
+        agent.provider_profile = Some(profile);
+        assert!(
+            agent
+                .build_streaming_request("system", "", &[], &[], "session")
+                .unwrap_err()
+                .to_string()
+                .contains("interrupted")
+        );
+    }
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn read_image_complete_request_bodies_follow_each_declared_contract() {
+    use base64::Engine as _;
+
+    let root = temp_test_dir("read-image-complete-contract");
+    let png = root.join("sample.png");
+    write_test_png(&png, [12, 34, 56, 255]);
+    let mut agent = test_agent(&root);
+    for contract in [
+        RequestContract::AnthropicMessages,
+        RequestContract::OpenAiChatCompletions,
+        RequestContract::OpenAiResponses,
+        RequestContract::ChatGptResponses,
+    ] {
+        let mut profile = built_in_provider_profiles()
+            .into_iter()
+            .find(|profile| profile.id == "openai")
+            .unwrap();
+        profile.id = "image-contract-fixture".to_string();
+        profile.api_provider = contract.api_provider();
+        profile.request_contract = Some(contract);
+        profile.model_defaults.capabilities.image_input = Some(true);
+        agent.provider_id = profile.id.clone();
+        agent.api_provider = profile.api_provider;
+        agent.provider_profile = Some(profile);
+        agent.base_url = "http://127.0.0.1:12345/v1".to_string();
+        agent.model = "fixture-vision".to_string();
+        agent.thinking_effort = ThinkingEffort::Off;
+        agent.history = vec![
+            Message {
+                role: "user".to_string(),
+                content: vec![Block::Text {
+                    text: "Inspect image".to_string(),
+                }],
+            },
+            Message {
+                role: "user".to_string(),
+                content: vec![image_reference_for_test(
+                    &png,
+                    &agent.image_disclosure_target(),
+                )],
+            },
+        ];
+        let (_, bytes) = agent
+            .build_streaming_request("system", "", &[], &[], "fixture-session")
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        let blocks: Vec<&Value> = match contract {
+            RequestContract::AnthropicMessages | RequestContract::OpenAiChatCompletions => {
+                &body["messages"]
+            }
+            _ => &body["input"],
+        }
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item["role"] == "user")
+        .flat_map(|item| item["content"].as_array().into_iter().flatten())
+        .collect();
+        let data = match contract {
+            RequestContract::AnthropicMessages => {
+                let images: Vec<_> = blocks
+                    .iter()
+                    .filter(|block| block["type"] == "image")
+                    .collect();
+                assert_eq!(images.len(), 1);
+                assert!(images[0].get("cache_control").is_none());
+                assert_eq!(images[0]["source"]["type"], "base64");
+                assert_eq!(images[0]["source"]["media_type"], "image/jpeg");
+                images[0]["source"]["data"].as_str().unwrap()
+            }
+            RequestContract::OpenAiChatCompletions => {
+                let images: Vec<_> = blocks
+                    .iter()
+                    .filter(|block| block["type"] == "image_url")
+                    .collect();
+                assert_eq!(images.len(), 1);
+                images[0]["image_url"]["url"]
+                    .as_str()
+                    .unwrap()
+                    .strip_prefix("data:image/jpeg;base64,")
+                    .unwrap()
+            }
+            _ => {
+                let images: Vec<_> = blocks
+                    .iter()
+                    .filter(|block| block["type"] == "input_image")
+                    .collect();
+                assert_eq!(images.len(), 1);
+                images[0]["image_url"]
+                    .as_str()
+                    .unwrap()
+                    .strip_prefix("data:image/jpeg;base64,")
+                    .unwrap()
+            }
+        };
+        let pixels = base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .unwrap();
+        assert!(pixels.len() <= image::ENCODED_BYTE_CAP);
+        assert!(pixels.starts_with(&[0xff, 0xd8, 0xff]));
+        assert!(!body.to_string().contains(png.to_str().unwrap()));
+        assert!(!body.to_string().contains("image/png"));
+        agent.base_url.push_str("/changed");
+        let (_, fenced) = agent
+            .build_streaming_request("system", "", &[], &[], "fixture-session")
+            .unwrap();
+        let fenced = String::from_utf8(fenced).unwrap();
+        assert!(!fenced.contains(data));
+        assert!(fenced.contains("provider, endpoint, contract, or model changed"));
+        agent.interrupt.store(true, Ordering::Relaxed);
+        assert!(
+            agent
+                .build_streaming_request("system", "", &[], &[], "fixture-session")
+                .unwrap_err()
+                .to_string()
+                .contains("interrupted")
+        );
+        agent.interrupt.store(false, Ordering::Relaxed);
+    }
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -11803,7 +12168,7 @@ fn read_image_changed_file_falls_back_to_placeholder() {
             content: vec![reference],
         },
     ];
-    let wire = anthropic_wire_messages(&history, false, disclosure_target).expect("wire");
+    let wire = anthropic_wire_messages(&history, false, disclosure_target, None).expect("wire");
     assert_eq!(wire[1]["content"][0]["type"], "text");
     assert!(
         wire[1]["content"][0]["text"]
@@ -18321,6 +18686,7 @@ fn nontext_assistant_response_precedes_tool_results_on_every_wire_contract() {
         &sanitize_anthropic_messages(&agent.history, false, false),
         false,
         &agent.image_disclosure_target(),
+        None,
     )
     .expect("Anthropic wire history");
     assert_eq!(
@@ -27893,7 +28259,7 @@ fn sliding_breakpoint_skips_thinking_blocks_and_cache_gate_env_works() {
             },
         ],
     }];
-    let wire = anthropic_wire_messages(&messages, true, "test-target").expect("wire");
+    let wire = anthropic_wire_messages(&messages, true, "test-target", None).expect("wire");
     assert!(wire[0]["content"][1].get("cache_control").is_none());
     assert_eq!(wire[0]["content"][0]["cache_control"]["type"], "ephemeral");
 
@@ -32954,7 +33320,7 @@ fn wire_messages_drop_content_emptied_by_sanitization() {
         sanitized[1].content.is_empty(),
         "prior-turn thinking-only message should sanitize to empty"
     );
-    let wire = anthropic_wire_messages(&sanitized, true, "test-target").expect("wire");
+    let wire = anthropic_wire_messages(&sanitized, true, "test-target", None).expect("wire");
     assert_eq!(wire.len(), 2, "{wire:?}");
     assert!(
         wire.iter()

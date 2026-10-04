@@ -2626,12 +2626,6 @@ fn sanitize_anthropic_messages(
         .collect()
 }
 
-/// Serialize sanitized history to Anthropic wire JSON. With prompt caching
-/// enabled, a sliding breakpoint is set on the final content block of the last
-/// message so the whole conversation prefix (tools → system → history) is
-/// reused across tool rounds instead of being re-billed as fresh input on
-/// every request. Tools and the stable system block hold the other two
-/// breakpoints (3 of the 4 allowed).
 fn inactive_image_detail(
     disclosure_target: Option<&str>,
     current_target: &str,
@@ -2658,10 +2652,12 @@ fn image_reference_is_active(
     message_index >= current_turn_start && disclosure_target == Some(current_target)
 }
 
+/// The conversation cache marker covers only eligible blocks before live pixels.
 fn anthropic_wire_messages(
     messages: &[Message],
     cache_enabled: bool,
     current_target: &str,
+    interrupt: Option<&AtomicBool>,
 ) -> Result<Vec<Value>> {
     let current_turn_start = messages
         .iter()
@@ -2685,7 +2681,7 @@ fn anthropic_wire_messages(
                 message_index,
                 current_turn_start,
             ) {
-                match active_image_wire(&reference) {
+                match active_image_wire(&reference, interrupt) {
                     Ok((media_type, data)) => json!({
                         "type": "image",
                         "source": {"type": "base64", "media_type": media_type, "data": data}
@@ -2726,17 +2722,30 @@ fn set_sliding_message_cache_breakpoint(wire: &mut [Value]) {
     let Ok(cache_control) = serde_json::to_value(CacheControl::for_prompt()) else {
         return;
     };
-    for message in wire.iter_mut().rev() {
+    // Anthropic markers cache every preceding block, not just their own block.
+    // Keep the conversation breakpoint strictly before the first live image.
+    let first_image = wire
+        .iter()
+        .enumerate()
+        .find_map(|(message_index, message)| {
+            message["content"]
+                .as_array()?
+                .iter()
+                .position(|block| block["type"] == "image")
+                .map(|block_index| (message_index, block_index))
+        });
+    for (message_index, message) in wire.iter_mut().enumerate().rev() {
         let Some(blocks) = message.get_mut("content").and_then(Value::as_array_mut) else {
             continue;
         };
-        for block in blocks.iter_mut().rev() {
+        for (block_index, block) in blocks.iter_mut().enumerate().rev() {
+            if first_image.is_some_and(|first| (message_index, block_index) >= first) {
+                continue;
+            }
             let Some(obj) = block.as_object_mut() else {
                 continue;
             };
-            // Thinking blocks and sensitive image pixels cannot carry cache
-            // breakpoints. Image bytes are current-turn disclosures and must not
-            // be explicitly retained through Anthropic prompt caching.
+            // Signed reasoning cannot carry explicit cache markers.
             let kind = obj.get("type").and_then(Value::as_str).unwrap_or("");
             if matches!(kind, "thinking" | "redacted_thinking" | "image") {
                 continue;
@@ -2874,8 +2883,9 @@ fn image_placeholder(reference: &image::ImageReference, detail: &str) -> String 
 
 fn active_image_wire(
     reference: &image::ImageReference,
+    interrupt: Option<&AtomicBool>,
 ) -> std::result::Result<(String, String), String> {
-    let prepared = image::prepare_if_unchanged(reference)?;
+    let prepared = image::prepare_if_unchanged(reference, interrupt)?;
     let encoded = base64::engine::general_purpose::STANDARD.encode(prepared.bytes);
     Ok((prepared.reference.media_type, encoded))
 }
@@ -7923,7 +7933,7 @@ fn execute_tool_with_cache_for_context(
     context_mode: ContextMode,
 ) -> std::result::Result<String, String> {
     match name {
-        "read_image" => image::read_tool(root, input),
+        "read_image" => image::read_tool(root, input, interrupt),
         "read_file" => {
             let path = input["path"].as_str().ok_or("missing path")?;
             let path = canonical_read_path(root, path)?;
@@ -9864,10 +9874,8 @@ async fn execute_builtin_call_for_context(
     pack_env: Vec<(String, String)>,
     context_mode: ContextMode,
 ) -> std::result::Result<String, String> {
-    // The blocking builtin path below cannot be cancelled once it starts, so
-    // this is the last point where an already-interrupted call can be stopped.
-    // It is also the gate for a parallel-round task that won its concurrency
-    // permit after the user hit Ctrl-C.
+    // Fence calls that acquired their parallel permit after an interrupt;
+    // cancellable native reads and supervised image workers also poll this flag.
     if interrupt.load(Ordering::SeqCst) {
         return Err(format!("{name} was not executed: interrupted by user"));
     }
@@ -16724,6 +16732,7 @@ impl Agent {
             .unwrap_or(0);
         let preserve_local_reasoning = self.local_llama_reasoning_enabled();
         let valid_ids = Self::tool_use_ids_in_messages(history);
+        let interrupt = Some(self.interrupt.as_ref());
         let current_image_target = self.image_disclosure_target();
         let mut msgs = vec![OaiMessage {
             role: "system".to_string(),
@@ -16790,7 +16799,7 @@ impl Agent {
                             message_index,
                             current_turn_start,
                         ) {
-                            match active_image_wire(&reference) {
+                            match active_image_wire(&reference, interrupt) {
                                 Ok((media_type, data)) => json!([
                                     {"type": "text", "text": "Approved workspace image"},
                                     {"type": "image_url", "image_url": {"url": format!("data:{media_type};base64,{data}")}}
@@ -16923,6 +16932,7 @@ impl Agent {
             .rposition(is_fresh_user_prompt_message)
             .unwrap_or(0);
         let valid_ids = Self::tool_use_ids_in_messages(history);
+        let interrupt = Some(self.interrupt.as_ref());
         let current_image_target = self.image_disclosure_target();
         let mut items = Vec::new();
         let mut msg_counter = 0usize;
@@ -16992,7 +17002,7 @@ impl Agent {
                             message_index,
                             current_turn_start,
                         ) {
-                            match active_image_wire(&reference) {
+                            match active_image_wire(&reference, interrupt) {
                                 Ok((media_type, data)) => json!([{
                                     "type": "input_image",
                                     "image_url": format!("data:{media_type};base64,{data}"),
@@ -17070,6 +17080,50 @@ impl Agent {
         )
     }
 
+    fn build_streaming_request_interruptible(
+        &self,
+        sys_stable: &str,
+        sys_env: &str,
+        sys_blocks: &[SystemBlock<'_>],
+        wire_tools: &[WireTool],
+        chatgpt_session_id: &str,
+        effort_override: Option<ThinkingEffort>,
+    ) -> Result<(String, Vec<u8>)> {
+        let request = || {
+            self.build_streaming_request_with_effort(
+                sys_stable,
+                sys_env,
+                sys_blocks,
+                wire_tools,
+                chatgpt_session_id,
+                effort_override,
+            )
+        };
+        let current_turn_start = self
+            .history
+            .iter()
+            .rposition(is_fresh_user_prompt_message)
+            .unwrap_or(0);
+        let current_image_target = self.image_disclosure_target();
+        let has_live_image = self.history[current_turn_start..].iter().any(|message| {
+            message.content.iter().any(|block| matches!(block,
+                Block::ImageReference { disclosure_target: Some(target), .. } if target == &current_image_target
+            ))
+        });
+        let result = if has_live_image
+            && tokio::runtime::Handle::current().runtime_flavor()
+                == tokio::runtime::RuntimeFlavor::MultiThread
+        {
+            tokio::task::block_in_place(request)
+        } else {
+            request()
+        };
+        if self.interrupt.load(Ordering::Relaxed) {
+            anyhow::bail!("interrupted by user during provider request construction");
+        }
+        result
+    }
+
     fn build_streaming_request_with_effort(
         &self,
         sys_stable: &str,
@@ -17079,6 +17133,9 @@ impl Agent {
         chatgpt_session_id: &str,
         effort_override: Option<ThinkingEffort>,
     ) -> Result<(String, Vec<u8>)> {
+        if self.interrupt.load(Ordering::Relaxed) {
+            anyhow::bail!("interrupted by user before provider request construction");
+        }
         let contract = self.request_contract();
         let effort = effort_override.unwrap_or_else(|| self.effective_thinking_effort());
         let max_output_tokens = self.request_max_output_tokens();
@@ -17280,6 +17337,7 @@ impl Agent {
                     &messages,
                     prompt_cache_enabled,
                     &self.image_disclosure_target(),
+                    Some(self.interrupt.as_ref()),
                 )?;
                 append_runtime_env_block(&mut messages, sys_env);
                 let system = system_blocks_with_cache_control(sys_blocks, prompt_cache_enabled);
@@ -18944,7 +19002,7 @@ impl Agent {
             let mut malformed_tool_call_recovery_attempted = false;
             let parsed_stream = 'stream_retry: loop {
                 let wire_tools = self.wire_tools();
-                let (url, req_body) = self.build_streaming_request_with_effort(
+                let (url, req_body) = self.build_streaming_request_interruptible(
                     &sys_stable,
                     &sys_env,
                     &sys_blocks,
@@ -24967,8 +25025,15 @@ fn handle_seat_cli(argv: &[String]) -> Result<Option<i32>> {
     }
 }
 
+fn main() -> Result<()> {
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new(image::WORKER_ARG)) {
+        std::process::exit(image::worker_main());
+    }
+    agent_main()
+}
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn agent_main() -> Result<()> {
     load_user_dotenv();
     fixup_path();
 
