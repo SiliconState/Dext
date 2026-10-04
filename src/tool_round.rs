@@ -493,7 +493,20 @@ impl Agent {
                 } else {
                     if name == "read_image" {
                         image_disclosure_target = Some(self.image_disclosure_target());
-                        match image::approval_digest(&self.sandbox_root, &input) {
+                        let image_root = self.sandbox_root.clone();
+                        let image_input = input.clone();
+                        let image_interrupt = self.interrupt.clone();
+                        let digest = tokio::task::spawn_blocking(move || {
+                            image::approval_digest(
+                                &image_root,
+                                &image_input,
+                                Some(image_interrupt.as_ref()),
+                            )
+                        })
+                        .await
+                        .map_err(|error| format!("image approval task failed: {error}"))
+                        .and_then(|result| result);
+                        match digest {
                             Ok(digest) => {
                                 if let Some(fields) = input.as_object_mut() {
                                     fields.insert(
