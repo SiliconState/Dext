@@ -535,10 +535,19 @@ impl Agent {
                         let pre_env = [
                             ("DEXT_TOOL_NAME", name.as_str()),
                             ("DEXT_TOOL_INPUT", input_redacted.as_str()),
+                            ("DEXT_TOOL_CALL_ID", id.as_str()),
+                            (
+                                "DEXT_SESSION_ID",
+                                if self.session_enabled {
+                                    self.session_id.as_str()
+                                } else {
+                                    ""
+                                },
+                            ),
                         ];
                         let mut blocked: Option<String> = None;
                         if hooks_approved {
-                            for (out, code) in self.hooks.fire(
+                            for (out, code, _) in self.hooks.fire(
                                 "pre_tool",
                                 &name,
                                 &pre_env,
@@ -1169,9 +1178,18 @@ impl Agent {
                 ("DEXT_TOOL_NAME", name.as_str()),
                 ("DEXT_TOOL_INPUT", post_tool_input.as_str()),
                 ("DEXT_TOOL_RESULT", post_tool_result.as_str()),
+                ("DEXT_TOOL_CALL_ID", tool_use_id.as_str()),
+                (
+                    "DEXT_SESSION_ID",
+                    if self.session_enabled {
+                        self.session_id.as_str()
+                    } else {
+                        ""
+                    },
+                ),
             ];
             if hooks_approved {
-                for (out, _code) in self.hooks.fire(
+                for (out, _code, _) in self.hooks.fire(
                     "post_tool",
                     &name,
                     &post_env,

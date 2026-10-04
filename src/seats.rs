@@ -273,6 +273,58 @@ fn ensure_seat_ancestors(root: &Path) -> Result<()> {
     ensure_owner_safe_dir(&project)
 }
 
+pub(crate) fn hook_memo_dir(root: &Path, session: &str, call_id: &str) -> Result<PathBuf> {
+    validate_session_id(session)?;
+    if call_id.trim().is_empty() || call_id.len() > 1024 {
+        anyhow::bail!("hook call id is empty or too long");
+    }
+    ensure_seat_ancestors(root)?;
+    let sessions = crate::session::latest_sessions_dir(root);
+    ensure_owner_safe_dir(&sessions)?;
+    let session = sessions.join(session);
+    ensure_private_dir(&session)?;
+    let memos = session.join("hook-memo");
+    ensure_private_dir(&memos)?;
+    let call = memos.join(crate::sha256_hex_str(call_id));
+    ensure_private_dir(&call)?;
+    Ok(call)
+}
+
+pub(crate) fn hook_memo_value(
+    dir: &Path,
+    key: &str,
+    value: Option<&[u8]>,
+) -> Result<Option<Vec<u8>>> {
+    validate_no_symlink_components(dir)?;
+    ensure_private_dir(dir)?;
+    if key.is_empty() || key.len() > 256 || value.is_some_and(|value| value.len() > 4096) {
+        anyhow::bail!("hook memo key/value exceeds its bound (256/4096 bytes)");
+    }
+    let path = dir.join(crate::sha256_hex_str(key));
+    if let Some(value) = value {
+        let temp = dir.join(format!(".memo-{}", crate::new_session_id()));
+        crate::session::atomic_write_secret(&temp, value)?;
+        let published = std::fs::hard_link(&temp, &path);
+        let _ = std::fs::remove_file(&temp);
+        match published {
+            Ok(()) => {
+                #[cfg(unix)]
+                std::fs::File::open(dir)?.sync_all()?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => validate_private_file(&path, &metadata)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+    crate::session::read_regular_file_bytes_with_limit(&path, 4096, None, "hook memo")
+        .map(|(bytes, _)| Some(bytes))
+        .map_err(anyhow::Error::msg)
+}
+
 fn validate_seat_ancestors_if_exists(root: &Path) -> Result<bool> {
     let project = crate::session::project_state_dir(root);
     validate_no_symlink_components(&project)?;

@@ -440,6 +440,12 @@ Dext starts with the `always` approval profile. Gated tools and host operations 
 
 For durable sessions, approved side-effect-capable tool calls receive a bounded, redacted start/terminal journal under the private session state directory. On resume, pending transcript calls are reconciled without replay: built-in replay-safe reads are marked `replay_safe` with “safe to call again”; other absent starts are marked `not_started`, unresolved starts are `uncertain`, and terminal entries recover their status without claiming unavailable output. Replay-safe reads are `read_file`, `read_symbol`, `fd`, `rg`, `jq`, `fzf`, `git_diff`, `git_status`, `git_log`, and `todo_read`; sensitive pixel reads, HTTP, shell commands, unknown tools, and pack-runtime tools remain conservative. Recovery results carry `is_error=true` because the original output is missing. No tool is automatically rerun. `--no-session` and `--fork` deliberately omit this journal, so side-effect crash recovery is unavailable in those modes.
 
+## Hooks
+
+`hooks.json` (or `DEXT_HOOKS_FILE`) and active-pack `phooks.json` accept arrays for `user_prompt`, `pre_tool`, `post_tool`, `pre_request`, `post_compact`, and `turn_end`, each with `{command, match?}` entries. Hook execution retains explicit approval, credential scrubbing, bounded capture/timeouts and the current sandbox. A nonzero `pre_request` blocks the provider request; successful output is privacy-redacted request context. `post_compact` fires once after actual history application, with `DEXT_COMPACT_SUMMARY`. At a successful yield, exit 2 and nonempty stdout from the first matching `turn_end` hook continue the same turn; stderr is not a prompt. Eight hook continuations per turn plus the normal budget/iteration/interrupt controls bound this opt-in behavior.
+
+Durable tool hooks receive core `DEXT_SESSION_ID`, provider `DEXT_TOOL_CALL_ID`, private per-call `DEXT_HOOK_MEMO_DIR`, and `DEXT_HOOK_MEMO_BIN`. `"$DEXT_HOOK_MEMO_BIN" hook-memo KEY [VALUE]` reads or atomically publishes a first-writer-wins value and prints the winning value. Keys are bounded at 256 bytes, values at 4 KiB and privacy-redacted. Memo paths hash call/key identifiers and reject symlinks and unsafe Unix ownership/modes. Confined hooks gain only their own memo directory as an additional write root. No-session/unsaved forks expose no memo. Hooks must read their memo before repeating a decision; arbitrary hook side effects are not automatically replay-safe.
+
 ## Safety diagnostics
 
 ```bash

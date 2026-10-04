@@ -11095,11 +11095,22 @@ struct Hooks {
     post_tool: Vec<Hook>,
     #[serde(default)]
     user_prompt: Vec<Hook>,
+    #[serde(default)]
+    pre_request: Vec<Hook>,
+    #[serde(default)]
+    post_compact: Vec<Hook>,
+    #[serde(default)]
+    turn_end: Vec<Hook>,
 }
 
 impl Hooks {
     fn is_empty(&self) -> bool {
-        self.pre_tool.is_empty() && self.post_tool.is_empty() && self.user_prompt.is_empty()
+        self.pre_tool.is_empty()
+            && self.post_tool.is_empty()
+            && self.user_prompt.is_empty()
+            && self.pre_request.is_empty()
+            && self.post_compact.is_empty()
+            && self.turn_end.is_empty()
     }
 
     fn load(root: &Path) -> Self {
@@ -11123,6 +11134,9 @@ impl Hooks {
         self.pre_tool.extend(other.pre_tool);
         self.post_tool.extend(other.post_tool);
         self.user_prompt.extend(other.user_prompt);
+        self.pre_request.extend(other.pre_request);
+        self.post_compact.extend(other.post_compact);
+        self.turn_end.extend(other.turn_end);
     }
 
     fn fire(
@@ -11133,11 +11147,14 @@ impl Hooks {
         extra_env: &[(String, String)],
         root: &Path,
         sandbox_profile: SandboxProfile,
-    ) -> Vec<(String, i32)> {
+    ) -> Vec<(String, i32, String)> {
         let hooks: &[Hook] = match phase {
             "pre_tool" => &self.pre_tool,
             "post_tool" => &self.post_tool,
             "user_prompt" => &self.user_prompt,
+            "pre_request" => &self.pre_request,
+            "post_compact" => &self.post_compact,
+            "turn_end" => &self.turn_end,
             _ => return Vec::new(),
         };
         let mut out = Vec::new();
@@ -11150,10 +11167,33 @@ impl Hooks {
             }
             let bash = bash_executable_path();
             let write_scope = project_scope_root(root);
-            let sandboxed = match sandbox::std_command(&bash, sandbox_profile, &write_scope) {
+            let memo = env
+                .iter()
+                .find_map(|(name, value)| {
+                    (*name == "DEXT_SESSION_ID" && !value.is_empty()).then_some(*value)
+                })
+                .zip(
+                    env.iter()
+                        .find_map(|(name, value)| (*name == "DEXT_TOOL_CALL_ID").then_some(*value)),
+                )
+                .map(|(session, call)| seats::hook_memo_dir(root, session, call))
+                .transpose();
+            let memo = match memo {
+                Ok(memo) => memo,
+                Err(error) => {
+                    out.push((format!("prepare hook memo: {error:#}"), -1, String::new()));
+                    continue;
+                }
+            };
+            let sandboxed = match sandbox::hook_command(
+                &bash,
+                sandbox_profile,
+                &write_scope,
+                memo.as_deref(),
+            ) {
                 Ok(command) => command,
                 Err(error) => {
-                    out.push((format!("prepare hook sandbox: {error}"), -1));
+                    out.push((format!("prepare hook sandbox: {error}"), -1, String::new()));
                     continue;
                 }
             };
@@ -11169,6 +11209,13 @@ impl Hooks {
             for (k, v) in extra_env {
                 cmd.env(k, v);
             }
+            cmd.env_remove("DEXT_HOOK_MEMO_DIR");
+            if let Some(memo) = memo.as_ref() {
+                cmd.env("DEXT_HOOK_MEMO_DIR", memo);
+                if let Ok(executable) = std::env::current_exe() {
+                    cmd.env("DEXT_HOOK_MEMO_BIN", executable);
+                }
+            }
             scrub_credentials_from_std_command_unconditionally(&mut cmd);
             match run_sync_command_limited_with_scratch(
                 cmd,
@@ -11179,14 +11226,19 @@ impl Hooks {
                 scratch,
             ) {
                 Ok((stdout, stderr, code)) => {
+                    let stdout = stdout.render("hook stdout");
                     let combined = merge_process_output_with_status(
-                        stdout.render("hook stdout"),
+                        stdout.clone(),
                         stderr.render("hook stderr"),
                         code,
                     );
-                    out.push((combined, code));
+                    let continuing = phase == "turn_end" && code == 2 && !stdout.trim().is_empty();
+                    out.push((combined, code, stdout));
+                    if continuing {
+                        break;
+                    }
                 }
-                Err(e) => out.push((e, -1)),
+                Err(e) => out.push((e, -1, String::new())),
             }
         }
         out
@@ -17599,6 +17651,8 @@ impl Agent {
                 | "after_pack_runtime_idle"
                 | "after_pack_runtime_continue"
                 | "after_pack_runtime_continue_cancel"
+                | "after_turn_end_continue"
+                | "after_pre_request_hooks"
         );
         if !critical
             && let Some(last) = self.last_checkpoint_at
@@ -18745,10 +18799,32 @@ impl Agent {
         self.sink.emit(AgentEvent::CompactEnd {
             before,
             after,
-            summary,
+            summary: summary.clone(),
         });
         self.append_latest_log("compact_complete", &format!("{before} -> {after} messages"));
         self.checkpoint_latest_session("after_compact");
+        if !self.hooks.post_compact.is_empty() && hooks_approved(self) {
+            let hook_summary = self.privacy.redact_text(&summary).text;
+            let hook_env = [
+                ("DEXT_SESSION_ID", self.session_id.as_str()),
+                ("DEXT_COMPACT_SUMMARY", hook_summary.as_str()),
+            ];
+            for (out, code, _) in self.hooks.fire(
+                "post_compact",
+                "",
+                &hook_env,
+                &self.pack_hook_env,
+                &self.sandbox_root,
+                self.sandbox_profile(),
+            ) {
+                if !out.trim().is_empty() || code != 0 {
+                    self.sink.emit(AgentEvent::Info(format!(
+                        "[hook:post_compact exit={code}] {}",
+                        self.privacy.redact_text(out.trim()).text
+                    )));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -18844,7 +18920,7 @@ impl Agent {
         }
         let hook_env = [("DEXT_USER_INPUT", user_input.as_str())];
         if hooks_approved {
-            for (out, _code) in self.hooks.fire(
+            for (out, _code, _) in self.hooks.fire(
                 "user_prompt",
                 "",
                 &hook_env,
@@ -18909,6 +18985,7 @@ impl Agent {
         let mut action_contract_no_mutation_turns: u32 = 0;
         let mut implementation_fallback_emitted = false;
         let mut last_retry_reason: Option<String> = None;
+        let mut hook_continuations = 0u32;
         let mut workaround_fired_this_turn = false;
 
         self.set_work_phase(turn_state.phase().label());
@@ -18987,6 +19064,39 @@ impl Agent {
                 continue;
             }
 
+            if hooks_approved && !self.hooks.pre_request.is_empty() {
+                let hook_env = [
+                    ("DEXT_SESSION_ID", self.session_id.as_str()),
+                    ("DEXT_TURN_ID", turn_id.as_str()),
+                ];
+                for (out, code, _) in self.hooks.fire(
+                    "pre_request",
+                    "",
+                    &hook_env,
+                    &self.pack_hook_env,
+                    &self.sandbox_root,
+                    self.sandbox_profile(),
+                ) {
+                    if code != 0 {
+                        anyhow::bail!(
+                            "pre_request hook blocked (exit {code}): {}",
+                            self.privacy.redact_text(&out).text
+                        );
+                    }
+                    if !out.trim().is_empty() {
+                        self.history.push(Message {
+                            role: "user".into(),
+                            content: vec![Block::Text {
+                                text: format!(
+                                    "[hook:pre_request]\n{}",
+                                    self.privacy.redact_text(out.trim()).text
+                                ),
+                            }],
+                        });
+                    }
+                }
+                self.checkpoint_latest_session("after_pre_request_hooks");
+            }
             let chatgpt_session_id = self.request_contract().is_responses().then(|| {
                 format!(
                     "dext-{}-{}",
@@ -19602,6 +19712,53 @@ impl Agent {
                         });
                         self.checkpoint_latest_session("after_queued_update_followup");
                         continue;
+                    }
+                }
+                if hooks_approved
+                    && !self.hooks.turn_end.is_empty()
+                    && !self.interrupt.load(Ordering::SeqCst)
+                {
+                    let hook_env = [
+                        ("DEXT_SESSION_ID", self.session_id.as_str()),
+                        ("DEXT_TURN_ID", turn_id.as_str()),
+                    ];
+                    let results = self.hooks.fire(
+                        "turn_end",
+                        "",
+                        &hook_env,
+                        &self.pack_hook_env,
+                        &self.sandbox_root,
+                        self.sandbox_profile(),
+                    );
+                    if let Some((_, _, prompt)) = results
+                        .iter()
+                        .find(|(_, code, stdout)| *code == 2 && !stdout.trim().is_empty())
+                    {
+                        if hook_continuations < 8 {
+                            hook_continuations += 1;
+                            self.history.push(Message {
+                                role: "user".into(),
+                                content: vec![Block::Text {
+                                    text: format!(
+                                        "[hook:turn_end]\n{}",
+                                        self.privacy.redact_text(prompt.trim()).text
+                                    ),
+                                }],
+                            });
+                            self.checkpoint_latest_session("after_turn_end_continue");
+                            continue;
+                        }
+                        self.sink.emit(AgentEvent::Warn(
+                            "turn_end hook continuation limit (8) reached".into(),
+                        ));
+                    }
+                    for (out, code, _) in results {
+                        if code != 0 && code != 2 {
+                            self.sink.emit(AgentEvent::Warn(format!(
+                                "turn_end hook failed (exit {code}): {}",
+                                self.privacy.redact_text(&out).text
+                            )));
+                        }
                     }
                 }
                 self.append_latest_log(
@@ -22302,7 +22459,7 @@ fn hooks_approved(agent: &mut Agent) -> bool {
     }
     let input = json!({
         "operation": "run project, active-pack, or repository Git hooks for this turn",
-        "phases": ["user_prompt", "pre_tool", "post_tool", "git_commit hooks"],
+        "phases": ["user_prompt", "pre_tool", "post_tool", "pre_request", "post_compact", "turn_end", "git_commit hooks"],
         "risk": format!(
             "executes hook programs selected by project, pack, or Git configuration; credentials are removed, output and runtime are bounded, and the current {} sandbox profile applies",
             agent.sandbox_profile().as_str()
@@ -23474,10 +23631,13 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             }
             let _ = writeln!(
                 w,
-                "pre_tool: {}, post_tool: {}, user_prompt: {}",
+                "pre_tool: {}, post_tool: {}, user_prompt: {}, pre_request: {}, post_compact: {}, turn_end: {}",
                 agent.hooks.pre_tool.len(),
                 agent.hooks.post_tool.len(),
-                agent.hooks.user_prompt.len()
+                agent.hooks.user_prompt.len(),
+                agent.hooks.pre_request.len(),
+                agent.hooks.post_compact.len(),
+                agent.hooks.turn_end.len()
             );
         }
         "undo" => {
@@ -25062,6 +25222,23 @@ async fn agent_main() -> Result<()> {
     }));
 
     let mut argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.first().is_some_and(|arg| arg == "hook-memo") {
+        if !(2..=3).contains(&argv.len()) {
+            anyhow::bail!("usage: dext hook-memo KEY [VALUE]");
+        }
+        let dir = std::env::var_os("DEXT_HOOK_MEMO_DIR")
+            .map(PathBuf::from)
+            .context("hook-memo requires DEXT_HOOK_MEMO_DIR")?;
+        let value = argv
+            .get(2)
+            .map(|value| PrivacyPolicy::from_env().redact_text(value).text);
+        if let Some(value) =
+            seats::hook_memo_value(&dir, &argv[1], value.as_deref().map(str::as_bytes))?
+        {
+            io::stdout().write_all(&value)?;
+        }
+        return Ok(());
+    }
     if argv.iter().any(|a| a == "-V" || a == "--version") {
         println!("dext {}", env!("CARGO_PKG_VERSION"));
         return Ok(());

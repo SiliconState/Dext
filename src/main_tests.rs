@@ -20159,6 +20159,207 @@ fn hooks_loads_project_hooks_json_by_default() {
 }
 
 #[test]
+fn hooks_extended_phases_and_turn_end_use_stdout_only() -> Result<()> {
+    let root = temp_test_dir("hooks-phases");
+    let mut hooks: Hooks = serde_json::from_value(json!({
+        "pre_request": [{"command": "printf request"}],
+        "post_compact": [{"command": "printf compact"}],
+        "turn_end": [
+            {"command": "printf continue; printf diagnostic >&2; exit 2"},
+            {"command": "printf should-not-run"}
+        ]
+    }))?;
+    assert!(!hooks.is_empty());
+    hooks.extend(Hooks::default());
+    for (phase, expected) in [("pre_request", "request"), ("post_compact", "compact")] {
+        let out = hooks.fire(phase, "", &[], &[], &root, SandboxProfile::WorkspaceWrite);
+        assert_eq!(out[0].2, expected);
+    }
+    let out = hooks.fire(
+        "turn_end",
+        "",
+        &[],
+        &[],
+        &root,
+        SandboxProfile::WorkspaceWrite,
+    );
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].1, 2);
+    assert_eq!(out[0].2, "continue");
+    assert!(out[0].0.contains("diagnostic"));
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[test]
+fn hook_memo_first_writer_wins_and_call_scope_is_private() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("hook-memo");
+    let dir = seats::hook_memo_dir(&root, "session-memo", "call/../unsafe-id")?;
+    assert!(dir.starts_with(session::session_state_dir(&root, "session-memo").join("hook-memo")));
+    assert_eq!(seats::hook_memo_value(&dir, "decision", None)?, None);
+    assert_eq!(
+        seats::hook_memo_value(&dir, "decision", Some(b"approved"))?,
+        Some(b"approved".to_vec())
+    );
+    assert_eq!(
+        seats::hook_memo_value(&dir, "decision", Some(b"denied"))?,
+        Some(b"approved".to_vec())
+    );
+    assert_eq!(
+        seats::hook_memo_dir(&root, "session-memo", "call/../unsafe-id")?,
+        dir
+    );
+    let other = seats::hook_memo_dir(&root, "session-memo", "other-call")?;
+    assert_eq!(seats::hook_memo_value(&other, "decision", None)?, None);
+    assert!(seats::hook_memo_value(&dir, "decision", Some(&[b'x'; 4097])).is_err());
+    assert!(seats::hook_memo_dir(&root, "../escape", "call").is_err());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        assert_eq!(std::fs::metadata(&dir)?.permissions().mode() & 0o777, 0o700);
+        let target = dir.join(sha256_hex_str("symlink"));
+        symlink(dir.join(sha256_hex_str("decision")), &target)?;
+        assert!(seats::hook_memo_value(&dir, "symlink", Some(b"new")).is_err());
+    }
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn hook_memo_sandbox_allows_only_the_call_directory() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("hook-memo-sandbox");
+    let session = "memo-sandbox";
+    let dir = seats::hook_memo_dir(&root, session, "call")?;
+    let outside = dir.parent().expect("memo parent").join("outside");
+    let hooks = Hooks {
+        pre_tool: vec![Hook {
+            tool_match: None,
+            command: format!(
+                "printf yes > \"$DEXT_HOOK_MEMO_DIR/decision\"; printf bad > {}",
+                shell_single_quote(&outside.to_string_lossy())
+            ),
+        }],
+        ..Default::default()
+    };
+    let out = hooks.fire(
+        "pre_tool",
+        "read_file",
+        &[("DEXT_SESSION_ID", session), ("DEXT_TOOL_CALL_ID", "call")],
+        &[],
+        &root,
+        SandboxProfile::ReadOnly,
+    );
+    if sandbox::is_enforced() {
+        assert_eq!(std::fs::read_to_string(dir.join("decision"))?, "yes");
+        assert!(!outside.exists());
+        assert_ne!(out[0].1, 0);
+    }
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn hooks_continue_with_stdout_before_turn_end_and_gate_requests() -> Result<()> {
+    let root = temp_test_dir("hooks-request-continue");
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let address = listener.local_addr()?;
+    let server = std::thread::spawn(move || {
+        let mut requests = Vec::new();
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().expect("accept hook request");
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut bytes = [0; 4096];
+            loop {
+                let count = stream.read(&mut bytes).unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&bytes[..count]);
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..end]);
+                    let length: usize = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse().unwrap())
+                        })
+                        .unwrap();
+                    if request.len() >= end + 4 + length {
+                        requests.push(
+                            serde_json::from_slice::<Value>(&request[end + 4..end + 4 + length])
+                                .unwrap(),
+                        );
+                        break;
+                    }
+                }
+            }
+            let body = "data: {\"choices\":[{\"delta\":{\"content\":\"This is a complete answer to the simple greeting, with enough detail to satisfy the existing objective tracker.\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        }
+        requests
+    });
+    let mut agent = test_agent(&root);
+    configure_local_openai_agent(&mut agent, format!("http://{address}"));
+    agent.max_iterations = Some(4);
+    agent.hooks.pre_request.push(Hook {
+        tool_match: None,
+        command: "printf request-context".into(),
+    });
+    agent.hooks.turn_end.push(Hook { tool_match: None, command: "if [ ! -f continued ]; then printf x > continued; printf 'hook followup'; printf 'not a prompt' >&2; exit 2; fi".into() });
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    agent.set_sink(Box::new(ChannelSink { tx }));
+    agent.chat("Hello".into()).await?;
+    let requests = server.join().expect("hook server");
+    assert!(requests[0].to_string().contains("request-context"));
+    assert!(requests[1].to_string().contains("hook followup"));
+    assert!(!requests[1].to_string().contains("not a prompt"));
+    let mut ends = 0;
+    while let Ok(event) = rx.try_recv() {
+        if matches!(event, AgentEvent::TurnEnd { .. }) {
+            ends += 1;
+        }
+    }
+    assert_eq!(ends, 1);
+    agent.hooks.pre_request[0].command = "printf refused; exit 1".into();
+    let error = agent
+        .chat("Hello again".into())
+        .await
+        .expect_err("hook blocks before network");
+    assert!(error.to_string().contains("pre_request hook blocked"));
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn post_compact_hook_runs_once_after_applied_history() -> Result<()> {
+    let root = temp_test_dir("post-compact-hook");
+    let mut agent = test_agent(&root);
+    agent.set_approval_profile(ApprovalProfile::Always);
+    agent.hooks.post_compact.push(Hook {
+        tool_match: None,
+        command: "printf x >> applied".into(),
+    });
+    agent.work_ledger.objective = "deterministic fallback".into();
+    agent.history = (0..12)
+        .map(|i| Message {
+            role: if i % 2 == 0 { "user" } else { "assistant" }.into(),
+            content: vec![Block::Text {
+                text: format!("message {i}"),
+            }],
+        })
+        .collect();
+    agent.compact().await?;
+    assert_eq!(std::fs::read_to_string(root.join("applied"))?, "x");
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[test]
 fn hooks_capture_is_capped() {
     let root = temp_test_dir("hook-cap");
     let hooks = Hooks {
