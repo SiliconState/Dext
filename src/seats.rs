@@ -554,6 +554,65 @@ pub(crate) fn update_metadata(
     Ok(record)
 }
 
+pub(crate) fn save_new_fork(
+    root: &Path,
+    header: &SessionHeader,
+    history: &[crate::Message],
+) -> Result<()> {
+    let seat = header.seat.as_ref().context("fork has no target seat")?;
+    let session = header
+        .session_id
+        .as_deref()
+        .context("fork has no session id")?;
+    validate_seat_ref(seat)?;
+    validate_session_id(session)?;
+    let _guard = crate::session::SessionLockOperationGuard::acquire()?;
+    if load(root, &seat.id)?.is_some()
+        || seat_record_path(root, &seat.id)?
+            .parent()
+            .context("seat parent")?
+            .try_exists()?
+    {
+        anyhow::bail!("fork target seat '{}' already exists", seat.id);
+    }
+    ensure_seat_ancestors(root)?;
+    let sessions = crate::session::latest_sessions_dir(root);
+    ensure_owner_safe_dir(&sessions)?;
+    let session_dir = sessions.join(session);
+    if session_dir.try_exists()? {
+        anyhow::bail!("fork session id already exists");
+    }
+    ensure_private_dir(&session_dir)?;
+    let mut bytes = Vec::new();
+    use std::io::Write as _;
+    let header_bytes = serde_json::to_vec(header)?;
+    if header_bytes.len() > crate::session::SESSION_HEADER_MAX_BYTES {
+        anyhow::bail!("fork header exceeds its byte limit");
+    }
+    bytes.extend_from_slice(&header_bytes);
+    bytes.push(b'\n');
+    for message in history {
+        writeln!(&mut bytes, "{}", serde_json::to_string(message)?)?;
+    }
+    let result = (|| {
+        crate::session::atomic_write_secret(
+            &crate::session::session_latest_session_path(root, session),
+            &bytes,
+        )?;
+        crate::tool_journal::initialize_empty(root, session)?;
+        let mut record = new_record(&seat.id);
+        record.last_session_id = Some(session.into());
+        save(root, &record)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(&session_dir);
+        if let Some(seat_dir) = seat_record_path(root, &seat.id)?.parent() {
+            let _ = std::fs::remove_dir(seat_dir);
+        }
+    }
+    result
+}
+
 pub(crate) fn record_session(root: &Path, seat: &SeatRef, session_id: &str) -> Result<()> {
     validate_seat_ref(seat)?;
     validate_session_id(session_id)?;

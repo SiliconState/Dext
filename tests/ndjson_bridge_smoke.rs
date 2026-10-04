@@ -137,6 +137,53 @@ fn fork_slash_and_close_keep_stdout_json() {
 }
 
 #[test]
+fn kept_fork_is_one_shot_pair_safe_and_source_immutable() {
+    let root = temp_root("kept-fork").canonicalize().unwrap();
+    let source = root.join("source.jsonl");
+    let header = serde_json::json!({"version":4,"model":"test-model","system":"test","session_id":"source-id","sandbox":root,"seat":{"id":"parent"}});
+    let text = format!(
+        "{header}\n{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"before\"}}]}}\n{{\"role\":\"assistant\",\"content\":[{{\"type\":\"tool_use\",\"id\":\"call\",\"name\":\"bash\",\"input\":{{\"command\":\"touch never\"}}}}]}}\n{{\"role\":\"user\",\"content\":[{{\"type\":\"tool_result\",\"tool_use_id\":\"call\",\"content\":\"done\"}}]}}\n"
+    );
+    std::fs::write(&source, &text).unwrap();
+    let invoke = |seat: &str| {
+        Command::new(env!("CARGO_BIN_EXE_dext"))
+            .args([
+                "--fork-to",
+                seat,
+                "--at",
+                "2",
+                "--resume",
+                "source.jsonl",
+                "--output",
+                "stream-json",
+                "--cd",
+            ])
+            .arg(&root)
+            .current_dir(&root)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", &root)
+            .env("DEXT_HOME", root.join(".dext"))
+            .output()
+            .unwrap()
+    };
+    let output = invoke("child");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let event: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(event["event"], "session_fork");
+    assert_eq!(event["data"]["at"], 1);
+    assert_eq!(event["data"]["source_session_id"], "source-id");
+    assert_eq!(std::fs::read_to_string(&source).unwrap(), text);
+    assert!(!root.join("never").exists());
+    assert!(!invoke("child").status.success());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn eof_terminates() {
     let root = temp_root("eof");
     let mut child = spawn(&root, &[]);

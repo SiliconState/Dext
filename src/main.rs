@@ -24569,6 +24569,8 @@ pub(crate) struct CliOptions {
     pub(crate) ndjson: bool,
     pub(crate) cd: Option<PathBuf>,
     pub(crate) fork: bool,
+    pub(crate) fork_to: Option<String>,
+    pub(crate) fork_at: Option<usize>,
     pub(crate) budget_cap: Option<BudgetCap>,
     pub(crate) sandbox_profile: Option<SandboxProfile>,
     pub(crate) thinking_effort: Option<ThinkingEffort>,
@@ -24595,6 +24597,8 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
     let mut output = OutputMode::Text;
     let mut cd: Option<PathBuf> = None;
     let mut fork = false;
+    let mut fork_to = None;
+    let mut fork_at = None;
     let mut budget_cap: Option<BudgetCap> = None;
     let mut sandbox_profile: Option<SandboxProfile> = None;
     let mut thinking_effort: Option<ThinkingEffort> = None;
@@ -24610,13 +24614,58 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
         let arg = &argv[i];
         match arg.as_str() {
             "-p" | "--print" => print = true,
-            "--resume" => resume_latest = true,
+            "--resume" => {
+                resume_latest = true;
+                if argv
+                    .iter()
+                    .any(|arg| arg == "--fork-to" || arg.starts_with("--fork-to="))
+                    && let Some(selector) = argv.get(i + 1).filter(|arg| !arg.starts_with('-'))
+                {
+                    resume_selector = Some(selector.clone());
+                    i += 1;
+                }
+            }
             "--no-session" => no_session = true,
             "--no-tui" => no_tui = true,
             "--eval" => eval = true,
             "--trust" => approval_policy_override = Some(ApprovalProfile::Always),
             "--no-trust" => approval_policy_override = Some(ApprovalProfile::Ask),
             "--fork" => fork = true,
+            "--fork-to" => {
+                i += 1;
+                let seat = argv.get(i).context("--fork-to requires a new seat id")?;
+                seats::validate_seat_id(seat)?;
+                if fork_to.replace(seat.clone()).is_some() {
+                    anyhow::bail!("--fork-to specified more than once");
+                }
+            }
+            "--at" => {
+                i += 1;
+                let count = argv
+                    .get(i)
+                    .context("--at requires a message count")?
+                    .parse::<usize>()
+                    .context("--at must be a nonnegative message count")?;
+                if fork_at.replace(count).is_some() {
+                    anyhow::bail!("--at specified more than once");
+                }
+            }
+            _ if arg.starts_with("--fork-to=") => {
+                let seat = arg.trim_start_matches("--fork-to=");
+                seats::validate_seat_id(seat)?;
+                if fork_to.replace(seat.to_string()).is_some() {
+                    anyhow::bail!("--fork-to specified more than once");
+                }
+            }
+            _ if arg.starts_with("--at=") => {
+                let count = arg
+                    .trim_start_matches("--at=")
+                    .parse::<usize>()
+                    .context("--at must be a nonnegative message count")?;
+                if fork_at.replace(count).is_some() {
+                    anyhow::bail!("--at specified more than once");
+                }
+            }
             "--frugal" => {
                 context_mode = Some(ContextMode::Frugal);
                 if thinking_effort.is_none() {
@@ -24930,6 +24979,22 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
             eval_filter = positional.pop();
         }
     }
+    if fork_at.is_some() && fork_to.is_none() {
+        anyhow::bail!("--at requires --fork-to");
+    }
+    if fork_to.is_some()
+        && (fork
+            || no_session
+            || ndjson
+            || print
+            || eval
+            || pack.is_some()
+            || !positional.is_empty())
+    {
+        anyhow::bail!(
+            "--fork-to conflicts with --fork, --no-session, --input ndjson, -p, --eval, --pack, and prompts"
+        );
+    }
     Ok(CliOptions {
         argv,
         positional,
@@ -24945,6 +25010,8 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
         ndjson,
         cd,
         fork,
+        fork_to,
+        fork_at,
         budget_cap,
         sandbox_profile,
         thinking_effort,
@@ -24956,6 +25023,103 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
         pack,
         seat,
     })
+}
+
+fn kept_fork_boundary(history: &[Message], requested: usize) -> Result<usize> {
+    if requested > history.len() {
+        anyhow::bail!("--at {requested} exceeds {} source messages", history.len());
+    }
+    for cut in (1..=requested).rev() {
+        let mut uses = HashMap::<&str, usize>::new();
+        let mut results = HashMap::<&str, usize>::new();
+        for block in history[..cut].iter().flat_map(|message| &message.content) {
+            match block {
+                Block::ToolUse { id, .. } => *uses.entry(id).or_default() += 1,
+                Block::ToolResult { tool_use_id, .. } => {
+                    *results.entry(tool_use_id).or_default() += 1
+                }
+                _ => {}
+            }
+        }
+        if uses == results
+            && (cut == history.len() || Agent::compact_split_is_pair_safe(history, cut))
+        {
+            return Ok(cut);
+        }
+    }
+    Ok(0)
+}
+
+fn keep_session_fork(opts: &CliOptions) -> Result<Value> {
+    let root = opts
+        .cd
+        .clone()
+        .unwrap_or(std::env::current_dir()?)
+        .canonicalize()
+        .context("resolving fork project")?;
+    let target = opts.fork_to.as_deref().context("missing fork target")?;
+    let source = if let Some(selector) = opts.resume_selector.as_deref() {
+        let selector_path = expand_user_path(selector);
+        if selector_path.is_relative() && root.join(&selector_path).exists() {
+            root.join(selector_path)
+        } else {
+            resolve_session_selector(&root, selector)?
+        }
+    } else if let Some(seat) = opts.seat.as_deref() {
+        seats::latest_session_path(&root, seat)?
+    } else {
+        latest_session_path(&root)
+    };
+    let (bytes, _) =
+        session::read_regular_file_bytes_with_limit(&source, 32 * 1024 * 1024, None, "fork source")
+            .map_err(anyhow::Error::msg)?;
+    let mut reader = io::BufReader::new(bytes.as_slice());
+    let header_line = read_session_header_line(&mut reader, &source)?;
+    let source_version = persisted_session_source_version(header_line.trim_end())?;
+    let mut header = parse_session_header(header_line.trim_end())?;
+    if let Some(expected) = opts.seat.as_deref()
+        && header.seat.as_ref().is_some_and(|seat| seat.id != expected)
+    {
+        anyhow::bail!("source belongs to a different seat than '{expected}'");
+    }
+    let saved_root = header
+        .sandbox
+        .as_deref()
+        .context("fork source is missing project sandbox provenance")?;
+    if project_key(&PathBuf::from(saved_root).canonicalize()?) != project_key(&root) {
+        anyhow::bail!("fork source belongs to a different project");
+    }
+    let source_id = header
+        .session_id
+        .clone()
+        .context("fork source is missing a valid session id")?;
+    let mut history = reader
+        .lines()
+        .filter_map(|line| match line {
+            Ok(line) if line.trim().is_empty() => None,
+            other => Some(other.map_err(anyhow::Error::from).and_then(|line| {
+                serde_json::from_str::<Message>(&line).map_err(anyhow::Error::from)
+            })),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    validate_persisted_image_references(&history, source_version)?;
+    let at = kept_fork_boundary(&history, opts.fork_at.unwrap_or(history.len()))?;
+    history.truncate(at);
+    let session_id = new_session_id();
+    header.session_id = Some(session_id.clone());
+    header.seat = Some(SeatRef {
+        id: target.into(),
+        label: None,
+    });
+    header.allowed.clear();
+    header.auto_approved_tools.clear();
+    header.active_pack_runtimes.clear();
+    header.work_ledger = WorkLedger::default();
+    header.usage = Usage::default();
+    header.sandbox = Some(root.to_string_lossy().into_owned());
+    header.version = source_version.max(SEAT_FORMAT_VERSION);
+    seats::save_new_fork(&root, &header, &history)?;
+    Ok(json!({"seat":target,"session_id":session_id,"source_session_id":source_id,"at":at}))
 }
 
 fn env_flag_default(name: &str, default: bool) -> bool {
@@ -25411,6 +25575,9 @@ async fn agent_main() -> Result<()> {
         println!(
             "       dext --fork           resume into an unsaved branch without side-effect crash recovery"
         );
+        println!(
+            "       dext --fork-to SEAT [--at N] [--resume SELECTOR]  save a pair-safe fork and exit"
+        );
         println!("       dext --cd DIR         use DIR as sandbox/cwd");
         println!("       dext --output json|stream-json  emit machine-readable output");
         println!(
@@ -25453,6 +25620,20 @@ async fn agent_main() -> Result<()> {
         return Ok(());
     }
     let opts = parse_cli_options(argv.clone())?;
+    if opts.fork_to.is_some() {
+        let result = keep_session_fork(&opts)?;
+        if opts.output.is_json() {
+            println!("{}", json!({"event": "session_fork", "data": result}));
+        } else {
+            println!(
+                "forked seat={} session_id={} at={}",
+                result["seat"].as_str().unwrap_or_default(),
+                result["session_id"].as_str().unwrap_or_default(),
+                result["at"]
+            );
+        }
+        return Ok(());
+    }
     let sandbox_profile =
         resolve_sandbox_profile_from_env(opts.sandbox_profile).map_err(anyhow::Error::msg)?;
     if opts.eval {

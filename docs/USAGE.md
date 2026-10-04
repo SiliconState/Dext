@@ -464,6 +464,7 @@ Seats select identity; sessions remain transcript and crash-recovery units:
 ```bash
 dext --seat planner
 dext --seat planner --resume
+dext --fork-to experiment --seat planner --at 8 # keep a pair-safe prefix on a new Seat, then exit
 dext seat list
 dext seat show planner
 ```

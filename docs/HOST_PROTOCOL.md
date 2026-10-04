@@ -95,6 +95,12 @@ Method params and successful values remain opaque to Dext beyond bounds and term
 
 Request params are privacy-redacted, including object keys as well as string values, and revalidated after redaction before leaving Dext. Responses travel only to the approved local runtime invocation; Dext does not emit, log, add to model history, or persist them itself. A runtime can still copy a response into its returned content/state/effects, after which the ordinary redaction and state rules apply; pack state must not contain secrets. Interrupt aborts the active runtime/UI chain instead of launching another helper after cancellation.
 
+## Kept fork (one-shot CLI)
+
+`dext --fork-to NEW_SEAT [--at N] [--resume SELECTOR] [--seat SOURCE] --cd ROOT --output stream-json` copies a coherent source snapshot and exits without a provider request. It conflicts with `--input ndjson`, unsaved `--fork`, `--no-session`, `-p`, packs, eval and prompts. stdout is one `{"event":"session_fork","data":{"seat":"NEW_SEAT","session_id":"NEW_ID","source_session_id":"SOURCE_ID","at":N}}` record, exit 0. Invalid/missing sources, nonportable or existing targets, out-of-range counts and storage errors exit 1 with stderr diagnostics.
+
+`--at` counts core `Message` records after the header (nonblank JSONL lines), not host journal sequence numbers or text deltas. It defaults to all source messages; a cut splitting a tool pair rounds backward to a pair-safe boundary and reports the actual retained count. Empty prefix (`--at 0`) is valid. Hosts must map their sequence numbers to exact core text/tool identities in a coherent idle transcript, and reject ambiguous or compacted-away selections rather than treating host seq as message count. Each message is `{role,content:[...]}`; tool uses have `{type:"tool_use",id,name,input}`, results `{type:"tool_result",tool_use_id,content,...}`. Source header must carry a valid session id and matching project sandbox provenance. The new Seat has a new session id and an empty journal; session sidecars, pack runtime/queued continuations, approval grants, accounting and work ledger are not copied. The source is never reconciled, executed or modified by this command.
+
 ## Lifecycle
 
 - stdin EOF ends the loop exactly like `close`. Neither interrupts a running

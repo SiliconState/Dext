@@ -9190,6 +9190,104 @@ fn builtin_parallel_policy_only_allows_read_only_rounds() {
 }
 
 #[test]
+fn kept_fork_cli_rejects_conflicts_and_parses_message_count() -> Result<()> {
+    let options = parse_cli_options(vec![
+        "--fork-to".into(),
+        "child".into(),
+        "--at=3".into(),
+        "--resume".into(),
+        "source.jsonl".into(),
+    ])?;
+    assert_eq!(options.fork_to.as_deref(), Some("child"));
+    assert_eq!(options.fork_at, Some(3));
+    assert_eq!(options.resume_selector.as_deref(), Some("source.jsonl"));
+    for flags in [
+        vec!["--at", "1"],
+        vec!["--fork-to", "../bad"],
+        vec!["--fork-to", "child", "--fork"],
+        vec!["--fork-to", "child", "--no-session"],
+        vec!["--fork-to", "child", "--input", "ndjson"],
+        vec!["--fork-to", "child", "-p"],
+        vec!["--fork-to", "child", "prompt"],
+    ] {
+        assert!(parse_cli_options(flags.into_iter().map(str::to_string).collect()).is_err());
+    }
+    Ok(())
+}
+
+#[test]
+fn kept_fork_preserves_pairs_new_identity_and_source_without_journal_replay() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("kept-fork").canonicalize()?;
+    let mut agent = test_agent(&root);
+    agent.select_seat("parent")?;
+    agent.history = vec![
+        Message {
+            role: "user".into(),
+            content: vec![Block::Text {
+                text: "before".into(),
+            }],
+        },
+        Message {
+            role: "assistant".into(),
+            content: vec![Block::ToolUse {
+                id: "pair".into(),
+                name: "write_file".into(),
+                input: json!({"path":"never-write","content":"bad"}),
+            }],
+        },
+        Message {
+            role: "user".into(),
+            content: vec![tool_result_block("pair", "already written", None)],
+        },
+        Message {
+            role: "assistant".into(),
+            content: vec![Block::Text {
+                text: "after".into(),
+            }],
+        },
+    ];
+    let path = agent.save_latest_session()?;
+    let before = std::fs::read(&path)?;
+    let options = parse_cli_options(vec![
+        "--fork-to".into(),
+        "child".into(),
+        "--at".into(),
+        "2".into(),
+        "--seat".into(),
+        "parent".into(),
+        "--cd".into(),
+        root.to_string_lossy().into_owned(),
+    ])?;
+    let fork = keep_session_fork(&options)?;
+    assert_eq!(fork["at"], 1);
+    assert_eq!(fork["source_session_id"], agent.session_id);
+    let id = fork["session_id"].as_str().expect("new id");
+    assert_ne!(id, agent.session_id);
+    let new_path = seats::latest_session_path(&root, "child")?;
+    let (header, history) = read_session_jsonl(&new_path)?;
+    assert_eq!(history.len(), 1);
+    assert_eq!(header.seat.as_ref().map(|s| s.id.as_str()), Some("child"));
+    assert_eq!(header.session_id.as_deref(), Some(id));
+    assert!(header.active_pack_runtimes.is_empty());
+    assert!(header.allowed.is_empty());
+    assert!(
+        tool_journal::load_for_session_file(&new_path)?
+            .expect("empty journal")
+            .is_empty()
+    );
+    assert_eq!(std::fs::read(&path)?, before);
+    assert!(!root.join("never-write").exists());
+    assert!(keep_session_fork(&options).is_err());
+    assert_eq!(kept_fork_boundary(&agent.history, 3)?, 3);
+    assert_eq!(kept_fork_boundary(&agent.history, 4)?, 4);
+    assert_eq!(kept_fork_boundary(&agent.history, 0)?, 0);
+    assert!(kept_fork_boundary(&agent.history, 5).is_err());
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[test]
 fn replay_safe_registry_is_parallel_safe_without_sensitive_reads() {
     let expected = HashSet::from([
         "read_file",
