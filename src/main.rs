@@ -9177,6 +9177,9 @@ async fn execute_bash_async_prepared(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    command
+        .env_remove("DEXT_TOOL_CALL_ID")
+        .env_remove("DEXT_SESSION_ID");
     for (key, value) in extra_env {
         command.env(key, value);
     }
@@ -9897,6 +9900,8 @@ async fn execute_builtin_call_for_context(
             _ => None,
         };
         let mut extra_env = pack_env;
+        extra_env.retain(|(name, _)| name != "DEXT_SESSION_ID");
+        extra_env.push(("DEXT_SESSION_ID".into(), session_id.unwrap_or_default()));
         if let Some(runtime) = git_cred_runtime.as_ref() {
             extra_env.extend(runtime.env.clone());
         }

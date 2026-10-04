@@ -11035,6 +11035,41 @@ fn canonical_dext_install_from_nested_directory_is_blocked() {
 }
 
 #[tokio::test]
+async fn bash_receives_exact_call_and_core_session_identity() -> Result<()> {
+    let root = temp_test_dir("bash-identity");
+    let mut agent = test_agent(&root);
+    agent.set_approval_profile(ApprovalProfile::Always);
+    agent.set_sandbox_profile(SandboxProfile::DangerFullAccess);
+    let mut state = orchestrator::TurnRuntimeState::new();
+    agent
+        .execute_tool_round(ToolRoundContext {
+            tool_calls: vec![(
+                "provider-call-identity".into(),
+                "bash".into(),
+                json!({"command":"printf '%s/%s' \"$DEXT_TOOL_CALL_ID\" \"$DEXT_SESSION_ID\""}),
+            )],
+            iterations: 1,
+            turn_id: "turn-identity".into(),
+            objective_apply_fixes_allowed: false,
+            turn_state: &mut state,
+            denied_signatures: HashSet::new(),
+            hooks_approval_decided: true,
+            hooks_approved: false,
+        })
+        .await?;
+    let (output, _) = last_tool_result(&agent.history).expect("bash result");
+    assert!(
+        output.contains(&format!("provider-call-identity/{}", agent.session_id)),
+        "{output}"
+    );
+    assert!(!tool_credential_env_key("DEXT_TOOL_CALL_ID"));
+    assert!(!tool_credential_env_key("DEXT_SESSION_ID"));
+    assert!(!tool_credential_env_key("DEXTUI_SESSION_ID"));
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[tokio::test]
 async fn pre_tool_hooks_receive_privacy_redacted_inputs() {
     let root = temp_test_dir("pre-tool-hook-input-redaction");
     let mut agent = test_agent(&root);

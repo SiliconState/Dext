@@ -1022,6 +1022,8 @@ impl Agent {
                     builtin_git_cred_used.insert(idx);
                 }
                 let prepared_mutation = plans[idx].prepared_mutation.take();
+                let mut call_env = self.pack_hook_env.clone();
+                call_env.push(("DEXT_TOOL_CALL_ID".into(), plans[idx].tool_use_id.clone()));
                 let r = if matches!(plans[idx].plan, Plan::Runtime) {
                     self.execute_pack_runtime_tool(&n, &inp, &turn_id, iterations)
                         .await
@@ -1039,7 +1041,7 @@ impl Agent {
                         self.sandbox_profile,
                         hooks_approved,
                         live_output,
-                        self.pack_hook_env.clone(),
+                        call_env,
                         context_mode,
                     )
                     .await
