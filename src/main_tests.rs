@@ -9190,6 +9190,38 @@ fn builtin_parallel_policy_only_allows_read_only_rounds() {
 }
 
 #[test]
+fn replay_safe_registry_is_parallel_safe_without_sensitive_reads() {
+    let expected = HashSet::from([
+        "read_file",
+        "read_symbol",
+        "fd",
+        "rg",
+        "jq",
+        "fzf",
+        "git_diff",
+        "git_status",
+        "git_log",
+        "todo_read",
+    ]);
+    let actual = tools::registered_tool_names()
+        .filter(|name| tools::is_replay_safe_tool(name))
+        .collect::<HashSet<_>>();
+    assert_eq!(actual, expected);
+    for name in tools::registered_tool_names() {
+        assert_eq!(
+            tools::is_replay_safe_tool(name),
+            is_parallel_safe_tool(name) && !is_sensitive_read_tool(name),
+            "replay classification drift for {name}"
+        );
+        if tools::is_replay_safe_tool(name) {
+            assert!(!is_side_effect_capable_tool(name));
+        }
+    }
+    assert!(!tools::is_replay_safe_tool("unknown_tool"));
+    assert!(!tools::is_replay_safe_tool("pack.read"));
+}
+
+#[test]
 fn tool_registry_covers_every_catalog_entry_and_schema_requirement() {
     let registry = tools::registered_tool_names().collect::<HashSet<_>>();
     let catalog = provider_tool_definitions();
@@ -23026,6 +23058,70 @@ fn eval_and_default_sandbox_cli_forms_are_parsed_as_policy() -> Result<()> {
         ])
         .is_err()
     );
+    Ok(())
+}
+
+#[test]
+fn resume_labels_replay_safe_reads_without_executing_or_repairing_pairs_twice() -> Result<()> {
+    let safe_names = tools::registered_tool_names()
+        .filter(|name| tools::is_replay_safe_tool(name))
+        .collect::<Vec<_>>();
+    let mut history = vec![Message {
+        role: "assistant".into(),
+        content: safe_names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| Block::ToolUse {
+                id: format!("read-{index}"),
+                name: (*name).into(),
+                input: json!({"path": "missing-read-must-not-execute"}),
+            })
+            .chain(
+                ["read_image", "bash", "unknown_tool", "pack.read"].map(|name| Block::ToolUse {
+                    id: name.into(),
+                    name: name.into(),
+                    input: json!({}),
+                }),
+            )
+            .collect(),
+    }];
+    let recovery = reconcile_pending_tool_calls(&mut history, None)?;
+    assert_eq!(recovery.replay_safe, safe_names.len());
+    assert_eq!(recovery.not_started, 4);
+    assert_eq!(recovery.uncertain, 0);
+    assert_eq!(recovery.recovered_terminal, 0);
+    assert_eq!(recovery.total(), safe_names.len() + 4);
+    assert!(recovery.warning().contains("no call was replayed"));
+    let results = &history.last().expect("recovery results").content;
+    for (index, name) in safe_names.iter().enumerate() {
+        let Block::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+            metadata,
+        } = &results[index]
+        else {
+            panic!("missing result for {name}");
+        };
+        assert_eq!(tool_use_id, &format!("read-{index}"));
+        assert_eq!(metadata.status.as_deref(), Some("replay_safe"));
+        assert_eq!(*is_error, Some(true));
+        assert_eq!(
+            content,
+            &format!(
+                "[resume recovery] {name} was interrupted; it is safe to call again. Dext did not replay it."
+            )
+        );
+    }
+    for result in &results[safe_names.len()..] {
+        let Block::ToolResult { metadata, .. } = result else {
+            panic!("missing conservative result");
+        };
+        assert_eq!(metadata.status.as_deref(), Some("not_started"));
+    }
+    let before = serde_json::to_value(&history)?;
+    assert_eq!(reconcile_pending_tool_calls(&mut history, None)?.total(), 0);
+    assert_eq!(serde_json::to_value(&history)?, before);
     Ok(())
 }
 

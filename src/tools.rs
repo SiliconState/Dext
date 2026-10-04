@@ -350,6 +350,7 @@ const PARALLEL_SAFE: u8 = 1 << 1;
 const EXTERNAL_PROCESS: u8 = 1 << 2;
 const DEFAULT_PROFILE: u8 = 1 << 3;
 const SENSITIVE_READ: u8 = 1 << 4;
+const REPLAY_SAFE: u8 = 1 << 5;
 
 const fn tool(name: &'static str, required_fields: &'static [&'static str], flags: u8) -> ToolSpec {
     ToolSpec {
@@ -360,13 +361,21 @@ const fn tool(name: &'static str, required_fields: &'static [&'static str], flag
 }
 
 const TOOL_SPECS: &[ToolSpec] = &[
-    tool("read_file", &["path"], PARALLEL_SAFE | DEFAULT_PROFILE),
+    tool(
+        "read_file",
+        &["path"],
+        PARALLEL_SAFE | REPLAY_SAFE | DEFAULT_PROFILE,
+    ),
     tool(
         "read_image",
         &["path"],
         PERMISSION_REQUIRED | SENSITIVE_READ | DEFAULT_PROFILE,
     ),
-    tool("read_symbol", &["path"], PARALLEL_SAFE | DEFAULT_PROFILE),
+    tool(
+        "read_symbol",
+        &["path"],
+        PARALLEL_SAFE | REPLAY_SAFE | DEFAULT_PROFILE,
+    ),
     tool(
         "write_file",
         &["path", "content"],
@@ -386,34 +395,50 @@ const TOOL_SPECS: &[ToolSpec] = &[
     tool(
         "fd",
         &["pattern"],
-        PARALLEL_SAFE | EXTERNAL_PROCESS | DEFAULT_PROFILE,
+        PARALLEL_SAFE | REPLAY_SAFE | EXTERNAL_PROCESS | DEFAULT_PROFILE,
     ),
     tool(
         "rg",
         &["pattern"],
-        PARALLEL_SAFE | EXTERNAL_PROCESS | DEFAULT_PROFILE,
+        PARALLEL_SAFE | REPLAY_SAFE | EXTERNAL_PROCESS | DEFAULT_PROFILE,
     ),
-    tool("jq", &["filter"], PARALLEL_SAFE | EXTERNAL_PROCESS),
-    tool("fzf", &["query", "items"], PARALLEL_SAFE | EXTERNAL_PROCESS),
+    tool(
+        "jq",
+        &["filter"],
+        PARALLEL_SAFE | REPLAY_SAFE | EXTERNAL_PROCESS,
+    ),
+    tool(
+        "fzf",
+        &["query", "items"],
+        PARALLEL_SAFE | REPLAY_SAFE | EXTERNAL_PROCESS,
+    ),
     tool("http", &["args"], PERMISSION_REQUIRED | DEFAULT_PROFILE),
     tool("awk", &["args"], PERMISSION_REQUIRED | EXTERNAL_PROCESS),
     tool(
         "git_diff",
         &[],
-        PARALLEL_SAFE | EXTERNAL_PROCESS | DEFAULT_PROFILE,
+        PARALLEL_SAFE | REPLAY_SAFE | EXTERNAL_PROCESS | DEFAULT_PROFILE,
     ),
     tool(
         "git_status",
         &[],
-        PARALLEL_SAFE | EXTERNAL_PROCESS | DEFAULT_PROFILE,
+        PARALLEL_SAFE | REPLAY_SAFE | EXTERNAL_PROCESS | DEFAULT_PROFILE,
     ),
-    tool("git_log", &[], PARALLEL_SAFE | EXTERNAL_PROCESS),
+    tool(
+        "git_log",
+        &[],
+        PARALLEL_SAFE | REPLAY_SAFE | EXTERNAL_PROCESS,
+    ),
     tool(
         "git_commit",
         &["message"],
         PERMISSION_REQUIRED | DEFAULT_PROFILE,
     ),
-    tool("todo_read", &[], PARALLEL_SAFE | DEFAULT_PROFILE),
+    tool(
+        "todo_read",
+        &[],
+        PARALLEL_SAFE | REPLAY_SAFE | DEFAULT_PROFILE,
+    ),
     tool(
         "todo_write",
         &["todos"],
@@ -463,6 +488,10 @@ pub(crate) fn is_side_effect_capable_tool(name: &str) -> bool {
 
 pub(crate) fn is_external_process_tool(name: &str) -> bool {
     tool_spec(name).is_some_and(|spec| spec.flags & EXTERNAL_PROCESS != 0)
+}
+
+pub(crate) fn is_replay_safe_tool(name: &str) -> bool {
+    tool_spec(name).is_some_and(|spec| spec.flags & REPLAY_SAFE != 0)
 }
 
 pub(crate) fn is_parallel_safe_tool(name: &str) -> bool {

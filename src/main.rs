@@ -10403,6 +10403,7 @@ fn summarize_call(name: &str, input: &Value) -> String {
 
 #[derive(Debug, Default, PartialEq, Eq)]
 struct ToolJournalRecovery {
+    replay_safe: usize,
     not_started: usize,
     uncertain: usize,
     recovered_terminal: usize,
@@ -10410,13 +10411,14 @@ struct ToolJournalRecovery {
 
 impl ToolJournalRecovery {
     fn total(&self) -> usize {
-        self.not_started + self.uncertain + self.recovered_terminal
+        self.replay_safe + self.not_started + self.uncertain + self.recovered_terminal
     }
 
     fn warning(&self) -> String {
         format!(
-            "[resume recovery] reconciled {} pending tool call(s): {} not started, {} uncertain, {} terminal with original output unavailable; no call was replayed",
+            "[resume recovery] reconciled {} pending tool call(s): {} replay safe, {} not started, {} uncertain, {} terminal with original output unavailable; no call was replayed",
             self.total(),
+            self.replay_safe,
             self.not_started,
             self.uncertain,
             self.recovered_terminal
@@ -10465,6 +10467,15 @@ fn reconcile_pending_tool_calls(
                 && entry.input_sha256 == input_sha256
         });
         let (content, status) = match matched.map(|entry| entry.status) {
+            _ if tools::is_replay_safe_tool(&tool_name) => {
+                recovery.replay_safe += 1;
+                (
+                    format!(
+                        "[resume recovery] {tool_name} was interrupted; it is safe to call again. Dext did not replay it."
+                    ),
+                    "replay_safe".to_string(),
+                )
+            }
             None => {
                 recovery.not_started += 1;
                 (
