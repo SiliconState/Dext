@@ -249,6 +249,8 @@ fn image_gateway_round_trip(unlink_binary: bool) {
                     Err(error) => panic!("accept: {error}"),
                 }
             };
+            // Winsock accepts inherit the listener's nonblocking setting.
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
