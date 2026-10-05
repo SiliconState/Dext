@@ -11230,6 +11230,7 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
                 command = cmd_rx.recv() => command,
                 _ = agent.background_wakeup() => {
                     agent.service_background(false).await;
+                    agent.checkpoint_latest_session("outer_loop_autosave");
                     continue;
                 }
             };
@@ -11430,6 +11431,7 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
         }
         agent.service_background(false).await;
         agent.settle_background("tui_shutdown").await;
+        agent.checkpoint_latest_session("outer_loop_autosave");
     });
 
     // Bridge: relay in_rx → cmd_tx

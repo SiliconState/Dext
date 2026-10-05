@@ -20944,30 +20944,44 @@ fn hook_identity_env_cannot_be_replaced_by_pack_env() -> Result<()> {
 fn hook_memo_concurrent_writers_observe_one_complete_value() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("hook-memo-concurrent");
-    let dir = seats::hook_memo_dir(&root, "session-concurrent", "call")?;
-    let values = std::thread::scope(|scope| {
-        let threads: Vec<_> = (0..8)
-            .map(|index| {
-                let dir = &dir;
-                scope.spawn(move || {
-                    seats::hook_memo_value(dir, "winner", Some(format!("value-{index}").as_bytes()))
-                        .unwrap()
-                        .unwrap()
+    let _cleanup = RemoveDirOnDrop(root.clone());
+    let _state_env = PackEnvGuard::new(&root.join("state"));
+    let old_sessions = std::env::var_os("DEXT_SESSIONS_DIR");
+    unsafe { std::env::remove_var("DEXT_SESSIONS_DIR") };
+    let result = (|| -> Result<()> {
+        let barrier = std::sync::Barrier::new(16);
+        let values = std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..16)
+                .map(|index| {
+                    let root = &root;
+                    let barrier = &barrier;
+                    scope.spawn(move || -> Result<_> {
+                        barrier.wait();
+                        let dir = seats::hook_memo_dir(root, "session-concurrent", "call")?;
+                        let value = seats::hook_memo_value(
+                            &dir,
+                            "winner",
+                            Some(format!("value-{index}").as_bytes()),
+                        )?
+                        .context("memo winner missing")?;
+                        Ok((dir, value))
+                    })
                 })
-            })
-            .collect();
-        threads
-            .into_iter()
-            .map(|thread| thread.join().unwrap())
-            .collect::<Vec<_>>()
-    });
-    assert!(values.iter().all(|value| value == &values[0]));
-    assert_eq!(
-        seats::hook_memo_value(&dir, "winner", None)?,
-        Some(values[0].clone())
-    );
-    let _ = std::fs::remove_dir_all(root);
-    Ok(())
+                .collect();
+            threads
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .collect::<Result<Vec<_>>>()
+        })?;
+        assert!(values.iter().all(|value| value == &values[0]));
+        assert_eq!(
+            seats::hook_memo_value(&values[0].0, "winner", None)?,
+            Some(values[0].1.clone())
+        );
+        Ok(())
+    })();
+    restore_env_var("DEXT_SESSIONS_DIR", old_sessions);
+    result
 }
 
 #[test]
@@ -21123,6 +21137,65 @@ async fn hooks_continue_with_stdout_before_turn_end_and_gate_requests() -> Resul
         .expect_err("hook blocks before network");
     assert!(error.to_string().contains("pre_request hook blocked"));
     let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn blocking_compaction_redacts_summary_before_history_events_and_save() -> Result<()> {
+    let root = temp_test_dir("compact-summary-redaction");
+    let _cleanup = RemoveDirOnDrop(root.clone());
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let address = listener.local_addr()?;
+    let server = std::thread::spawn(move || -> Result<()> {
+        let (mut stream, _) = listener.accept()?;
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        let mut request = Vec::new();
+        let mut buffer = [0; 4096];
+        loop {
+            let count = stream.read(&mut buffer)?;
+            anyhow::ensure!(count > 0, "summary request ended before body");
+            request.extend_from_slice(&buffer[..count]);
+            if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&request[..end]);
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .and_then(|value| value.trim().parse().ok())
+                    })
+                    .context("summary request content length")?;
+                if request.len() >= end + 4 + length {
+                    break;
+                }
+            }
+        }
+        let summary = format!("Task summary\n{}={}", "api_key", "fixturevalue123456789");
+        let body = json!({"choices":[{"message":{"content":summary},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":7}}).to_string();
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )?;
+        Ok(())
+    });
+    let mut agent = test_agent(&root);
+    configure_local_openai_agent(&mut agent, format!("http://{address}"));
+    background_test_history(&mut agent);
+    agent.background.enabled = false;
+    agent.latest_session_path = root.join("saved.jsonl");
+    agent.latest_log_path = root.join("latest.log");
+    let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+    agent.set_sink(Box::new(ChannelSink { tx }));
+    agent.compact().await?;
+    server.join().expect("summary fixture thread")?;
+    let history = serde_json::to_string(&agent.history)?;
+    let saved = std::fs::read_to_string(&agent.latest_session_path)?;
+    assert!(history.contains("[REDACTED_SECRET]"));
+    assert!(!history.contains("fixturevalue123456789"));
+    assert!(!saved.contains("fixturevalue123456789"));
+    assert!(drain_events(&mut events).iter().any(|event| matches!(event,
+        AgentEvent::CompactEnd { summary, .. } if summary.contains("[REDACTED_SECRET]") && !summary.contains("fixturevalue123456789"))));
     Ok(())
 }
 

@@ -347,11 +347,21 @@ fn tui_path_picker_inserts_without_submitting_and_preserves_draft_on_cancel() {
 
 #[test]
 fn tui_background_summary_applies_while_idle_and_keeps_input_available() {
+    run_tui_background_summary(false);
+}
+
+#[test]
+fn tui_background_discard_persists_usage_before_shutdown() {
+    run_tui_background_summary(true);
+}
+
+fn run_tui_background_summary(discard: bool) {
     let temp = TempDir::new("dext-tui-background").unwrap();
     let sandbox = temp.path().join("sandbox");
     let state = temp.path().join("state");
     let home = temp.path().join("home");
-    for path in [&sandbox, &state, &home] {
+    let sessions = temp.path().join("sessions");
+    for path in [&sandbox, &state, &home, &sessions] {
         fs::create_dir_all(path).unwrap();
     }
     let mut fixture = format!(
@@ -397,7 +407,12 @@ fn tui_background_summary_applies_while_idle_and_keeps_input_available() {
                 let release = release_rx.take().unwrap();
                 summary = Some(std::thread::spawn(move || {
                     release.recv_timeout(Duration::from_secs(15)).unwrap();
-                    let body = r#"{"choices":[{"message":{"content":"background-idle-summary"}}],"usage":{"prompt_tokens":11,"completion_tokens":7}}"#;
+                    let summary = if discard {
+                        "context ".repeat(4000)
+                    } else {
+                        "background-idle-summary".into()
+                    };
+                    let body = serde_json::json!({"choices":[{"message":{"content":summary}}],"usage":{"prompt_tokens":11,"completion_tokens":7}}).to_string();
                     write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
                 }));
             } else {
@@ -409,7 +424,7 @@ fn tui_background_summary_applies_while_idle_and_keeps_input_available() {
         summary.unwrap().join().unwrap();
     });
     let mut pty = Pty::open(TUI_COLS, TUI_ROWS).unwrap();
-    let mut child = spawn_dext_with_env(
+    let mut child = spawn_dext_configured(
         &pty,
         &sandbox,
         &state,
@@ -420,7 +435,9 @@ fn tui_background_summary_applies_while_idle_and_keeps_input_available() {
             ("DEXT_MODEL", "mock-model"),
             ("DEXT_MODEL_FORCE", "1"),
             ("DEXT_BACKGROUND_COMPACT", "1"),
+            ("DEXT_SESSIONS_DIR", sessions.to_str().unwrap()),
         ],
+        true,
     )
     .unwrap();
     assert_visible(
@@ -452,13 +469,41 @@ fn tui_background_summary_applies_while_idle_and_keeps_input_available() {
         "history: 14 messages",
         Duration::from_secs(5),
     );
+    let saved = sessions.join("background-source/_latest.jsonl");
+    let usage = |file: &Path| -> Option<(u64, u64)> {
+        let text = fs::read_to_string(file).ok()?;
+        let header: serde_json::Value = serde_json::from_str(text.lines().next()?).ok()?;
+        Some((
+            header["usage"]["input"].as_u64()?,
+            header["usage"]["output"].as_u64()?,
+        ))
+    };
+    let before_usage = usage(&saved).expect("foreground session saved");
     release_tx.send(()).unwrap();
-    assert_visible(
-        &mut pty,
-        &mut child,
-        "background-idle-summary",
-        Duration::from_secs(5),
-    );
+    if !discard {
+        assert_visible(
+            &mut pty,
+            &mut child,
+            "background-idle-summary",
+            Duration::from_secs(5),
+        );
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if usage(&saved) == Some((before_usage.0 + 11, before_usage.1 + 7)) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "idle summary usage was not persisted: {:?}",
+            usage(&saved)
+        );
+        pty.pump_for(&mut child, Duration::from_millis(30)).unwrap();
+    }
+    if discard {
+        assert_eq!(fs::read_to_string(&saved).unwrap().lines().count(), 15);
+        assert!(!pty.visible_text().contains("compacted 14"));
+    }
     pty.write_all_retry(b"\x04").unwrap();
     assert!(
         wait_for_exit(&mut child, Duration::from_secs(5), &mut pty)
@@ -768,13 +813,27 @@ fn spawn_dext_with_env(
     home: &Path,
     extra_env: &[(&str, &str)],
 ) -> io::Result<Child> {
+    spawn_dext_configured(pty, sandbox, dext_home, home, extra_env, false)
+}
+
+fn spawn_dext_configured(
+    pty: &Pty,
+    sandbox: &Path,
+    dext_home: &Path,
+    home: &Path,
+    extra_env: &[(&str, &str)],
+    persistent: bool,
+) -> io::Result<Child> {
     let stdin = unsafe { File::from_raw_fd(dup_fd(pty.slave_file())?) };
     let stdout = unsafe { File::from_raw_fd(dup_fd(pty.slave_file())?) };
     let stderr = unsafe { File::from_raw_fd(dup_fd(pty.slave_file())?) };
     let path = std::env::var_os("PATH").unwrap_or_else(|| OsString::from("/usr/bin:/bin"));
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_dext"));
-    cmd.args(["--no-session", "--cd"])
+    if !persistent {
+        cmd.arg("--no-session");
+    }
+    cmd.arg("--cd")
         .arg(sandbox)
         .current_dir(sandbox)
         .env_clear()

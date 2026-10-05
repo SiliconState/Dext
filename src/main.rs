@@ -18706,6 +18706,7 @@ impl Agent {
         };
         self.session_usage.add(usage);
         self.ensure_session_usage_cost();
+        let summary = self.privacy.redact_text(&summary).text;
 
         self.history =
             build_compacted_history(&summary, preserved_tool_msgs, &self.history[split..]);

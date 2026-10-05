@@ -152,6 +152,10 @@ impl SummaryRequest {
                     return Ok(text);
                 }
                 Err(error) => {
+                    {
+                        let mut accounting = accounting.lock().unwrap_or_else(|e| e.into_inner());
+                        accounting.unknown |= accounting.inflight_open;
+                    }
                     let message = crate::stream_error_body(&error);
                     let plan = crate::orchestrator::classify_stream_error(&message);
                     // Speculation must not compete with a rate-limited foreground request.
@@ -272,15 +276,17 @@ impl SummaryRequest {
                     bail!("summary stream exceeded byte limit");
                 }
                 for frame in decoder.push(&chunk)? {
-                    parser.push_frame(frame)?;
+                    let parsed = parser.push_frame(frame);
                     observed = parser.known_usage();
                     self.observe_usage(observed, accounting);
+                    parsed?;
                 }
             }
             for frame in decoder.finish()? {
-                parser.push_frame(frame)?;
+                let parsed = parser.push_frame(frame);
                 observed = parser.known_usage();
                 self.observe_usage(observed, accounting);
+                parsed?;
             }
             parser.finish()
         }
@@ -641,6 +647,87 @@ impl Agent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn loopback_request(
+        responses: Vec<(u16, String)>,
+    ) -> (SummaryRequest, std::thread::JoinHandle<()>) {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for (status, body) in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0; 1024];
+                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let count = stream.read(&mut buffer).unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                write!(stream, "HTTP/1.1 {status} Fixture\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        let client = reqwest::Client::new();
+        let request = client.get(format!("http://{address}")).build().unwrap();
+        (
+            SummaryRequest {
+                client,
+                request,
+                contract: RequestContract::OpenAiResponses,
+                first_byte: Duration::from_secs(5),
+                idle: Duration::from_secs(5),
+                provider: "test".into(),
+                model: "test-model".into(),
+                pricing: crate::UsagePricing::default(),
+                pricing_override: false,
+                override_wire_cost: false,
+                input_tokens: 1,
+                speculative: false,
+            },
+            server,
+        )
+    }
+
+    #[tokio::test]
+    async fn failed_attempt_keeps_unknown_billing_after_successful_retry() {
+        let body = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"summary\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":5,\"output_tokens\":4}}}\n\n"
+        );
+        let (request, server) = loopback_request(vec![
+            (503, "upstream temporarily unavailable".into()),
+            (200, body.into()),
+        ]);
+        let accounting = Mutex::new(SummaryAccounting::default());
+        assert_eq!(request.compute(&accounting).await.unwrap(), "summary");
+        let accounting = accounting.lock().unwrap();
+        assert_eq!(accounting.usage.input, 5);
+        assert_eq!(accounting.usage.output, 4);
+        assert!(!accounting.inflight_open);
+        assert!(
+            accounting.unknown,
+            "a successful retry cannot prove earlier billing"
+        );
+        assert_eq!(accounting.retries.len(), 1);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn malformed_terminal_preserves_usage_decoded_before_validation_failure() {
+        let body = "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{}],\"usage\":{\"input_tokens\":17,\"output_tokens\":9}}}\n\n";
+        let (request, server) = loopback_request(vec![(200, body.into())]);
+        let accounting = Mutex::new(SummaryAccounting::default());
+        assert!(request.attempt(&accounting).await.is_err());
+        let accounting = accounting.lock().unwrap();
+        assert_eq!(accounting.usage.input, 17);
+        assert_eq!(accounting.usage.output, 9);
+        assert!(accounting.unknown);
+        assert!(!accounting.inflight_open);
+        server.join().unwrap();
+    }
 
     #[test]
     fn speculative_rate_limit_detection_covers_http_and_stream_errors() {

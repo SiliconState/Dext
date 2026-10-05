@@ -240,9 +240,14 @@ fn ensure_owner_safe_dir(path: &Path) -> Result<()> {
                     std::fs::DirBuilder::new()
                 }
             };
-            builder
-                .create(path)
-                .with_context(|| format!("creating seat state ancestor {}", path.display()))
+            match builder.create(path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    ensure_owner_safe_dir(path)
+                }
+                Err(error) => Err(error)
+                    .with_context(|| format!("creating seat state ancestor {}", path.display())),
+            }
         }
         Err(error) => Err(error.into()),
     }
@@ -374,9 +379,17 @@ fn ensure_private_dir(path: &Path) -> Result<()> {
                     std::fs::DirBuilder::new()
                 }
             };
-            builder
-                .create(path)
-                .with_context(|| format!("creating seat state directory {}", path.display()))?;
+            match builder.create(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    ensure_private_dir(path)?;
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("creating seat state directory {}", path.display())
+                    });
+                }
+            }
         }
         Err(error) => return Err(error.into()),
     }
