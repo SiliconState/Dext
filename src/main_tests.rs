@@ -9235,6 +9235,259 @@ fn background_test_candidate(agent: &mut Agent) -> tokio::sync::oneshot::Sender<
     tx
 }
 
+#[test]
+fn background_compaction_default_and_cli_choices_are_explicit() -> Result<()> {
+    let _guard = env_lock();
+    let previous = std::env::var_os("DEXT_BACKGROUND_COMPACT");
+    unsafe { std::env::remove_var("DEXT_BACKGROUND_COMPACT") };
+    assert!(compaction::background_default());
+    unsafe { std::env::set_var("DEXT_BACKGROUND_COMPACT", "0") };
+    assert!(!compaction::background_default());
+    unsafe { std::env::set_var("DEXT_BACKGROUND_COMPACT", "1") };
+    assert!(compaction::background_default());
+    restore_env_var("DEXT_BACKGROUND_COMPACT", previous);
+    assert_eq!(
+        parse_cli_options(vec!["--background-compact=off".into()])?.background_compact,
+        Some(false)
+    );
+    assert_eq!(
+        parse_cli_options(vec!["--background-compact".into(), "on".into()])?.background_compact,
+        Some(true)
+    );
+    for flags in [
+        vec!["--background-compact"],
+        vec!["--background-compact=maybe"],
+        vec!["--background-compact="],
+    ] {
+        assert!(parse_cli_options(flags.into_iter().map(str::to_string).collect()).is_err());
+    }
+    for (command, value) in [
+        ("/compact background", None),
+        ("/compact background status", None),
+        ("/compact background on", Some(true)),
+        ("/compact background OFF", Some(false)),
+    ] {
+        assert_eq!(
+            parse_compact_slash(command),
+            Some(Ok(CompactSlash::Background(value)))
+        );
+    }
+    assert!(matches!(
+        parse_compact_slash("/compact background off extra"),
+        Some(Err(_))
+    ));
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[allow(clippy::await_holding_lock)]
+async fn background_compaction_preference_persists_and_legacy_uses_startup_default() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("background-setting-resume").canonicalize()?;
+    let _cleanup = RemoveDirOnDrop(root.clone());
+    let state = root.join("state");
+    std::fs::create_dir(&state)?;
+    let _state_env = PackEnvGuard::new(&state);
+    let mut source = test_agent(&root);
+    background_test_history(&mut source);
+    source.latest_session_path = root.join("saved.jsonl");
+    source.configure_background_compaction(Some(false)).await?;
+    let (header, history) = read_session_jsonl(&source.latest_session_path)?;
+    assert_eq!(header.background_compact, Some(false));
+    let mut resumed = test_agent(&root);
+    resumed.session_enabled = false;
+    resumed.background.enabled = true;
+    resumed.load_session_from_path(&source.latest_session_path)?;
+    assert!(
+        !resumed.background.enabled,
+        "saved choice wins over the startup default"
+    );
+    resumed.apply_background_compaction_override(Some(true))?;
+    assert!(
+        resumed.background.enabled,
+        "explicit CLI wins after saved preference"
+    );
+    resumed.apply_background_compaction_override(Some(false))?;
+    assert!(!resumed.background.enabled);
+    let old_env = std::env::var_os("DEXT_BACKGROUND_COMPACT");
+    unsafe { std::env::remove_var("DEXT_BACKGROUND_COMPACT") };
+    let mut legacy = serde_json::to_value(header)?;
+    legacy["version"] = json!(SEAT_TRANSITIONAL_FORMAT_VERSION);
+    legacy.as_object_mut().unwrap().remove("background_compact");
+    let legacy_path = root.join("legacy.jsonl");
+    let mut bytes = format!("{legacy}\n");
+    for message in history {
+        bytes.push_str(&format!("{}\n", serde_json::to_string(&message)?));
+    }
+    std::fs::write(&legacy_path, bytes)?;
+    resumed.load_session_from_path(&legacy_path)?;
+    assert!(
+        resumed.background.enabled,
+        "legacy missing preference defaults on"
+    );
+    unsafe { std::env::set_var("DEXT_BACKGROUND_COMPACT", "0") };
+    resumed.load_session_from_path(&legacy_path)?;
+    assert!(
+        !resumed.background.enabled,
+        "legacy missing preference uses startup override"
+    );
+    restore_env_var("DEXT_BACKGROUND_COMPACT", old_env);
+    for version in [1, 3, 4] {
+        let invalid =
+            json!({"version":version,"model":"test","system":"test","background_compact":"off"});
+        assert!(parse_session_header(&invalid.to_string()).is_err());
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn background_compaction_disable_reaps_accounts_saves_and_keeps_regular_fallback()
+-> Result<()> {
+    let root = temp_test_dir("background-setting-disable");
+    let _cleanup = RemoveDirOnDrop(root.clone());
+    let mut agent = test_agent(&root);
+    background_test_history(&mut agent);
+    agent.latest_session_path = root.join("saved.jsonl");
+    let before = serde_json::to_value(&agent.history)?;
+    let tx = background_test_candidate(&mut agent);
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    agent.set_sink(Box::new(ChannelSink { tx: event_tx }));
+    assert!(
+        agent
+            .configure_background_compaction(Some(false))
+            .await?
+            .contains("off")
+    );
+    assert!(!agent.background.enabled);
+    assert!(agent.background.job.is_none());
+    assert!(tx.send("must not apply".into()).is_err());
+    assert_eq!(serde_json::to_value(&agent.history)?, before);
+    assert_eq!(agent.session_usage.input, 11);
+    let (saved, _) = read_session_jsonl(&agent.latest_session_path)?;
+    assert_eq!(saved.background_compact, Some(false));
+    assert_eq!(saved.usage.input, 11);
+    let events = drain_events(&mut event_rx);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::BackgroundCompactionSetting { enabled: false }
+    )));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::CompactEnd { .. }))
+    );
+    agent.start_background("disabled")?;
+    assert!(agent.background.job.is_none());
+    let threshold = agent.history_chars() - 1;
+    assert!(
+        agent
+            .compact_if_over_threshold(threshold, "regular-fallback")
+            .await
+    );
+    assert!(agent.history_chars() < threshold);
+    assert!(drain_events(&mut event_rx).iter().any(|event| matches!(
+        event,
+        AgentEvent::CompactEnd {
+            background: false,
+            ..
+        }
+    )));
+    agent.background.last_prefix = Some("cancelled-prefix".into());
+    agent.configure_background_compaction(Some(true)).await?;
+    assert!(agent.background.enabled);
+    assert!(agent.background.last_prefix.is_none());
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn background_compaction_not_useful_uses_regular_compaction_at_threshold() -> Result<()> {
+    let root = temp_test_dir("background-setting-fallback");
+    let _cleanup = RemoveDirOnDrop(root.clone());
+    let mut agent = test_agent(&root);
+    background_test_history(&mut agent);
+    agent.latest_session_path = root.join("saved.jsonl");
+    let threshold = agent.history_chars() - 1;
+    let tx = background_test_candidate(&mut agent);
+    tx.send("oversized summary ".repeat(5000)).unwrap();
+    agent.background_wakeup().await;
+    let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+    agent.set_sink(Box::new(ChannelSink { tx }));
+    assert!(
+        agent
+            .compact_if_over_threshold(threshold, "unusable-background-fallback")
+            .await
+    );
+    assert!(agent.history_chars() < threshold);
+    assert!(agent.background.enabled);
+    assert!(agent.background.job.is_none());
+    assert_eq!(agent.session_usage.input, 11);
+    let events = drain_events(&mut events);
+    assert!(events.iter().any(|event| matches!(event,
+        AgentEvent::BackgroundCompaction { phase, reason, .. }
+        if phase == "discarded" && reason == "not_useful_or_unpaired")));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::CompactEnd {
+            background: false,
+            ..
+        }
+    )));
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        AgentEvent::CompactEnd {
+            background: true,
+            ..
+        }
+    )));
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn background_compaction_setting_save_failure_stays_safe_and_retries_accounting_once()
+-> Result<()> {
+    let root = temp_test_dir("background-setting-save-failure");
+    let _cleanup = RemoveDirOnDrop(root.clone());
+    let mut agent = test_agent(&root);
+    background_test_history(&mut agent);
+    agent.latest_session_path = root.join("blocked.jsonl");
+    std::fs::create_dir(&agent.latest_session_path)?;
+    let _tx = background_test_candidate(&mut agent);
+    let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+    agent.set_sink(Box::new(ChannelSink { tx }));
+    assert!(
+        agent
+            .configure_background_compaction(Some(false))
+            .await
+            .is_err()
+    );
+    assert!(!agent.background.enabled);
+    assert!(agent.background.job.is_none());
+    assert!(agent.background.retirement_usage_pending);
+    assert_eq!(agent.session_usage.input, 11);
+    assert!(
+        !drain_events(&mut events)
+            .iter()
+            .any(|event| matches!(event, AgentEvent::BackgroundCompactionSetting { .. }))
+    );
+    assert!(
+        agent
+            .configure_background_compaction(Some(true))
+            .await
+            .is_err()
+    );
+    assert!(
+        !agent.background.enabled,
+        "failed enable never launches speculation"
+    );
+    std::fs::remove_dir(&agent.latest_session_path)?;
+    agent.configure_background_compaction(Some(false)).await?;
+    let (saved, _) = read_session_jsonl(&agent.latest_session_path)?;
+    assert_eq!(saved.background_compact, Some(false));
+    assert_eq!(saved.usage.input, 11);
+    assert!(!agent.background.retirement_usage_pending);
+    Ok(())
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn background_compaction_overlaps_foreground_request_and_idle_apply() -> Result<()> {
     let root = temp_test_dir("background-overlap");
@@ -9818,6 +10071,7 @@ fn kept_fork_preserves_pairs_new_identity_and_source_without_journal_replay() ->
     let result = (|| -> Result<()> {
         let mut agent = test_agent(&root);
         agent.select_seat("parent")?;
+        agent.background.enabled = false;
         agent.history = vec![
             Message {
                 role: "user".into(),
@@ -9866,6 +10120,7 @@ fn kept_fork_preserves_pairs_new_identity_and_source_without_journal_replay() ->
         assert_eq!(history.len(), 1);
         assert_eq!(header.seat.as_ref().map(|s| s.id.as_str()), Some("child"));
         assert_eq!(header.session_id.as_deref(), Some(id));
+        assert_eq!(header.background_compact, Some(false));
         assert!(header.active_pack_runtimes.is_empty());
         assert!(header.allowed.is_empty());
         assert!(

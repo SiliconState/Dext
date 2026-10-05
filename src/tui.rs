@@ -3005,6 +3005,12 @@ impl TuiState {
                 }
                 self.workaround_fired = workaround_fired;
             }
+            AgentEvent::BackgroundCompactionSetting { enabled } => {
+                self.push_debug_event(format!("background compaction setting · {enabled}"));
+                if !enabled {
+                    self.background_compaction = None;
+                }
+            }
             AgentEvent::ThinkingEffortChanged { effort } => {
                 self.push_debug_event(format!("thinking effort changed · {}", effort.as_str()));
                 self.thinking_effort = effort;
@@ -11264,6 +11270,9 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
                                             agent.context_mode.as_str()
                                         ))),
                                     }
+                                    agent.sink.emit(AgentEvent::Slash(
+                                        agent.background_compaction_status(),
+                                    ));
                                 }
                                 Ok(crate::CompactSlash::Auto) => {
                                     agent.set_compact_threshold_auto();
@@ -11278,6 +11287,14 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
                                     agent.sink.emit(AgentEvent::Slash(format!(
                                         "compact threshold set to {percent}% -> {chars} chars"
                                     )));
+                                }
+                                Ok(crate::CompactSlash::Background(choice)) => {
+                                    match agent.configure_background_compaction(choice).await {
+                                        Ok(message) => agent.sink.emit(AgentEvent::Slash(message)),
+                                        Err(error) => agent.sink.emit(AgentEvent::Error(format!(
+                                            "[background compaction] {error:#}"
+                                        ))),
+                                    }
                                 }
                                 Err(msg) => agent.sink.emit(AgentEvent::Slash(msg.to_string())),
                             }

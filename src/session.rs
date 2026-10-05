@@ -1394,6 +1394,14 @@ pub(crate) fn parse_session_header(line: &str) -> Result<SessionHeader> {
         compact_threshold_percent: meta["compact_threshold_percent"]
             .as_u64()
             .and_then(|v| u8::try_from(v).ok()),
+        background_compact: match object.get("background_compact") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(value) => Some(
+                value
+                    .as_bool()
+                    .context("background_compact must be a boolean")?,
+            ),
+        },
         approval_profile: meta["approval_profile"]
             .as_str()
             .and_then(crate::ApprovalProfile::parse)

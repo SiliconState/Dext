@@ -346,6 +346,101 @@ fn tui_path_picker_inserts_without_submitting_and_preserves_draft_on_cancel() {
 }
 
 #[test]
+fn tui_background_preference_is_saved_and_controls_keep_terminal_usable() {
+    let temp = TempDir::new("dext-tui-background-preference").unwrap();
+    let sandbox = temp.path().join("sandbox");
+    let state = temp.path().join("state");
+    let home = temp.path().join("home");
+    let sessions = temp.path().join("sessions");
+    for path in [&sandbox, &state, &home, &sessions] {
+        fs::create_dir_all(path).unwrap();
+    }
+    let mut pty = Pty::open(TUI_COLS, TUI_ROWS).unwrap();
+    let mut child = spawn_dext_configured(
+        &pty,
+        &sandbox,
+        &state,
+        &home,
+        &[
+            ("DEXT_PROVIDER", "local"),
+            ("DEXT_BASE_URL", "http://127.0.0.1:1"),
+            ("DEXT_MODEL", "mock-model"),
+            ("DEXT_MODEL_FORCE", "1"),
+            ("DEXT_SESSIONS_DIR", sessions.to_str().unwrap()),
+        ],
+        true,
+    )
+    .unwrap();
+    assert_visible(
+        &mut pty,
+        &mut child,
+        "Type a request",
+        Duration::from_secs(5),
+    );
+    pty.write_all_retry(b"/compact background status\r")
+        .unwrap();
+    assert_visible(
+        &mut pty,
+        &mut child,
+        "background compaction: on",
+        Duration::from_secs(5),
+    );
+    pty.write_all_retry(b"/compact background off\r").unwrap();
+    assert_visible(
+        &mut pty,
+        &mut child,
+        "background compaction: off",
+        Duration::from_secs(5),
+    );
+    let saved = fs::read_dir(&sessions)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path().join("_latest.jsonl"))
+        .find(|file| file.is_file())
+        .expect("per-session choice saves even empty history");
+    let header = || -> serde_json::Value {
+        serde_json::from_str(fs::read_to_string(&saved).unwrap().lines().next().unwrap()).unwrap()
+    };
+    assert_eq!(header()["background_compact"], false);
+    let at = pty.capture.len();
+    pty.write_all_retry(format!("/resume {}\r", saved.display()).as_bytes())
+        .unwrap();
+    assert_visible_since(&mut pty, &mut child, at, "loaded", Duration::from_secs(5));
+    let at = pty.capture.len();
+    pty.write_all_retry(b"/compact background status\r")
+        .unwrap();
+    assert_visible_since(
+        &mut pty,
+        &mut child,
+        at,
+        "background compaction: off",
+        Duration::from_secs(5),
+    );
+    pty.write_all_retry(b"/compact background on\r").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while header()["background_compact"] != true {
+        assert!(
+            Instant::now() < deadline,
+            "re-enabled preference was not saved"
+        );
+        pty.pump_for(&mut child, Duration::from_millis(30)).unwrap();
+    }
+    pty.write_all_retry(b"/history\r").unwrap();
+    assert_visible(
+        &mut pty,
+        &mut child,
+        "history: 0 messages",
+        Duration::from_secs(5),
+    );
+    pty.write_all_retry(b"\x04").unwrap();
+    assert!(
+        wait_for_exit(&mut child, Duration::from_secs(5), &mut pty)
+            .unwrap()
+            .success()
+    );
+}
+
+#[test]
 fn tui_background_summary_applies_while_idle_and_keeps_input_available() {
     run_tui_background_summary(false);
 }

@@ -1609,6 +1609,7 @@ enum CompactSlash {
     Status,
     Auto,
     SetPercent(u8),
+    Background(Option<bool>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1992,6 +1993,7 @@ impl EventSink for ConsoleSink {
             }
             AgentEvent::ExternalTelemetry { .. } => {}
             AgentEvent::TurnDiagnostics { .. } => {}
+            AgentEvent::BackgroundCompactionSetting { .. } => {}
             AgentEvent::ThinkingEffortChanged { .. } => {}
             AgentEvent::ReasoningModeChanged { .. } => {}
             AgentEvent::ApprovalProfileChanged { .. } => {}
@@ -11687,6 +11689,10 @@ const HELP_GROUPS: &[(&str, &[(&str, &str)])] = &[
                 "/compact [status|auto|N]",
                 "summarize older history or set the auto-compaction threshold",
             ),
+            (
+                "/compact background [on|off|status]",
+                "saved per-session background setting; regular compaction remains available",
+            ),
             ("/usage", "cumulative token usage this session"),
             ("/status", "runtime diagnostics (provider, auth, model)"),
             ("/tokens", "approximate tokens per message + top hogs"),
@@ -11980,6 +11986,8 @@ struct SessionHeader {
     compact_threshold_chars: Option<usize>,
     #[serde(default)]
     compact_threshold_percent: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    background_compact: Option<bool>,
     #[serde(default = "legacy_approval_profile")]
     approval_profile: ApprovalProfile,
     #[serde(default)]
@@ -12031,6 +12039,7 @@ impl Default for SessionHeader {
             reasoning_mode: ReasoningMode::default(),
             compact_threshold_chars: None,
             compact_threshold_percent: None,
+            background_compact: None,
             approval_profile: ApprovalProfile::default(),
             approval_policy_source: ApprovalPolicySource::default(),
             sandbox_profile: SandboxProfile::default(),
@@ -12665,6 +12674,26 @@ fn parse_compact_slash(line: &str) -> Option<Result<CompactSlash, &'static str>>
     }
     if arg.eq_ignore_ascii_case("auto") {
         return Some(Ok(CompactSlash::Auto));
+    }
+
+    let words = arg.split_whitespace().collect::<Vec<_>>();
+    if words
+        .first()
+        .is_some_and(|word| word.eq_ignore_ascii_case("background"))
+    {
+        return Some(match words.as_slice() {
+            [_] => Ok(CompactSlash::Background(None)),
+            [_, value] if value.eq_ignore_ascii_case("status") => {
+                Ok(CompactSlash::Background(None))
+            }
+            [_, value] if value.eq_ignore_ascii_case("on") => {
+                Ok(CompactSlash::Background(Some(true)))
+            }
+            [_, value] if value.eq_ignore_ascii_case("off") => {
+                Ok(CompactSlash::Background(Some(false)))
+            }
+            _ => Err("usage: /compact background [on|off|status]"),
+        });
     }
 
     let numeric = arg.strip_suffix('%').unwrap_or(arg).trim();
@@ -14107,7 +14136,7 @@ impl Agent {
             partial_stream_text: None,
             quiet_stream_events: false,
             background: compaction::BackgroundState {
-                enabled: env_flag_default("DEXT_BACKGROUND_COMPACT", false),
+                enabled: compaction::background_default(),
                 ..Default::default()
             },
             compact_threshold_chars: compact_threshold_percent
@@ -17564,6 +17593,7 @@ impl Agent {
             reasoning_mode: self.reasoning_mode,
             compact_threshold_chars: self.compact_threshold_override(),
             compact_threshold_percent: self.compact_threshold_override_percent(),
+            background_compact: Some(self.background.enabled),
             approval_profile: self.approval_profile,
             approval_policy_source: self.approval_policy_source,
             sandbox_profile: self.sandbox_profile,
@@ -17762,6 +17792,7 @@ impl Agent {
             reasoning_mode,
             compact_threshold_chars,
             compact_threshold_percent,
+            background_compact,
             approval_profile: _saved_approval_profile,
             approval_policy_source: _saved_approval_policy_source,
             sandbox_profile: _saved_sandbox_profile,
@@ -17956,6 +17987,7 @@ impl Agent {
         self.system = system;
         self.allowed.clear();
         self.session_usage = usage;
+        self.background.enabled = background_compact.unwrap_or_else(compaction::background_default);
         self.thinking_effort = thinking_effort;
         self.reasoning_mode = reasoning_mode;
         self.compact_threshold_percent =
@@ -18040,6 +18072,7 @@ impl Agent {
                 self.last_checkpoint_signature = Some((self.history.len(), self.history_chars()));
             }
         }
+        self.emit_background_compaction_setting();
         Ok(path.to_path_buf())
     }
 
@@ -19060,23 +19093,23 @@ impl Agent {
                 }
                 self.checkpoint_latest_session("after_pre_request_hooks");
             }
-            if self.background.enabled {
-                compacted_this_turn |= self.service_background(false).await;
+            compacted_this_turn |= self.service_background(false).await;
+            if self.history_chars() > self.active_compact_threshold_chars() {
+                compacted_this_turn |= self
+                    .compact_if_over_threshold(
+                        self.active_compact_threshold_chars(),
+                        "before_headroom_request",
+                    )
+                    .await;
                 if self.history_chars() > self.active_compact_threshold_chars() {
-                    compacted_this_turn |= self
-                        .compact_if_over_threshold(
-                            self.active_compact_threshold_chars(),
-                            "before_background_headroom_request",
-                        )
-                        .await;
-                    if self.history_chars() > self.active_compact_threshold_chars() {
-                        anyhow::bail!("context headroom exhausted after bounded compaction");
-                    }
+                    anyhow::bail!("context headroom exhausted after bounded compaction");
                 }
-                if let Err(error) = self.start_background(&turn_id) {
-                    self.append_latest_log("background_prepare_failed", &error.to_string());
-                    self.background.cooldown = Some(std::time::Instant::now());
-                }
+            }
+            if self.background.enabled
+                && let Err(error) = self.start_background(&turn_id)
+            {
+                self.append_latest_log("background_prepare_failed", &error.to_string());
+                self.background.cooldown = Some(std::time::Instant::now());
             }
             let chatgpt_session_id = self.request_contract().is_responses().then(|| {
                 format!(
@@ -23292,6 +23325,17 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                         );
                     }
                 }
+                let _ = writeln!(w, "{}", agent.background_compaction_status());
+            }
+            "background" | "background status" => {
+                agent.emit_background_compaction_setting();
+                let _ = writeln!(w, "{}", agent.background_compaction_status());
+            }
+            "background on" | "background off" => {
+                let _ = writeln!(
+                    w,
+                    "background compaction changes are handled before generic slash dispatch"
+                );
             }
             "auto" => {
                 agent.set_compact_threshold_auto();
@@ -23354,6 +23398,7 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             let _ = writeln!(w, "schemas: {}", agent.wire_tool_profile().as_str());
             let _ = writeln!(w, "toolset: {}", agent.tool_context_profile().as_str());
             let _ = writeln!(w, "compact threshold: {}", agent.compact_threshold_chars());
+            let _ = writeln!(w, "{}", agent.background_compaction_status());
             let _ = writeln!(w, "approval profile: {}", agent.approval_profile().as_str());
             let _ = writeln!(
                 w,
@@ -24562,6 +24607,7 @@ pub(crate) struct CliOptions {
     pub(crate) thinking_effort: Option<ThinkingEffort>,
     pub(crate) reasoning_mode: Option<ReasoningMode>,
     pub(crate) context_mode: Option<ContextMode>,
+    pub(crate) background_compact: Option<bool>,
     pub(crate) tool_context_profile: Option<ToolContextProfile>,
     pub(crate) tool_profile: Option<ToolProfile>,
     pub(crate) preview_mode: Option<MutationPreviewMode>,
@@ -24590,6 +24636,7 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
     let mut thinking_effort: Option<ThinkingEffort> = None;
     let mut reasoning_mode: Option<ReasoningMode> = None;
     let mut context_mode: Option<ContextMode> = None;
+    let mut background_compact = None;
     let mut tool_context_profile: Option<ToolContextProfile> = None;
     let mut tool_profile: Option<ToolProfile> = None;
     let mut preview_mode: Option<MutationPreviewMode> = None;
@@ -24659,6 +24706,28 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
                 }
             }
             "--tiny" => anyhow::bail!("unknown option '--tiny'; use --frugal"),
+            "--background-compact" => {
+                i += 1;
+                let value = argv
+                    .get(i)
+                    .context("--background-compact requires on|off")?;
+                if background_compact
+                    .replace(compaction::parse_background_choice(value)?)
+                    .is_some()
+                {
+                    anyhow::bail!("--background-compact specified more than once");
+                }
+            }
+            _ if arg.starts_with("--background-compact=") => {
+                if background_compact
+                    .replace(compaction::parse_background_choice(
+                        arg.trim_start_matches("--background-compact="),
+                    )?)
+                    .is_some()
+                {
+                    anyhow::bail!("--background-compact specified more than once");
+                }
+            }
             "--context-mode" => {
                 i += 1;
                 let value = argv
@@ -25003,6 +25072,7 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
         thinking_effort,
         reasoning_mode,
         context_mode,
+        background_compact,
         tool_context_profile,
         tool_profile,
         preview_mode,
@@ -25130,6 +25200,11 @@ fn keep_session_fork(opts: &CliOptions) -> Result<Value> {
     header.usage = Usage::default();
     header.sandbox = Some(root.to_string_lossy().into_owned());
     header.version = source_version.max(SEAT_FORMAT_VERSION);
+    header.background_compact = Some(opts.background_compact.unwrap_or_else(|| {
+        header
+            .background_compact
+            .unwrap_or_else(compaction::background_default)
+    }));
     seats::save_new_fork(&root, &header, &history)?;
     Ok(json!({"seat":target,"session_id":session_id,"source_session_id":source_id,"at":at}))
 }
@@ -25611,6 +25686,9 @@ async fn agent_main() -> Result<()> {
             "       dext --frugal        minimize prompt/tool/history context for lower token cost"
         );
         println!("       dext --context-mode standard|frugal");
+        println!(
+            "       dext --background-compact on|off  override this session's background compaction (default on)"
+        );
         println!("       dext --toolset default|full  choose provider-visible tool count profile");
         println!("       dext --tool-context-profile default|full  alias for --toolset");
         println!(
@@ -25627,7 +25705,7 @@ async fn agent_main() -> Result<()> {
         println!("       dext undo --apply <id>   non-interactive apply");
         println!("       dext                  interactive REPL (or reads stdin if piped)");
         println!(
-            "env:   DEXT_PROVIDER, DEXT_PROFILE, DEXT_MODEL, DEXT_MODEL_<PROVIDER>, DEXT_MODEL_FORCE=1, DEXT_BASE_URL, DEXT_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, CHATGPT_ACCESS_TOKEN, ZAI_API_KEY, ANTHROPIC_BASE_URL, OPENAI_BASE_URL, DEXT_SYSTEM, DEXT_EXTERNAL_TIMEOUT_SECS, DEXT_BASH_TIMEOUT_SECS, DEXT_HOOK_TIMEOUT_SECS, DEXT_SESSIONS_DIR, DEXT_LOGS_DIR, DEXT_LOG_ARCHIVES (0-16 rotated archives of latest.log; default 0 keeps truncation-only), DEXT_APPROVAL=ask|auto-read|auto-write|never|always, DEXT_TRUST=1 as an alias for approval=always, DEXT_PRIVACY=0 to disable output redaction or DEXT_PRIVACY=strict to block sensitive-looking native read paths, DEXT_INHERIT_TOOL_CREDENTIALS=1 to explicitly pass provider API credentials to tool subprocesses, DEXT_NO_TUI=1, DEXT_THINKING_EFFORT=off|minimal|low|medium|high|xhigh|max, DEXT_REASONING_MODE=standard|pro, DEXT_CONTEXT_MODE=standard|frugal, DEXT_TOOLSET=default|full, DEXT_TOOL_PROFILE=lean|full, DEXT_MUTATION_PREVIEW=off|simple|git, DEXT_BUDGET_CAP, DEXT_SANDBOX_PROFILE, DEXT_SHELVES_DIR"
+            "env:   DEXT_PROVIDER, DEXT_PROFILE, DEXT_MODEL, DEXT_MODEL_<PROVIDER>, DEXT_MODEL_FORCE=1, DEXT_BASE_URL, DEXT_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, CHATGPT_ACCESS_TOKEN, ZAI_API_KEY, ANTHROPIC_BASE_URL, OPENAI_BASE_URL, DEXT_SYSTEM, DEXT_EXTERNAL_TIMEOUT_SECS, DEXT_BASH_TIMEOUT_SECS, DEXT_HOOK_TIMEOUT_SECS, DEXT_SESSIONS_DIR, DEXT_LOGS_DIR, DEXT_LOG_ARCHIVES (0-16 rotated archives of latest.log; default 0 keeps truncation-only), DEXT_APPROVAL=ask|auto-read|auto-write|never|always, DEXT_TRUST=1 as an alias for approval=always, DEXT_PRIVACY=0 to disable output redaction or DEXT_PRIVACY=strict to block sensitive-looking native read paths, DEXT_INHERIT_TOOL_CREDENTIALS=1 to explicitly pass provider API credentials to tool subprocesses, DEXT_NO_TUI=1, DEXT_THINKING_EFFORT=off|minimal|low|medium|high|xhigh|max, DEXT_REASONING_MODE=standard|pro, DEXT_CONTEXT_MODE=standard|frugal, DEXT_BACKGROUND_COMPACT=0|1 (startup default; default 1, saved session and CLI override it), DEXT_TOOLSET=default|full, DEXT_TOOL_PROFILE=lean|full, DEXT_MUTATION_PREVIEW=off|simple|git, DEXT_BUDGET_CAP, DEXT_SANDBOX_PROFILE, DEXT_SHELVES_DIR"
         );
         return Ok(());
     }
@@ -25826,6 +25904,7 @@ async fn agent_main() -> Result<()> {
             }
         }
     }
+    agent.apply_background_compaction_override(opts.background_compact)?;
     if !opts.output.is_json() {
         eprintln!(
             "[approval] profile {} (source {})",
@@ -26063,6 +26142,7 @@ async fn agent_main() -> Result<()> {
                 "sandbox": agent.sandbox_root.display().to_string(),
                 "thinking_effort": agent.thinking_effort,
                 "approval": agent.approval_profile,
+                "background_compact": agent.background.enabled,
                 "frames": ["user", "steer", "control", "interrupt", "permission", "ui.capabilities", "ui.response", "close"],
                 "ui_protocol": 1,
             }
@@ -26187,6 +26267,8 @@ async fn agent_main() -> Result<()> {
                             );
                         }
                     }
+                    let message = agent.background_compaction_status();
+                    note(&mut agent, message);
                 }
                 Ok(CompactSlash::Auto) => {
                     agent.set_compact_threshold_auto();
@@ -26203,6 +26285,14 @@ async fn agent_main() -> Result<()> {
                         &mut agent,
                         format!("compact threshold set to {percent}% -> {chars} chars"),
                     );
+                }
+                Ok(CompactSlash::Background(choice)) => {
+                    match agent.configure_background_compaction(choice).await {
+                        Ok(message) => note(&mut agent, message),
+                        Err(error) => agent.sink.emit(AgentEvent::Error(format!(
+                            "[background compaction] {error:#}"
+                        ))),
+                    }
                 }
                 Err(msg) => note(&mut agent, msg.to_string()),
             }

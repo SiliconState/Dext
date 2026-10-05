@@ -108,6 +108,135 @@ fn ready_first_then_close_terminates_with_pure_json_stdout() {
 }
 
 #[test]
+fn background_compaction_defaults_on_and_session_controls_remain_provider_free() {
+    let root = temp_root("background-setting-controls");
+    let mut child = spawn(&root, &[]);
+    let mut stdin = child.stdin.take().unwrap();
+    for command in [
+        "/compact background off",
+        "/compact background status",
+        "/compact background on",
+    ] {
+        writeln!(
+            stdin,
+            "{}",
+            serde_json::json!({"type":"control","command":command})
+        )
+        .unwrap();
+    }
+    writeln!(stdin, r#"{{"type":"close"}}"#).unwrap();
+    drop(stdin);
+    let events = drain_json(&mut child);
+    assert!(wait_within(&mut child, Duration::from_secs(20)).success());
+    let ready = events
+        .iter()
+        .find(|event| event["event"] == "ready")
+        .unwrap();
+    assert_eq!(ready["data"]["background_compact"], true);
+    let settings = events
+        .iter()
+        .filter(|event| event["event"] == "background_compaction_setting")
+        .map(|event| event["data"]["enabled"].as_bool().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(settings, [false, false, true]);
+    assert!(
+        !events
+            .iter()
+            .any(|event| event["event"] == "turn_start" || event["event"] == "compact_start")
+    );
+    let mut disabled = spawn(&root, &["--background-compact=off"]);
+    writeln!(disabled.stdin.as_mut().unwrap(), r#"{{"type":"close"}}"#).unwrap();
+    let events = drain_json(&mut disabled);
+    assert!(wait_within(&mut disabled, Duration::from_secs(20)).success());
+    assert_eq!(events[0]["data"]["background_compact"], false);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn background_compaction_preference_survives_provider_free_restart_and_cli_override() {
+    let root = temp_root("background-setting-persist");
+    let invoke = |extra: &[&str], controls: &[&str]| {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_dext"))
+            .args(["--input", "ndjson", "--output", "stream-json", "--cd"])
+            .arg(&root)
+            .args(extra)
+            .current_dir(&root)
+            .env_clear()
+            .env("PATH", path)
+            .env("HOME", &root)
+            .env("DEXT_HOME", root.join(".dext"))
+            .env("DEXT_PROVIDER", "local")
+            .env("DEXT_BASE_URL", "http://127.0.0.1:1")
+            .env("DEXT_MODEL", "mock-model")
+            .env("DEXT_MODEL_FORCE", "1")
+            .env("DEXT_APPROVAL", "never")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut input = child.stdin.take().unwrap();
+        for command in controls {
+            writeln!(
+                input,
+                "{}",
+                serde_json::json!({"type":"control", "command": command})
+            )
+            .unwrap();
+        }
+        writeln!(input, r#"{{"type":"close"}}"#).unwrap();
+        drop(input);
+        let events = drain_json(&mut child);
+        let success = wait_within(&mut child, Duration::from_secs(20)).success();
+        assert!(success, "{events:?}");
+        let ready = events
+            .iter()
+            .find(|event| event["event"] == "ready")
+            .unwrap()
+            .clone();
+        assert!(!events.iter().any(|event| event["event"] == "turn_start"));
+        ready
+    };
+    let first = invoke(&[], &["/compact background off"]);
+    assert_eq!(first["data"]["background_compact"], true);
+    let session_id = first["data"]["session_id"].as_str().unwrap();
+    let projects = root.join(".dext/projects");
+    let project = std::fs::read_dir(&projects)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let saved = project
+        .join("sessions")
+        .join(session_id)
+        .join("_latest.jsonl");
+    assert!(
+        saved.is_file(),
+        "an empty session must save its per-session preference"
+    );
+    let header: serde_json::Value = serde_json::from_str(
+        std::fs::read_to_string(&saved)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(header["background_compact"], false);
+    let resume = format!("--resume={}", saved.display());
+    let second = invoke(&[&resume], &[]);
+    assert_eq!(second["data"]["background_compact"], false);
+    assert_eq!(second["data"]["session_id"], first["data"]["session_id"]);
+    let overridden = invoke(&[&resume, "--background-compact=on"], &[]);
+    assert_eq!(overridden["data"]["background_compact"], true);
+    let third = invoke(&[&resume], &[]);
+    assert_eq!(third["data"]["background_compact"], true);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn incompatible_flags_fail_without_reading_stdin() {
     for extra in [&["-p"][..], &["--pack", "missing-pack"][..]] {
         let root = temp_root(if extra[0] == "-p" { "print" } else { "pack" });

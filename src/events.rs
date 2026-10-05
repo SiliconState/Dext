@@ -162,6 +162,9 @@ pub(crate) enum AgentEvent {
         usage: Usage,
         failed: bool,
     },
+    BackgroundCompactionSetting {
+        enabled: bool,
+    },
     BackgroundCompaction {
         version: u32,
         session_id: String,

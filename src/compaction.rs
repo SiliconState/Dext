@@ -11,6 +11,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+pub(crate) fn background_default() -> bool {
+    crate::env_flag_default("DEXT_BACKGROUND_COMPACT", true)
+}
+
+pub(crate) fn parse_background_choice(value: &str) -> Result<bool> {
+    match value.to_ascii_lowercase().as_str() {
+        "on" => Ok(true),
+        "off" => Ok(false),
+        _ => bail!("background compaction requires on|off"),
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct BackgroundState {
     pub(crate) enabled: bool,
@@ -316,6 +328,75 @@ impl SummaryRequest {
 }
 
 impl Agent {
+    pub(crate) fn emit_background_compaction_setting(&mut self) {
+        self.sink.emit(AgentEvent::BackgroundCompactionSetting {
+            enabled: self.background.enabled,
+        });
+    }
+
+    pub(crate) fn background_compaction_status(&self) -> String {
+        let state = if self.background.enabled { "on" } else { "off" };
+        let suspended = if self.background.enabled && self.budget_cap.is_some() {
+            "; speculation suspended by budget"
+        } else if self.background.enabled && !self.hooks.pre_request.is_empty() {
+            "; speculation suspended by pre-request hooks"
+        } else {
+            ""
+        };
+        format!("background compaction: {state}{suspended}; regular compaction remains available")
+    }
+
+    pub(crate) fn apply_background_compaction_override(
+        &mut self,
+        choice: Option<bool>,
+    ) -> Result<()> {
+        if let Some(enabled) = choice {
+            self.background.enabled = enabled;
+            if self.session_enabled {
+                self.save_latest_session()
+                    .context("persisting startup background compaction setting")?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn configure_background_compaction(
+        &mut self,
+        choice: Option<bool>,
+    ) -> Result<String> {
+        if let Some(enabled) = choice {
+            let previous = self.background.enabled;
+            self.background.enabled = enabled;
+            if !enabled {
+                self.background.history_epoch = self.background.history_epoch.wrapping_add(1);
+                self.background.config_epoch = self.background.config_epoch.wrapping_add(1);
+                if self.background.job.is_some() {
+                    self.background.cooldown = Some(Instant::now());
+                }
+                self.settle_background("disabled").await;
+                self.background.retirement_usage_pending = self.session_enabled;
+            } else if !previous {
+                self.background.last_prefix = None;
+            }
+            if self.session_enabled
+                && let Err(error) = self.save_latest_session()
+            {
+                // Never leave newly enabled speculation active after a failed setting save.
+                self.background.enabled = previous && enabled;
+                return Err(anyhow::anyhow!(
+                    self.privacy
+                        .redact_text(&format!(
+                            "persisting background compaction setting: {error:#}"
+                        ))
+                        .text
+                ));
+            }
+            self.background.retirement_usage_pending = false;
+        }
+        self.emit_background_compaction_setting();
+        Ok(self.background_compaction_status())
+    }
+
     pub(crate) fn history_pairs_closed(history: &[crate::Message]) -> bool {
         let mut uses = std::collections::HashMap::new();
         let mut results = std::collections::HashMap::new();
@@ -334,6 +415,7 @@ impl Agent {
     pub(crate) fn background_config_digest(&self) -> String {
         sha256_hex_str(&json!({
             "route": self.provider_route_identity(), "root": self.sandbox_root,
+            "background_compact": self.background.enabled,
             "model": self.compact_summary_model(), "context": self.context_mode,
             "effort": self.thinking_effort, "reasoning": self.reasoning_mode,
             "privacy": self.privacy.mode_label(), "threshold": self.active_compact_threshold_chars(),
@@ -458,7 +540,8 @@ impl Agent {
     }
 
     pub(crate) fn background_eligible(&self, job: &BackgroundJob) -> bool {
-        job.session == self.session_id
+        self.background.enabled
+            && job.session == self.session_id
             && job.history_epoch == self.background.history_epoch
             && job.config_epoch == self.background.config_epoch
             && job.config_digest == self.background_config_digest()
