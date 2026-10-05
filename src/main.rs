@@ -15261,7 +15261,7 @@ impl Agent {
     fn adopt_session_id(&mut self, session_id: String) -> Result<()> {
         let lock = SessionStateLock::acquire(&self.sandbox_root, &session_id)
             .with_context(|| format!("resuming session state '{session_id}'"))?;
-        self.retire_background_session("session_identity");
+        self.retire_background_session("session_identity")?;
         self.session_id = session_id;
         self.state_lock = Some(Arc::new(lock));
         self.refresh_state_paths();
@@ -15270,7 +15270,6 @@ impl Agent {
     }
 
     fn set_sandbox_root(&mut self, root: PathBuf) -> Result<()> {
-        self.retire_background_session("sandbox");
         let root = std::fs::canonicalize(&root)
             .with_context(|| format!("canonicalizing sandbox root {}", root.display()))?;
         if !std::fs::metadata(&root)
@@ -15294,6 +15293,7 @@ impl Agent {
         };
         git_checkpoints::normalize_existing_checkpoint_storage(&root)
             .map_err(anyhow::Error::msg)?;
+        self.retire_background_session("sandbox")?;
 
         let root_changed = self.sandbox_root != root;
         let project_changed = project_key(&self.sandbox_root) != project_key(&root);
@@ -17744,7 +17744,6 @@ impl Agent {
         path: &Path,
         expected_seat: Option<&str>,
     ) -> Result<PathBuf> {
-        self.retire_background_session("session_load");
         let file =
             std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
         let mut reader = io::BufReader::new(file);
@@ -17758,7 +17757,7 @@ impl Agent {
             system,
             allowed: _saved_allowed,
             sandbox,
-            usage,
+            mut usage,
             thinking_effort,
             reasoning_mode,
             compact_threshold_chars,
@@ -17796,6 +17795,11 @@ impl Agent {
                     .with_context(|| format!("restoring saved sandbox {saved_sandbox}"))
             })
             .transpose()?;
+        if let Some(root) = &restored_sandbox
+            && !std::fs::metadata(root)?.is_dir()
+        {
+            anyhow::bail!("sandbox root is not a directory: {}", root.display());
+        }
         if seat.is_some() && restored_sandbox.is_none() {
             anyhow::bail!("seated session is missing project sandbox provenance");
         }
@@ -17899,6 +17903,18 @@ impl Agent {
             }
         }
 
+        let reloading_current = (self.background.job.is_some()
+            || self.background.retirement_usage_pending)
+            && std::fs::canonicalize(path).is_ok_and(|source| {
+                std::fs::canonicalize(&self.latest_session_path)
+                    .is_ok_and(|current| source == current)
+            })
+            && saved_session_id.as_deref() == Some(self.session_id.as_str())
+            && runtime_root == self.sandbox_root;
+        self.retire_background_session("session_load")?;
+        if reloading_current {
+            usage = self.session_usage;
+        }
         if let Some(restored) = restored_sandbox {
             self.set_sandbox_root(restored)?;
         }
@@ -18662,7 +18678,10 @@ impl Agent {
         };
         self.sink.emit(AgentEvent::CompactStart);
         let before = self.history.len();
-        let result = self.compact_after_start(split, before).await;
+        let result = self
+            .compact_after_start(split, before)
+            .await
+            .map_err(|error| anyhow::anyhow!(self.privacy.redact_text(&format!("{error:#}")).text));
         if let Err(e) = &result {
             let message = format!("{e:#}");
             self.append_latest_log("compact_failed", &message);
@@ -18690,9 +18709,12 @@ impl Agent {
             match self.one_shot_summary(&summary_input, &evidence).await {
                 Ok(v) => v,
                 Err(e) if !self.interrupt.load(Ordering::SeqCst) && !evidence.trim().is_empty() => {
-                    let msg = format!(
-                        "summary model failed; using deterministic compaction evidence: {e:#}"
-                    );
+                    let msg = self
+                        .privacy
+                        .redact_text(&format!(
+                            "summary model failed; using deterministic compaction evidence: {e:#}"
+                        ))
+                        .text;
                     self.append_latest_log("compact_summary_fallback", &msg);
                     self.sink
                         .emit(AgentEvent::Warn(format!("[compact fallback] {msg}")));
@@ -18708,8 +18730,20 @@ impl Agent {
         self.ensure_session_usage_cost();
         let summary = self.privacy.redact_text(&summary).text;
 
-        self.history =
+        let candidate =
             build_compacted_history(&summary, preserved_tool_msgs, &self.history[split..]);
+        if !Self::history_pairs_closed(&candidate) {
+            anyhow::bail!("compacted history contains unpaired tool calls");
+        }
+        let old = std::mem::replace(&mut self.history, candidate);
+        if self.session_enabled
+            && let Err(error) = self.save_latest_session()
+        {
+            self.history = old;
+            return Err(error).context("persisting compacted history before application");
+        }
+        self.last_checkpoint_at = Some(std::time::Instant::now());
+        self.last_checkpoint_signature = Some((self.history.len(), self.history_chars()));
 
         let compacted_chars = self.history_chars();
         let compacted_tokens = self.estimated_context_tokens_from_history();
@@ -18727,7 +18761,6 @@ impl Agent {
             background: false,
         });
         self.append_latest_log("compact_complete", &format!("{before} -> {after} messages"));
-        self.checkpoint_latest_session("after_compact");
         self.post_compact_hooks(&summary);
         Ok(())
     }

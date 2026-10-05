@@ -328,6 +328,13 @@ fn parse_tool_arguments(
     call_label: &str,
     raw: &str,
 ) -> Result<Value> {
+    if raw.len() > TOOL_ARGUMENT_BUFFER_CAP {
+        return Err(protocol_error(
+            contract,
+            event,
+            "tool arguments exceeded buffer cap",
+        ));
+    }
     if raw.trim().is_empty() {
         return Err(protocol_error(
             contract,
@@ -1176,6 +1183,13 @@ fn parse_chatgpt_frame(
                     .unwrap_or_default(),
                     done: false,
                 };
+                if call.arguments.len() > TOOL_ARGUMENT_BUFFER_CAP {
+                    return Err(protocol_error(
+                        contract,
+                        event,
+                        "tool arguments exceeded buffer cap",
+                    ));
+                }
                 state.tool_call_order.push(item_id.clone());
                 state.tool_calls.insert(item_id, call);
             }
@@ -2578,10 +2592,32 @@ mod tests {
                     .contains(&format!("event exceeded {cap} bytes"))
             );
         }
+        let oversized =
+            serde_json::json!({"content":"x".repeat(TOOL_ARGUMENT_BUFFER_CAP)}).to_string();
         for contract in [
             RequestContract::ChatGptResponses,
             RequestContract::OpenAiResponses,
         ] {
+            let mut parser = ProviderStreamParser::new(contract, false);
+            let added = serde_json::json!({"type":"response.output_item.added", "item": {
+                "type":"function_call", "id":"fc_initial", "call_id":"call_initial",
+                "name":"write_file", "arguments":oversized}});
+            assert!(
+                parser
+                    .push_frame(SseFrame {
+                        event: None,
+                        data: Some(added.to_string())
+                    })
+                    .unwrap_err()
+                    .to_string()
+                    .contains("tool arguments exceeded buffer cap")
+            );
+            assert!(
+                parse_tool_arguments(contract, "finalize", "oversized", &oversized)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("tool arguments exceeded buffer cap")
+            );
             let wire = format!(
                 "data: {}\n\ndata: {}\n\n",
                 serde_json::json!({"type":"response.output_item.added", "item": {

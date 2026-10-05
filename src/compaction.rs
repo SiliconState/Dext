@@ -4,7 +4,7 @@ use crate::{
     Agent, AgentEvent, Block, Usage, build_compacted_history, millis_u64,
     render_compaction_evidence, sha256_hex_str, summarize_inline, tool_journal,
 };
-use anyhow::{Result, bail};
+use anyhow::{Context as _, Result, bail};
 use futures_util::StreamExt as _;
 use serde_json::json;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,6 +19,7 @@ pub(crate) struct BackgroundState {
     pub(crate) job: Option<BackgroundJob>,
     pub(crate) cooldown: Option<Instant>,
     pub(crate) last_prefix: Option<String>,
+    pub(crate) retirement_usage_pending: bool,
     pub(crate) next_job: u64,
 }
 
@@ -416,11 +417,19 @@ impl Agent {
         }
     }
 
-    pub(crate) fn retire_background_session(&mut self, reason: &str) {
+    pub(crate) fn retire_background_session(&mut self, reason: &str) -> Result<()> {
         self.invalidate_background(reason);
         if let Some(job) = self.background.job.take() {
             self.account_background(&job);
+            self.background.retirement_usage_pending = self.session_enabled;
         }
+        if self.background.retirement_usage_pending {
+            self.save_latest_session()
+                .context("persisting retired summary usage before session change")?;
+            self.background.retirement_usage_pending = false;
+        }
+        self.background.last_prefix = None;
+        Ok(())
     }
 
     pub(crate) async fn settle_background(&mut self, reason: &str) {
@@ -550,7 +559,10 @@ impl Agent {
             self.background_event(
                 &job,
                 "failed",
-                &format!("persist: {}", summarize_inline(&error.to_string(), 120)),
+                &format!(
+                    "persist: {}",
+                    summarize_inline(&self.privacy.redact_text(&error.to_string()).text, 120)
+                ),
                 wait_ms,
                 None,
             );

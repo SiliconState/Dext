@@ -9480,10 +9480,14 @@ async fn background_compaction_retirement_isolated_from_new_session_and_hook_gat
     let root = temp_test_dir("background-retirement");
     let mut agent = test_agent(&root);
     background_test_history(&mut agent);
+    agent.latest_session_path = root.join("old-session.jsonl");
     let _tx = background_test_candidate(&mut agent);
-    agent.retire_background_session("test_load");
+    agent.retire_background_session("test_load")?;
     assert!(agent.background.job.is_none());
     assert_eq!(agent.session_usage.input, 11);
+    let (saved, _) = read_session_jsonl(&agent.latest_session_path)?;
+    assert_eq!(saved.usage.input, 11);
+    assert_eq!(saved.usage.output, 7);
     agent.session_usage = Usage {
         input: 101,
         output: 73,
@@ -9499,6 +9503,93 @@ async fn background_compaction_retirement_isolated_from_new_session_and_hook_gat
     agent.start_background("gated")?;
     assert!(agent.background.job.is_none());
     let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn background_compaction_retirement_persist_failure_blocks_switch_and_retries_once()
+-> Result<()> {
+    let root = temp_test_dir("background-retirement-persist-failure");
+    let _cleanup = RemoveDirOnDrop(root.clone());
+    let next = root.join("next-root");
+    std::fs::create_dir(&next)?;
+    let mut agent = test_agent(&root);
+    background_test_history(&mut agent);
+    agent.latest_session_path = root.join("blocked.jsonl");
+    std::fs::create_dir(&agent.latest_session_path)?;
+    let _tx = background_test_candidate(&mut agent);
+    assert!(agent.set_sandbox_root(next.clone()).is_err());
+    assert_eq!(agent.sandbox_root, root);
+    assert_eq!(agent.session_usage.input, 11);
+    assert!(agent.background.job.is_none());
+    assert!(agent.background.retirement_usage_pending);
+    std::fs::remove_dir(&agent.latest_session_path)?;
+    agent.set_sandbox_root(next.canonicalize()?)?;
+    let (saved, _) = read_session_jsonl(&root.join("blocked.jsonl"))?;
+    assert_eq!(saved.usage.input, 11);
+    assert_eq!(saved.usage.output, 7);
+    assert_eq!(agent.session_usage.input, 11);
+    assert!(agent.background.job.is_none());
+    assert!(!agent.background.retirement_usage_pending);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn background_compaction_rejected_load_does_not_retire_live_job() -> Result<()> {
+    let root = temp_test_dir("background-rejected-load");
+    let _cleanup = RemoveDirOnDrop(root.clone());
+    let mut agent = test_agent(&root);
+    background_test_history(&mut agent);
+    let tx = background_test_candidate(&mut agent);
+    let epochs = (
+        agent.background.history_epoch,
+        agent.background.config_epoch,
+    );
+    assert!(
+        agent
+            .load_session_from_path(&root.join("missing.jsonl"))
+            .is_err()
+    );
+    assert_eq!(
+        (
+            agent.background.history_epoch,
+            agent.background.config_epoch
+        ),
+        epochs
+    );
+    assert_eq!(agent.session_usage.input, 0);
+    assert!(agent.background.job.is_some());
+    tx.send("summary survives rejected load".into()).unwrap();
+    agent.background_wakeup().await;
+    assert!(agent.service_background(false).await);
+    assert_eq!(agent.session_usage.input, 11);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[allow(clippy::await_holding_lock)]
+async fn background_compaction_reload_current_preserves_retired_usage() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("background-reload-current").canonicalize()?;
+    let _cleanup = RemoveDirOnDrop(root.clone());
+    let state = root.join("state");
+    std::fs::create_dir(&state)?;
+    let _state_env = PackEnvGuard::new(&state);
+    let mut agent = test_agent(&root);
+    background_test_history(&mut agent);
+    agent.latest_session_path = root.join("current.jsonl");
+    agent.save_latest_session()?;
+    let _tx = background_test_candidate(&mut agent);
+    agent.background.last_prefix = Some("old-prefix".into());
+    let path = agent.latest_session_path.clone();
+    agent.load_session_from_path(&path)?;
+    assert!(agent.background.job.is_none());
+    assert!(agent.background.last_prefix.is_none());
+    assert_eq!(agent.session_usage.input, 11);
+    assert_eq!(agent.session_usage.output, 7);
+    let (saved, _) = read_session_jsonl(&path)?;
+    assert_eq!(saved.usage.input, 11);
+    assert_eq!(saved.usage.output, 7);
     Ok(())
 }
 
@@ -21144,58 +21235,113 @@ async fn hooks_continue_with_stdout_before_turn_end_and_gate_requests() -> Resul
 async fn blocking_compaction_redacts_summary_before_history_events_and_save() -> Result<()> {
     let root = temp_test_dir("compact-summary-redaction");
     let _cleanup = RemoveDirOnDrop(root.clone());
-    let listener = TcpListener::bind("127.0.0.1:0")?;
-    let address = listener.local_addr()?;
-    let server = std::thread::spawn(move || -> Result<()> {
-        let (mut stream, _) = listener.accept()?;
-        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-        let mut request = Vec::new();
-        let mut buffer = [0; 4096];
-        loop {
-            let count = stream.read(&mut buffer)?;
-            anyhow::ensure!(count > 0, "summary request ended before body");
-            request.extend_from_slice(&buffer[..count]);
-            if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
-                let headers = String::from_utf8_lossy(&request[..end]);
-                let length: usize = headers
-                    .lines()
-                    .find_map(|line| {
-                        line.to_ascii_lowercase()
-                            .strip_prefix("content-length:")
-                            .and_then(|value| value.trim().parse().ok())
-                    })
-                    .context("summary request content length")?;
-                if request.len() >= end + 4 + length {
-                    break;
+    for status in [200, 400] {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let server = std::thread::spawn(move || -> Result<()> {
+            let (mut stream, _) = listener.accept()?;
+            stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+            let mut request = Vec::new();
+            let mut buffer = [0; 4096];
+            loop {
+                let count = stream.read(&mut buffer)?;
+                anyhow::ensure!(count > 0, "summary request ended before body");
+                request.extend_from_slice(&buffer[..count]);
+                if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..end]);
+                    let length: usize = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|value| value.trim().parse().ok())
+                        })
+                        .context("summary request content length")?;
+                    if request.len() >= end + 4 + length {
+                        break;
+                    }
                 }
             }
+            let summary = format!("Task summary\n{}={}", "api_key", "fixturevalue123456789");
+            let body = if status == 200 {
+                json!({"choices":[{"message":{"content":summary},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":7}}).to_string()
+            } else {
+                summary
+            };
+            write!(
+                stream,
+                "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )?;
+            Ok(())
+        });
+        let mut agent = test_agent(&root);
+        configure_local_openai_agent(&mut agent, format!("http://{address}"));
+        background_test_history(&mut agent);
+        agent.background.enabled = false;
+        agent.latest_session_path = root.join("saved.jsonl");
+        agent.latest_log_path = root.join("latest.log");
+        let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+        agent.set_sink(Box::new(ChannelSink { tx }));
+        agent.compact().await?;
+        server.join().expect("summary fixture thread")?;
+        let history = serde_json::to_string(&agent.history)?;
+        let saved = std::fs::read_to_string(&agent.latest_session_path)?;
+        assert!(!history.contains("fixturevalue123456789"));
+        assert!(!saved.contains("fixturevalue123456789"));
+        let events = drain_events(&mut events);
+        for event in &events {
+            let text = match event {
+                AgentEvent::CompactEnd { summary, .. } => summary.as_str(),
+                AgentEvent::Warn(text) | AgentEvent::CompactFailed { message: text } => {
+                    text.as_str()
+                }
+                _ => continue,
+            };
+            assert!(!text.contains("fixturevalue123456789"));
         }
-        let summary = format!("Task summary\n{}={}", "api_key", "fixturevalue123456789");
-        let body = json!({"choices":[{"message":{"content":summary},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":7}}).to_string();
-        write!(
-            stream,
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        )?;
-        Ok(())
-    });
+        if status == 200 {
+            assert!(history.contains("[REDACTED_SECRET]"));
+            assert!(events.iter().any(|event| matches!(event,
+            AgentEvent::CompactEnd { summary, .. } if summary.contains("[REDACTED_SECRET]"))));
+        } else {
+            assert!(events.iter().any(|event| matches!(event,
+            AgentEvent::Warn(text) if text.contains("[REDACTED_SECRET]"))));
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn blocking_compaction_persist_failure_keeps_history_and_does_not_observe() -> Result<()> {
+    let root = temp_test_dir("blocking-compact-persist-failure");
+    let _cleanup = RemoveDirOnDrop(root.clone());
     let mut agent = test_agent(&root);
-    configure_local_openai_agent(&mut agent, format!("http://{address}"));
     background_test_history(&mut agent);
     agent.background.enabled = false;
-    agent.latest_session_path = root.join("saved.jsonl");
-    agent.latest_log_path = root.join("latest.log");
+    agent.set_approval_profile(ApprovalProfile::Always);
+    agent.hooks.post_compact.push(Hook {
+        tool_match: None,
+        command: "printf x >> applied".into(),
+    });
+    agent.latest_session_path = root.join("not-a-file");
+    std::fs::create_dir(&agent.latest_session_path)?;
+    let before = serde_json::to_value(&agent.history)?;
     let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
     agent.set_sink(Box::new(ChannelSink { tx }));
-    agent.compact().await?;
-    server.join().expect("summary fixture thread")?;
-    let history = serde_json::to_string(&agent.history)?;
-    let saved = std::fs::read_to_string(&agent.latest_session_path)?;
-    assert!(history.contains("[REDACTED_SECRET]"));
-    assert!(!history.contains("fixturevalue123456789"));
-    assert!(!saved.contains("fixturevalue123456789"));
-    assert!(drain_events(&mut events).iter().any(|event| matches!(event,
-        AgentEvent::CompactEnd { summary, .. } if summary.contains("[REDACTED_SECRET]") && !summary.contains("fixturevalue123456789"))));
+    assert!(agent.compact().await.is_err());
+    assert_eq!(serde_json::to_value(&agent.history)?, before);
+    assert!(!root.join("applied").exists());
+    let events = drain_events(&mut events);
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::CompactFailed { .. }))
+    );
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        AgentEvent::CompactEnd { .. } | AgentEvent::HistoryContextUpdated { .. }
+    )));
     Ok(())
 }
 
