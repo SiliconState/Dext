@@ -297,27 +297,22 @@ pub(crate) fn hook_memo_value(
 ) -> Result<Option<Vec<u8>>> {
     validate_no_symlink_components(dir)?;
     ensure_private_dir(dir)?;
+    let _guard =
+        crate::session::SessionLockOperationGuard::acquire_at(&dir.join("memo.operation.lock"))?;
     if key.is_empty() || key.len() > 256 || value.is_some_and(|value| value.len() > 4096) {
         anyhow::bail!("hook memo key/value exceeds its bound (256/4096 bytes)");
     }
     let path = dir.join(crate::sha256_hex_str(key));
-    if let Some(value) = value {
-        let temp = dir.join(format!(".memo-{}", crate::new_session_id()));
-        crate::session::atomic_write_secret(&temp, value)?;
-        let published = std::fs::hard_link(&temp, &path);
-        let _ = std::fs::remove_file(&temp);
-        match published {
-            Ok(()) => {
-                #[cfg(unix)]
-                std::fs::File::open(dir)?.sync_all()?;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error.into()),
-        }
-    }
     match std::fs::symlink_metadata(&path) {
         Ok(metadata) => validate_private_file(&path, &metadata)?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let Some(value) = value else {
+                return Ok(None);
+            };
+            crate::session::atomic_write_secret(&path, value)?;
+            #[cfg(unix)]
+            std::fs::File::open(dir)?.sync_all()?;
+        }
         Err(error) => return Err(error.into()),
     }
     crate::session::read_regular_file_bytes_with_limit(&path, 4096, None, "hook memo")
@@ -582,7 +577,6 @@ pub(crate) fn save_new_fork(
     if session_dir.try_exists()? {
         anyhow::bail!("fork session id already exists");
     }
-    ensure_private_dir(&session_dir)?;
     let mut bytes = Vec::new();
     use std::io::Write as _;
     let header_bytes = serde_json::to_vec(header)?;
@@ -594,6 +588,7 @@ pub(crate) fn save_new_fork(
     for message in history {
         writeln!(&mut bytes, "{}", serde_json::to_string(message)?)?;
     }
+    ensure_private_dir(&session_dir)?;
     let result = (|| {
         crate::session::atomic_write_secret(
             &crate::session::session_latest_session_path(root, session),

@@ -116,6 +116,11 @@ impl SummaryWorker {
     }
 }
 
+fn summary_rate_limited(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("429") || message.contains("rate_limit") || message.contains("rate limit")
+}
+
 impl SummaryRequest {
     async fn compute(&self, accounting: &Mutex<SummaryAccounting>) -> Result<String> {
         for attempt in 1..=crate::MAX_STREAM_ATTEMPTS {
@@ -153,7 +158,7 @@ impl SummaryRequest {
                     if !plan.retry
                         || !self.contract.is_responses()
                         || attempt == crate::MAX_STREAM_ATTEMPTS
-                        || (self.speculative && message.contains("429"))
+                        || (self.speculative && summary_rate_limited(&message))
                     {
                         return Err(error);
                     }
@@ -234,6 +239,9 @@ impl SummaryRequest {
             } else {
                 Usage::parse_openai(&value["usage"])
             };
+            if usage.total_tokens() == 0 {
+                accounting.lock().unwrap_or_else(|e| e.into_inner()).unknown = true;
+            }
             self.record_usage(usage, accounting);
             let text = if self.contract == RequestContract::AnthropicMessages {
                 value["content"]
@@ -283,6 +291,9 @@ impl SummaryRequest {
         }
         let parsed = result?;
         let mut usage = parsed.usage;
+        if usage.total_tokens() == 0 {
+            accounting.lock().unwrap_or_else(|e| e.into_inner()).unknown = true;
+        }
         crate::Agent::fill_missing_usage_metrics(&mut usage, self.input_tokens, &parsed.blocks);
         self.record_usage(usage, accounting);
         let text = parsed
@@ -368,6 +379,9 @@ impl Agent {
         if accounting.accounted {
             return;
         }
+        if !job.worker.task.is_finished() {
+            accounting.unknown = true;
+        }
         let mut known = accounting.usage;
         known.add(accounting.inflight);
         accounting.accounted = true;
@@ -390,10 +404,16 @@ impl Agent {
         if let Some(job) = self.background.job.take() {
             job.worker.cancel.store(true, Ordering::SeqCst);
             job.worker.task.abort();
-            self.account_background(&job);
             self.background_event(&job, "cancelled", reason, 0, None);
             self.background.job = Some(job);
             self.background.cooldown = Some(std::time::Instant::now());
+        }
+    }
+
+    pub(crate) fn retire_background_session(&mut self, reason: &str) {
+        self.invalidate_background(reason);
+        if let Some(job) = self.background.job.take() {
+            self.account_background(&job);
         }
     }
 
@@ -518,7 +538,7 @@ impl Agent {
         let before = self.history.len();
         let old = std::mem::replace(&mut self.history, candidate);
         if self.session_enabled
-            && let Err(error) = self.save_latest_session()
+            && let Err(error) = self.save_session_to_path(&self.latest_session_path)
         {
             self.history = old;
             self.background_event(
@@ -557,6 +577,7 @@ impl Agent {
         let threshold = self.active_compact_threshold_chars();
         if !self.background.enabled
             || self.background.job.is_some()
+            || !self.hooks.pre_request.is_empty()
             || self.interrupt.load(Ordering::SeqCst)
             || self.history_chars() < threshold.saturating_mul(4) / 5
             || self.history_chars() >= threshold
@@ -614,5 +635,18 @@ impl Agent {
         self.background_event(&job, "running", "soft_threshold", 0, None);
         self.background.job = Some(job);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn speculative_rate_limit_detection_covers_http_and_stream_errors() {
+        for message in ["HTTP 429", "RATE_LIMIT_EXCEEDED", "rate limit reached"] {
+            assert!(summary_rate_limited(message));
+        }
+        assert!(!summary_rate_limited("server_error"));
     }
 }

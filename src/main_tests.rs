@@ -9448,16 +9448,106 @@ async fn background_compaction_policy_changes_cancel_and_account_once() -> Resul
                 .cancel
                 .load(Ordering::SeqCst)
         );
-        assert_eq!(agent.session_usage.input, 11);
-        assert_eq!(agent.session_usage.output, 7);
+        assert_eq!(agent.session_usage.input, 0);
+        assert_eq!(agent.session_usage.output, 0);
+        {
+            let accounting = agent
+                .background
+                .job
+                .as_ref()
+                .unwrap()
+                .worker
+                .accounting
+                .clone();
+            let mut accounting = accounting.lock().unwrap();
+            assert!(!accounting.accounted);
+            accounting.usage.input += 5;
+            accounting.usage.output += 3;
+        }
         assert!(!agent.service_background(false).await, "{policy}");
         assert!(tx.send("cancelled summary".into()).is_err());
         assert!(agent.background.job.is_none());
         assert_eq!(serde_json::to_value(&agent.history)?, expected);
-        assert_eq!(agent.session_usage.input, 11);
-        assert_eq!(agent.session_usage.output, 7);
+        assert_eq!(agent.session_usage.input, 16);
+        assert_eq!(agent.session_usage.output, 10);
     }
     let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn background_compaction_retirement_isolated_from_new_session_and_hook_gate() -> Result<()> {
+    let root = temp_test_dir("background-retirement");
+    let mut agent = test_agent(&root);
+    background_test_history(&mut agent);
+    let _tx = background_test_candidate(&mut agent);
+    agent.retire_background_session("test_load");
+    assert!(agent.background.job.is_none());
+    assert_eq!(agent.session_usage.input, 11);
+    agent.session_usage = Usage {
+        input: 101,
+        output: 73,
+        ..Default::default()
+    };
+    assert!(!agent.service_background(false).await);
+    assert_eq!(agent.session_usage.input, 101);
+    agent.background.cooldown = None;
+    agent.hooks.pre_request.push(Hook {
+        tool_match: None,
+        command: "exit 1".into(),
+    });
+    agent.start_background("gated")?;
+    assert!(agent.background.job.is_none());
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[test]
+fn kept_fork_boundary_handles_long_unpaired_suffix_without_repeated_scans() -> Result<()> {
+    let mut history = vec![Message {
+        role: "user".into(),
+        content: vec![Block::Text {
+            text: "before".into(),
+        }],
+    }];
+    history.extend((0..10_000).map(|index| Message {
+        role: "assistant".into(),
+        content: vec![Block::ToolUse {
+            id: format!("unpaired-{index}"),
+            name: "read_file".into(),
+            input: json!({"path":"x"}),
+        }],
+    }));
+    assert_eq!(kept_fork_boundary(&history, history.len())?, 0);
+    let closed = vec![
+        Message {
+            role: "user".into(),
+            content: vec![Block::Text {
+                text: "before".into(),
+            }],
+        },
+        Message {
+            role: "assistant".into(),
+            content: vec![Block::ToolUse {
+                id: "one".into(),
+                name: "read_file".into(),
+                input: json!({"path":"x"}),
+            }],
+        },
+        Message {
+            role: "user".into(),
+            content: vec![tool_result_block("one", "result", None)],
+        },
+        Message {
+            role: "assistant".into(),
+            content: vec![Block::Text {
+                text: "after".into(),
+            }],
+        },
+    ];
+    for (cut, expected) in [(0, 0), (1, 1), (2, 1), (3, 3), (4, 4)] {
+        assert_eq!(kept_fork_boundary(&closed, cut)?, expected);
+    }
     Ok(())
 }
 
@@ -9538,6 +9628,32 @@ async fn background_compaction_hard_limit_reuses_job_then_falls_back_if_insuffic
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn background_compaction_persist_failure_keeps_history_and_emits_no_apply() -> Result<()> {
+    let root = temp_test_dir("background-persist-failure");
+    let mut agent = test_agent(&root);
+    background_test_history(&mut agent);
+    agent.session_enabled = true;
+    agent.latest_session_path = root.join("directory-not-file");
+    std::fs::create_dir(&agent.latest_session_path)?;
+    let tx = background_test_candidate(&mut agent);
+    let before = serde_json::to_value(&agent.history)?;
+    let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+    agent.set_sink(Box::new(ChannelSink { tx: events_tx }));
+    tx.send("short summary".into()).unwrap();
+    agent.background_wakeup().await;
+    assert!(!agent.service_background(false).await);
+    assert_eq!(serde_json::to_value(&agent.history)?, before);
+    let events = drain_events(&mut events_rx);
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        AgentEvent::CompactEnd { .. } | AgentEvent::HistoryContextUpdated { .. }
+    )));
+    assert_eq!(agent.session_usage.input, 11);
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn background_compaction_shutdown_settles_worker_and_hooks_fire_only_on_apply() -> Result<()>
 {
     let root = temp_test_dir("background-shutdown-hooks");
@@ -9602,72 +9718,81 @@ fn kept_fork_cli_rejects_conflicts_and_parses_message_count() -> Result<()> {
 fn kept_fork_preserves_pairs_new_identity_and_source_without_journal_replay() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("kept-fork").canonicalize()?;
-    let mut agent = test_agent(&root);
-    agent.select_seat("parent")?;
-    agent.history = vec![
-        Message {
-            role: "user".into(),
-            content: vec![Block::Text {
-                text: "before".into(),
-            }],
-        },
-        Message {
-            role: "assistant".into(),
-            content: vec![Block::ToolUse {
-                id: "pair".into(),
-                name: "write_file".into(),
-                input: json!({"path":"never-write","content":"bad"}),
-            }],
-        },
-        Message {
-            role: "user".into(),
-            content: vec![tool_result_block("pair", "already written", None)],
-        },
-        Message {
-            role: "assistant".into(),
-            content: vec![Block::Text {
-                text: "after".into(),
-            }],
-        },
-    ];
-    let path = agent.save_latest_session()?;
-    let before = std::fs::read(&path)?;
-    let options = parse_cli_options(vec![
-        "--fork-to".into(),
-        "child".into(),
-        "--at".into(),
-        "2".into(),
-        "--seat".into(),
-        "parent".into(),
-        "--cd".into(),
-        root.to_string_lossy().into_owned(),
-    ])?;
-    let fork = keep_session_fork(&options)?;
-    assert_eq!(fork["at"], 1);
-    assert_eq!(fork["source_session_id"], agent.session_id);
-    let id = fork["session_id"].as_str().expect("new id");
-    assert_ne!(id, agent.session_id);
-    let new_path = seats::latest_session_path(&root, "child")?;
-    let (header, history) = read_session_jsonl(&new_path)?;
-    assert_eq!(history.len(), 1);
-    assert_eq!(header.seat.as_ref().map(|s| s.id.as_str()), Some("child"));
-    assert_eq!(header.session_id.as_deref(), Some(id));
-    assert!(header.active_pack_runtimes.is_empty());
-    assert!(header.allowed.is_empty());
-    assert!(
-        tool_journal::load_for_session_file(&new_path)?
-            .expect("empty journal")
-            .is_empty()
-    );
-    assert_eq!(std::fs::read(&path)?, before);
-    assert!(!root.join("never-write").exists());
-    assert!(keep_session_fork(&options).is_err());
-    assert_eq!(kept_fork_boundary(&agent.history, 3)?, 3);
-    assert_eq!(kept_fork_boundary(&agent.history, 4)?, 4);
-    assert_eq!(kept_fork_boundary(&agent.history, 0)?, 0);
-    assert!(kept_fork_boundary(&agent.history, 5).is_err());
-    let _ = std::fs::remove_dir_all(root);
-    Ok(())
+    let _cleanup = RemoveDirOnDrop(root.clone());
+    let state = root.join("state");
+    std::fs::create_dir(&state)?;
+    let _state_env = PackEnvGuard::new(&state);
+    let old_sessions = std::env::var_os("DEXT_SESSIONS_DIR");
+    unsafe { std::env::remove_var("DEXT_SESSIONS_DIR") };
+    let result = (|| -> Result<()> {
+        let mut agent = test_agent(&root);
+        agent.select_seat("parent")?;
+        agent.history = vec![
+            Message {
+                role: "user".into(),
+                content: vec![Block::Text {
+                    text: "before".into(),
+                }],
+            },
+            Message {
+                role: "assistant".into(),
+                content: vec![Block::ToolUse {
+                    id: "pair".into(),
+                    name: "write_file".into(),
+                    input: json!({"path":"never-write","content":"bad"}),
+                }],
+            },
+            Message {
+                role: "user".into(),
+                content: vec![tool_result_block("pair", "already written", None)],
+            },
+            Message {
+                role: "assistant".into(),
+                content: vec![Block::Text {
+                    text: "after".into(),
+                }],
+            },
+        ];
+        let path = agent.save_latest_session()?;
+        let before = std::fs::read(&path)?;
+        let options = parse_cli_options(vec![
+            "--fork-to".into(),
+            "child".into(),
+            "--at".into(),
+            "2".into(),
+            "--seat".into(),
+            "parent".into(),
+            "--cd".into(),
+            root.to_string_lossy().into_owned(),
+        ])?;
+        let fork = keep_session_fork(&options)?;
+        assert_eq!(fork["at"], 1);
+        assert_eq!(fork["source_session_id"], agent.session_id);
+        let id = fork["session_id"].as_str().expect("new id");
+        assert_ne!(id, agent.session_id);
+        let new_path = seats::latest_session_path(&root, "child")?;
+        let (header, history) = read_session_jsonl(&new_path)?;
+        assert_eq!(history.len(), 1);
+        assert_eq!(header.seat.as_ref().map(|s| s.id.as_str()), Some("child"));
+        assert_eq!(header.session_id.as_deref(), Some(id));
+        assert!(header.active_pack_runtimes.is_empty());
+        assert!(header.allowed.is_empty());
+        assert!(
+            tool_journal::load_for_session_file(&new_path)?
+                .expect("empty journal")
+                .is_empty()
+        );
+        assert_eq!(std::fs::read(&path)?, before);
+        assert!(!root.join("never-write").exists());
+        assert!(keep_session_fork(&options).is_err());
+        assert_eq!(kept_fork_boundary(&agent.history, 3)?, 3);
+        assert_eq!(kept_fork_boundary(&agent.history, 4)?, 4);
+        assert_eq!(kept_fork_boundary(&agent.history, 0)?, 0);
+        assert!(kept_fork_boundary(&agent.history, 5).is_err());
+        Ok(())
+    })();
+    restore_env_var("DEXT_SESSIONS_DIR", old_sessions);
+    result
 }
 
 #[test]
@@ -20777,6 +20902,75 @@ fn hooks_extended_phases_and_turn_end_use_stdout_only() -> Result<()> {
 }
 
 #[test]
+fn hook_identity_env_cannot_be_replaced_by_pack_env() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("hook-identity");
+    let hooks = Hooks { pre_tool: vec![Hook { tool_match: None, command:
+        "printf '%s\\n%s\\n%s' \"$DEXT_SESSION_ID\" \"$DEXT_TOOL_CALL_ID\" \"${DEXT_HOOK_MEMO_DIR:-none}\"".into() }], ..Default::default() };
+    let extra = vec![
+        ("DEXT_SESSION_ID".into(), "spoof-session".into()),
+        ("DEXT_TOOL_CALL_ID".into(), "spoof-call".into()),
+        ("DEXT_HOOK_MEMO_DIR".into(), "spoof-dir".into()),
+        ("DEXT_HOOK_MEMO_BIN".into(), "spoof-bin".into()),
+    ];
+    let out = hooks.fire(
+        "pre_tool",
+        "read_file",
+        &[
+            ("DEXT_SESSION_ID", "real-session"),
+            ("DEXT_TOOL_CALL_ID", "real-call"),
+        ],
+        &extra,
+        &root,
+        SandboxProfile::WorkspaceWrite,
+    );
+    assert_eq!(out[0].1, 0);
+    assert!(out[0].2.starts_with("real-session\nreal-call\n"));
+    assert!(!out[0].2.contains("spoof"));
+    let out = hooks.fire(
+        "pre_tool",
+        "read_file",
+        &[("DEXT_SESSION_ID", ""), ("DEXT_TOOL_CALL_ID", "real-call")],
+        &extra,
+        &root,
+        SandboxProfile::WorkspaceWrite,
+    );
+    assert_eq!(out[0].2, "\nreal-call\nnone");
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[test]
+fn hook_memo_concurrent_writers_observe_one_complete_value() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("hook-memo-concurrent");
+    let dir = seats::hook_memo_dir(&root, "session-concurrent", "call")?;
+    let values = std::thread::scope(|scope| {
+        let threads: Vec<_> = (0..8)
+            .map(|index| {
+                let dir = &dir;
+                scope.spawn(move || {
+                    seats::hook_memo_value(dir, "winner", Some(format!("value-{index}").as_bytes()))
+                        .unwrap()
+                        .unwrap()
+                })
+            })
+            .collect();
+        threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert!(values.iter().all(|value| value == &values[0]));
+    assert_eq!(
+        seats::hook_memo_value(&dir, "winner", None)?,
+        Some(values[0].clone())
+    );
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[test]
 fn hook_memo_first_writer_wins_and_call_scope_is_private() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("hook-memo");
@@ -20806,7 +21000,19 @@ fn hook_memo_first_writer_wins_and_call_scope_is_private() -> Result<()> {
         let target = dir.join(sha256_hex_str("symlink"));
         symlink(dir.join(sha256_hex_str("decision")), &target)?;
         assert!(seats::hook_memo_value(&dir, "symlink", Some(b"new")).is_err());
+        std::fs::remove_file(target)?;
+        let decision = dir.join(sha256_hex_str("decision"));
+        let alias = dir.join(sha256_hex_str("hardlink"));
+        std::fs::hard_link(&decision, &alias)?;
+        assert!(seats::hook_memo_value(&dir, "hardlink", Some(b"new")).is_err());
+        assert_eq!(std::fs::read(&decision)?, b"approved");
+        std::fs::remove_file(alias)?;
     }
+    assert_eq!(std::fs::read_dir(&dir)?.count(), 2);
+    assert_eq!(
+        seats::hook_memo_value(&dir, "decision", None)?,
+        Some(b"approved".to_vec())
+    );
     let _ = std::fs::remove_dir_all(root);
     Ok(())
 }

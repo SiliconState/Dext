@@ -11215,13 +11215,24 @@ impl Hooks {
                 .arg("-c")
                 .arg(&h.command)
                 .current_dir(root);
+            cmd.env_remove("DEXT_SESSION_ID")
+                .env_remove("DEXT_TOOL_CALL_ID")
+                .env_remove("DEXT_HOOK_MEMO_DIR")
+                .env_remove("DEXT_HOOK_MEMO_BIN");
+            for (k, v) in extra_env {
+                if !matches!(
+                    k.as_str(),
+                    "DEXT_SESSION_ID"
+                        | "DEXT_TOOL_CALL_ID"
+                        | "DEXT_HOOK_MEMO_DIR"
+                        | "DEXT_HOOK_MEMO_BIN"
+                ) {
+                    cmd.env(k, v);
+                }
+            }
             for (k, v) in env {
                 cmd.env(k, v);
             }
-            for (k, v) in extra_env {
-                cmd.env(k, v);
-            }
-            cmd.env_remove("DEXT_HOOK_MEMO_DIR");
             if let Some(memo) = memo.as_ref() {
                 cmd.env("DEXT_HOOK_MEMO_DIR", memo);
                 if let Ok(executable) = std::env::current_exe() {
@@ -15250,6 +15261,7 @@ impl Agent {
     fn adopt_session_id(&mut self, session_id: String) -> Result<()> {
         let lock = SessionStateLock::acquire(&self.sandbox_root, &session_id)
             .with_context(|| format!("resuming session state '{session_id}'"))?;
+        self.retire_background_session("session_identity");
         self.session_id = session_id;
         self.state_lock = Some(Arc::new(lock));
         self.refresh_state_paths();
@@ -15258,7 +15270,7 @@ impl Agent {
     }
 
     fn set_sandbox_root(&mut self, root: PathBuf) -> Result<()> {
-        self.invalidate_background("sandbox");
+        self.retire_background_session("sandbox");
         let root = std::fs::canonicalize(&root)
             .with_context(|| format!("canonicalizing sandbox root {}", root.display()))?;
         if !std::fs::metadata(&root)
@@ -17732,7 +17744,7 @@ impl Agent {
         path: &Path,
         expected_seat: Option<&str>,
     ) -> Result<PathBuf> {
-        self.invalidate_background("session_load");
+        self.retire_background_session("session_load");
         let file =
             std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
         let mut reader = io::BufReader::new(file);
@@ -18566,6 +18578,9 @@ impl Agent {
         }
         let mut usage = accounting.usage;
         usage.add(accounting.inflight);
+        if accounting.unknown || accounting.inflight_open {
+            self.append_latest_log("summary_usage_unknown", "blocking_summary");
+        }
         if result.is_err() {
             self.session_usage.add(usage);
             self.sink.emit(AgentEvent::UsageUpdate {
@@ -24966,25 +24981,51 @@ fn kept_fork_boundary(history: &[Message], requested: usize) -> Result<usize> {
     if requested > history.len() {
         anyhow::bail!("--at {requested} exceeds {} source messages", history.len());
     }
-    for cut in (1..=requested).rev() {
-        let mut uses = HashMap::<&str, usize>::new();
-        let mut results = HashMap::<&str, usize>::new();
-        for block in history[..cut].iter().flat_map(|message| &message.content) {
-            match block {
-                Block::ToolUse { id, .. } => *uses.entry(id).or_default() += 1,
-                Block::ToolResult { tool_use_id, .. } => {
-                    *results.entry(tool_use_id).or_default() += 1
-                }
-                _ => {}
-            }
+    fn adjust(balance: &mut i64, unpaired: &mut usize, delta: i64) {
+        if *balance != 0 {
+            *unpaired -= 1;
         }
-        if uses == results
-            && (cut == history.len() || Agent::compact_split_is_pair_safe(history, cut))
-        {
-            return Ok(cut);
+        *balance += delta;
+        if *balance != 0 {
+            *unpaired += 1;
         }
     }
-    Ok(0)
+    let mut balances = HashMap::<&str, (i64, i64)>::new();
+    let mut suffix_unpaired = 0;
+    for block in history.iter().flat_map(|message| &message.content) {
+        let (id, delta) = match block {
+            Block::ToolUse { id, .. } => (id.as_str(), 1),
+            Block::ToolResult { tool_use_id, .. } => (tool_use_id.as_str(), -1),
+            _ => continue,
+        };
+        adjust(
+            &mut balances.entry(id).or_default().1,
+            &mut suffix_unpaired,
+            delta,
+        );
+    }
+    let mut prefix_unpaired = 0;
+    let mut safe = 0;
+    for (index, message) in history.iter().take(requested).enumerate() {
+        for block in &message.content {
+            let (id, delta) = match block {
+                Block::ToolUse { id, .. } => (id.as_str(), 1),
+                Block::ToolResult { tool_use_id, .. } => (tool_use_id.as_str(), -1),
+                _ => continue,
+            };
+            let (prefix, suffix) = balances.get_mut(id).expect("counted tool identity");
+            adjust(prefix, &mut prefix_unpaired, delta);
+            adjust(suffix, &mut suffix_unpaired, -delta);
+        }
+        let cut = index + 1;
+        if prefix_unpaired == 0
+            && (cut == history.len()
+                || (suffix_unpaired == 0 && !Agent::message_has_tool_results(&history[cut])))
+        {
+            safe = cut;
+        }
+    }
+    Ok(safe)
 }
 
 fn keep_session_fork(opts: &CliOptions) -> Result<Value> {

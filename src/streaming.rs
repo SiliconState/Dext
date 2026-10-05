@@ -92,6 +92,7 @@ struct ChatGptState {
     reasoning_in_progress: bool,
     reasoning_items: BTreeMap<String, Value>,
     reasoning_item_order: Vec<String>,
+    reasoning_item_bytes: usize,
     tool_calls: BTreeMap<String, ToolCallParts>,
     tool_call_order: Vec<String>,
     stop_reason: Option<String>,
@@ -1499,6 +1500,7 @@ fn parse_chatgpt_frame(
                 if discard_all_response_content {
                     state.reasoning_items.clear();
                     state.reasoning_item_order.clear();
+                    state.reasoning_item_bytes = 0;
                 }
                 if state.text_in_progress
                     || (discard_all_response_content && !state.text.is_empty())
@@ -1546,10 +1548,38 @@ fn capture_openai_reasoning_item(
     state: &mut ChatGptState,
     item: &serde_json::Map<String, Value>,
 ) -> Result<()> {
-    let item = Value::Object(item.clone());
-    if !crate::valid_openai_reasoning_item(&item) {
+    if item.get("type").and_then(Value::as_str) != Some("reasoning")
+        || item
+            .get("id")
+            .and_then(Value::as_str)
+            .is_none_or(|id| id.trim().is_empty())
+        || item
+            .get("encrypted_content")
+            .and_then(Value::as_str)
+            .is_none_or(|value| value.is_empty())
+    {
         return Ok(());
     }
+    let id = item["id"].as_str().expect("validated id");
+    let previous_bytes = state
+        .reasoning_items
+        .get(id)
+        .map(serde_json::to_vec)
+        .transpose()?
+        .map_or(0, |bytes| bytes.len());
+    let item_bytes = serde_json::to_vec(item)?.len();
+    let total = state
+        .reasoning_item_bytes
+        .saturating_sub(previous_bytes)
+        .saturating_add(item_bytes);
+    if total > REASONING_BUFFER_CAP {
+        return Err(protocol_error(
+            contract,
+            event,
+            "opaque reasoning items exceeded buffer cap",
+        ));
+    }
+    let item = Value::Object(item.clone());
     let id = item
         .get("id")
         .and_then(Value::as_str)
@@ -1567,6 +1597,7 @@ fn capture_openai_reasoning_item(
     if !state.reasoning_items.contains_key(&id) {
         state.reasoning_item_order.push(id.clone());
     }
+    state.reasoning_item_bytes = total;
     state.reasoning_items.insert(id, item);
     Ok(())
 }
@@ -2428,6 +2459,41 @@ mod tests {
             error.contains("delta.reasoning_content exceeded 4194304 bytes"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn responses_opaque_reasoning_has_an_aggregate_cap_without_double_counting() {
+        let mut parser = ProviderStreamParser::new(RequestContract::OpenAiResponses, false);
+        let item = serde_json::json!({"type":"response.output_item.done", "item": {
+            "type":"reasoning", "id":"rs_first", "encrypted_content":"x".repeat(2_200_000), "summary":[]
+        }});
+        for _ in 0..2 {
+            parser
+                .push_frame(SseFrame {
+                    event: None,
+                    data: Some(item.to_string()),
+                })
+                .unwrap();
+        }
+        let second = serde_json::json!({"type":"response.output_item.done", "item": {
+            "type":"reasoning", "id":"rs_second", "encrypted_content":"y".repeat(2_200_000), "summary":[]
+        }});
+        let error = parser
+            .push_frame(SseFrame {
+                event: None,
+                data: Some(second.to_string()),
+            })
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("opaque reasoning items exceeded buffer cap")
+        );
+        let ProviderState::ChatGpt(state) = &parser.state else {
+            unreachable!()
+        };
+        assert_eq!(state.reasoning_items.len(), 1);
+        assert!(state.reasoning_item_bytes < REASONING_BUFFER_CAP);
     }
 
     #[test]
