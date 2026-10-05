@@ -183,6 +183,199 @@ fn kept_fork_is_one_shot_pair_safe_and_source_immutable() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+struct BackgroundTestChild(Child);
+
+impl Drop for BackgroundTestChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn background_compaction_finishes_while_ndjson_is_idle_without_busy_turn() {
+    use std::io::Read as _;
+    let root = temp_root("background-idle").canonicalize().unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let provider = std::thread::spawn(move || {
+        let until = Instant::now() + Duration::from_secs(15);
+        let mut completed = 0;
+        let mut release_rx = Some(release_rx);
+        let mut summary = None;
+        while completed < 2 && Instant::now() < until {
+            let (mut stream, _) = match listener.accept() {
+                Ok(value) => value,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(error) => panic!("mock accept: {error}"),
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0; 4096];
+            let body = loop {
+                let count = stream.read(&mut chunk).unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&chunk[..count]);
+                if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..end]);
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= end + 4 + length {
+                        break request[end + 4..end + 4 + length].to_vec();
+                    }
+                }
+            };
+            if body.is_empty() {
+                stream
+                    .write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+                continue;
+            }
+            let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            completed += 1;
+            if request["stream"] == false {
+                let release = release_rx.take().unwrap();
+                summary = Some(std::thread::spawn(move || {
+                    release.recv_timeout(Duration::from_secs(10)).unwrap();
+                    let body = r#"{"choices":[{"message":{"content":"idle background summary"}}],"usage":{"prompt_tokens":11,"completion_tokens":7}}"#;
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                }));
+            } else {
+                let body = "data: {\"choices\":[{\"delta\":{\"content\":\"Foreground NDJSON answer completed while the background summary remains behind its barrier, and input remains usable.\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        }
+        assert_eq!(completed, 2);
+        summary.unwrap().join().unwrap();
+    });
+    let mut fixture = format!(
+        "{}\n",
+        serde_json::json!({"version":4,"model":"mock-model","system":"test","session_id":"background-source","sandbox":root,"compact_threshold_chars":30000})
+    );
+    for index in 0..12 {
+        fixture.push_str(&format!("{}\n", serde_json::json!({"role":if index % 2 == 0 {"user"} else {"assistant"},"content":[{"type":"text","text":"context ".repeat(250)}]})));
+    }
+    std::fs::write(root.join("source.jsonl"), fixture).unwrap();
+    let mut child = BackgroundTestChild(
+        Command::new(env!("CARGO_BIN_EXE_dext"))
+            .args([
+                "--input",
+                "ndjson",
+                "--output",
+                "stream-json",
+                "--no-session",
+                "--resume=source.jsonl",
+                "--cd",
+            ])
+            .arg(&root)
+            .current_dir(&root)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", &root)
+            .env("DEXT_HOME", root.join(".dext"))
+            .env("DEXT_PROVIDER", "local")
+            .env("DEXT_BASE_URL", base)
+            .env("DEXT_MODEL", "mock-model")
+            .env("DEXT_MODEL_FORCE", "1")
+            .env("DEXT_BACKGROUND_COMPACT", "1")
+            .env("DEXT_APPROVAL", "never")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let mut input = child.0.stdin.take().unwrap();
+    let output = child.0.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(output).lines() {
+            let value: serde_json::Value = serde_json::from_str(&line.unwrap()).unwrap();
+            let _ = tx.send(value);
+        }
+    });
+    let mut events = Vec::new();
+    loop {
+        let event = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let ready = event["event"] == "ready";
+        events.push(event);
+        if ready {
+            break;
+        }
+    }
+    writeln!(input, "{{\"type\":\"user\",\"text\":\"Hello\"}}").unwrap();
+    loop {
+        let event = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let done = event["event"] == "turn_end";
+        events.push(event);
+        if done {
+            break;
+        }
+    }
+    assert!(!events.iter().any(|event| event["event"] == "compact_end"));
+    writeln!(input, "{{\"type\":\"control\",\"command\":\"/history\"}}").unwrap();
+    loop {
+        let event = rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap_or_else(|error| panic!("idle command: {error}; events={events:?}"));
+        let usable = (event["event"] == "slash"
+            || event["event"] == "info"
+            || event["event"] == "structured_slash")
+            && event["data"]
+                .as_str()
+                .is_some_and(|text| text.contains("history:"));
+        events.push(event);
+        if usable {
+            break;
+        }
+    }
+    release_tx.send(()).unwrap();
+    loop {
+        let event = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let applied =
+            event["event"] == "background_compaction" && event["data"]["phase"] == "applied";
+        events.push(event);
+        if applied {
+            break;
+        }
+    }
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["event"] == "turn_start")
+            .count(),
+        1
+    );
+    assert!(!events.iter().any(|event| event["event"] == "compact_start"));
+    assert!(
+        events
+            .iter()
+            .any(|event| event["event"] == "compact_end" && event["data"]["background"] == true)
+    );
+    writeln!(input, "{{\"type\":\"close\"}}").unwrap();
+    drop(input);
+    assert!(wait_within(&mut child.0, Duration::from_secs(5)).success());
+    reader.join().unwrap();
+    provider.join().unwrap();
+    let _ = std::fs::remove_dir_all(root);
+}
+
 #[test]
 fn eof_terminates() {
     let root = temp_root("eof");

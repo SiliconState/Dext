@@ -1567,6 +1567,7 @@ struct TuiState {
     external_telemetry: ExternalTelemetry,
     retry_status: Option<String>,
     compacting: bool,
+    background_compaction: Option<(String, String)>,
     compacting_resume_busy: bool,
     provider_label: String,
     api_family: String,
@@ -1708,6 +1709,7 @@ impl TuiState {
             external_telemetry: ExternalTelemetry::default(),
             retry_status: None,
             compacting: false,
+            background_compaction: None,
             compacting_resume_busy: false,
             provider_label: String::new(),
             api_family: String::new(),
@@ -3098,6 +3100,25 @@ impl TuiState {
                 self.commit_turn_thinking();
                 self.live_tools.clear();
             }
+            AgentEvent::BackgroundCompaction { job_id, phase, .. } => {
+                if phase == "running" {
+                    self.background_compaction = Some((job_id, phase));
+                } else if matches!(phase.as_str(), "ready" | "waiting") {
+                    if self
+                        .background_compaction
+                        .as_ref()
+                        .is_some_and(|(id, _)| *id == job_id)
+                    {
+                        self.background_compaction = Some((job_id, phase));
+                    }
+                } else if self
+                    .background_compaction
+                    .as_ref()
+                    .is_some_and(|(id, _)| *id == job_id)
+                {
+                    self.background_compaction = None;
+                }
+            }
             AgentEvent::CompactStart => {
                 self.push_debug_event("compact start");
                 self.compacting_resume_busy = self.agent_busy;
@@ -3110,12 +3131,24 @@ impl TuiState {
                 before,
                 after,
                 summary,
+                background,
+                job_id,
             } => {
+                if background
+                    && self
+                        .background_compaction
+                        .as_ref()
+                        .is_none_or(|(id, _)| Some(id) != job_id.as_ref())
+                {
+                    return;
+                }
                 self.push_debug_event(format!("compact end · {before} → {after}"));
                 let resume_busy = self.compacting_resume_busy;
                 self.compacting = false;
                 self.compacting_resume_busy = false;
-                self.set_agent_busy(resume_busy);
+                if !background {
+                    self.set_agent_busy(resume_busy);
+                }
                 self.last_turn_context_tokens = self
                     .last_turn_context_tokens
                     .max(((self.history_chars.saturating_add(3)) / 4).max(1));
@@ -3151,6 +3184,7 @@ impl TuiState {
                 };
             }
             AgentEvent::Interrupted => {
+                self.background_compaction = None;
                 self.push_debug_event("interrupted");
                 self.compacting = false;
                 self.compacting_resume_busy = false;
@@ -3361,6 +3395,14 @@ fn todo_progress_label(progress: &TodoProgress) -> String {
 }
 
 fn derived_busy_status(state: &TuiState) -> String {
+    if let Some((_, phase)) = &state.background_compaction {
+        if phase == "waiting" {
+            return "waiting for compaction".into();
+        }
+        if !state.agent_busy {
+            return "ready · background summary".into();
+        }
+    }
     if state.compacting {
         return "compacting history".to_string();
     }
@@ -9087,6 +9129,7 @@ fn apply_tui_message(state: &mut TuiState, msg: ToTui) {
             }
         }
         ToTui::ResumeLoaded { root, git, todos } => {
+            state.background_compaction = None;
             state.resume_loading = false;
             state.git_epoch = state.git_epoch.wrapping_add(1);
             state.sandbox = root.display().to_string();
@@ -9096,6 +9139,7 @@ fn apply_tui_message(state: &mut TuiState, msg: ToTui) {
             state.set_todo_items(todos);
         }
         ToTui::RootChanged(root) => {
+            state.background_compaction = None;
             state.sandbox = root.display().to_string();
             state.sandbox_path = root;
             state.path_picker = None;
@@ -10582,6 +10626,9 @@ fn handle_key(
                     state.clear_slash_completion_selection();
                     state.status = "input cleared; Esc again interrupts".to_string();
                 }
+            } else if state.background_compaction.is_some() {
+                interrupt.store(true, Ordering::SeqCst);
+                state.status = "cancelling background summary".into();
             } else if !state.input.is_empty() {
                 state.clear_input();
                 state.clear_slash_completion_selection();
@@ -11178,7 +11225,17 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
     let handle = tokio::spawn(async move {
         let mut git_epoch = 0u64;
         let mut picker_root = agent.sandbox_root.clone();
-        while let Some(cmd) = cmd_rx.recv().await {
+        loop {
+            let received = tokio::select! {
+                command = cmd_rx.recv() => command,
+                _ = agent.background_wakeup() => {
+                    agent.service_background(false).await;
+                    continue;
+                }
+            };
+            let Some(cmd) = received else {
+                break;
+            };
             match cmd {
                 FromTui::Submit { text, pane_width } => {
                     agent.slash_render_width = (pane_width > 0).then_some(usize::from(pane_width));
@@ -11371,6 +11428,8 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
                 FromTui::Quit => break,
             }
         }
+        agent.service_background(false).await;
+        agent.settle_background("tui_shutdown").await;
     });
 
     // Bridge: relay in_rx → cmd_tx
@@ -16176,6 +16235,63 @@ mod tests {
     }
 
     #[test]
+    fn background_compaction_status_never_claims_a_turn_and_fences_late_apply() {
+        let mut state = TuiState::new(
+            "test-model".into(),
+            model_context_window("test-model"),
+            ".".into(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        let status = |phase: &str| AgentEvent::BackgroundCompaction {
+            version: 1,
+            session_id: "session".into(),
+            session_epoch: 1,
+            job_id: "job".into(),
+            origin_turn_id: "turn".into(),
+            phase: phase.into(),
+            blocking: phase == "waiting",
+            reason: "fixture".into(),
+            elapsed_ms: 1,
+            wait_ms: 0,
+            before_chars: 1000,
+            after_chars: None,
+            usage_known: true,
+        };
+        state.apply_event(status("running"));
+        assert!(!state.agent_busy);
+        assert!(!state.compacting);
+        assert_eq!(derived_busy_status(&state), "ready · background summary");
+        state.apply_event(status("waiting"));
+        assert!(!state.agent_busy);
+        assert_eq!(derived_busy_status(&state), "waiting for compaction");
+        state.apply_event(status("cancelled"));
+        state.apply_event(status("ready"));
+        assert!(state.background_compaction.is_none());
+        let before = state.pending_insert.len();
+        state.apply_event(AgentEvent::CompactEnd {
+            before: 20,
+            after: 4,
+            summary: "stale".into(),
+            job_id: Some("job".into()),
+            background: true,
+        });
+        assert_eq!(state.pending_insert.len(), before);
+        state.apply_event(status("running"));
+        state.set_agent_busy(true);
+        state.apply_event(AgentEvent::CompactEnd {
+            before: 20,
+            after: 4,
+            summary: "applied".into(),
+            job_id: Some("job".into()),
+            background: true,
+        });
+        assert!(state.agent_busy);
+        state.apply_event(status("applied"));
+        assert!(state.background_compaction.is_none());
+    }
+
+    #[test]
     fn compact_end_after_idle_manual_compact_marks_ready() {
         let mut state = TuiState::new(
             "test-model".to_string(),
@@ -16193,6 +16309,8 @@ mod tests {
             before: 20,
             after: 4,
             summary: "Task\n- reviewed compaction".to_string(),
+            job_id: None,
+            background: false,
         });
 
         assert!(!state.agent_busy);
@@ -16223,6 +16341,8 @@ mod tests {
             before: 20,
             after: 4,
             summary: String::new(),
+            job_id: None,
+            background: false,
         });
 
         assert!(state.agent_busy);

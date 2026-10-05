@@ -183,6 +183,7 @@ fn test_agent(root: &Path) -> Agent {
         session_model_pins: HashMap::new(),
         partial_stream_text: None,
         quiet_stream_events: false,
+        background: compaction::BackgroundState::default(),
         compact_threshold_chars: None,
         compact_threshold_percent: None,
         context_window_tokens: model_context_window("test-model"),
@@ -9187,6 +9188,388 @@ fn builtin_parallel_policy_only_allows_read_only_rounds() {
     assert!(!should_parallelize_builtin_tools(&["bash"]));
     assert!(!should_parallelize_builtin_tools(&["http", "rg"]));
     assert!(!should_parallelize_builtin_tools(&[]));
+}
+
+fn background_test_history(agent: &mut Agent) {
+    agent.history = (0..12)
+        .map(|index| Message {
+            role: if index % 2 == 0 { "user" } else { "assistant" }.into(),
+            content: vec![Block::Text {
+                text: format!("{index:02} {}", "context ".repeat(250)),
+            }],
+        })
+        .collect();
+    agent.background.enabled = true;
+    agent.compact_threshold_chars = Some(30_000);
+}
+
+fn background_test_candidate(agent: &mut Agent) -> tokio::sync::oneshot::Sender<String> {
+    let split = agent.find_compact_split().expect("pair-safe prefix");
+    let (_, preserved) = agent.split_compaction_inputs(&agent.history[..split]);
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    agent.background.job = Some(compaction::BackgroundJob {
+        worker: compaction::SummaryWorker {
+            task: tokio::spawn(async move { Ok(rx.await?) }),
+            cancel: Arc::new(AtomicBool::new(false)),
+            accounting: Arc::new(Mutex::new(compaction::SummaryAccounting {
+                usage: Usage {
+                    input: 11,
+                    output: 7,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })),
+            started: std::time::Instant::now(),
+        },
+        id: "test-job".into(),
+        session: agent.session_id.clone(),
+        turn: "test-turn".into(),
+        history_epoch: agent.background.history_epoch,
+        config_epoch: agent.background.config_epoch,
+        config_digest: agent.background_config_digest(),
+        prefix_digest: tool_journal::input_sha256(&json!(&agent.history[..split])).unwrap(),
+        split,
+        preserved,
+        before_chars: agent.history_chars(),
+    });
+    tx
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn background_compaction_overlaps_foreground_request_and_idle_apply() -> Result<()> {
+    let root = temp_test_dir("background-overlap");
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let address = listener.local_addr()?;
+    let (summary_seen_tx, summary_seen_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let server = std::thread::spawn(move || {
+        let mut summary_seen_tx = Some(summary_seen_tx);
+        let mut release_rx = Some(release_rx);
+        let mut summary_thread = None;
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 4096];
+            let value = loop {
+                let count = stream.read(&mut buffer).unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&buffer[..count]);
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..end]);
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                        })
+                        .unwrap();
+                    if request.len() >= end + 4 + length {
+                        break serde_json::from_slice::<Value>(&request[end + 4..end + 4 + length])
+                            .unwrap();
+                    }
+                }
+            };
+            if value["stream"] == false {
+                let release = release_rx.take().expect("one summary only");
+                summary_seen_tx.take().unwrap().send(()).unwrap();
+                summary_thread = Some(std::thread::spawn(move || {
+                    release
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                    let body = r#"{"choices":[{"message":{"content":"short summary"},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":7}}"#;
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                }));
+            } else {
+                let body = "data: {\"choices\":[{\"delta\":{\"content\":\"The foreground answer completed while the summary worker remained blocked at its barrier; this proves real overlap.\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":13,\"completion_tokens\":9}}\n\ndata: [DONE]\n\n";
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        }
+        summary_thread.unwrap().join().unwrap();
+    });
+    let mut agent = test_agent(&root);
+    configure_local_openai_agent(&mut agent, format!("http://{address}"));
+    background_test_history(&mut agent);
+    agent.max_iterations = Some(2);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    agent.set_sink(Box::new(ChannelSink { tx }));
+    let started = std::time::Instant::now();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        agent.chat("Hello".into()),
+    )
+    .await??;
+    let foreground_ms = started.elapsed().as_millis();
+    tokio::time::timeout(std::time::Duration::from_secs(1), summary_seen_rx).await??;
+    assert!(
+        agent.background.job.is_some(),
+        "summary must still be blocked after foreground completes"
+    );
+    assert!(!agent.quiet_stream_events);
+    let split = agent.background.job.as_ref().unwrap().split;
+    let tail = serde_json::to_value(&agent.history[split..])?;
+    let foreground_events = drain_events(&mut rx);
+    assert!(foreground_events.iter().any(
+        |event| matches!(event, AgentEvent::TextDelta(text) if text.contains("foreground answer"))
+    ));
+    assert!(
+        foreground_events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::TurnEnd { .. }))
+    );
+    release_tx.send(())?;
+    agent.background_wakeup().await;
+    assert!(
+        agent.service_background(false).await,
+        "idle completion applies without another prompt"
+    );
+    assert_eq!(serde_json::to_value(&agent.history[2..])?, tail);
+    assert_eq!(agent.session_usage.input, 24);
+    assert_eq!(agent.session_usage.output, 16);
+    eprintln!(
+        "overlap foreground_ms={foreground_ms} summary_barrier_total_ms={} exact_tail_messages={}",
+        started.elapsed().as_millis(),
+        agent.history.len() - 2
+    );
+    server.join().unwrap();
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn background_compaction_applies_exact_current_tail_and_accounts_once() -> Result<()> {
+    let root = temp_test_dir("background-tail");
+    let mut agent = test_agent(&root);
+    background_test_history(&mut agent);
+    let tx = background_test_candidate(&mut agent);
+    let split = agent.background.job.as_ref().unwrap().split;
+    agent.history.extend([
+        Message {
+            role: "assistant".into(),
+            content: vec![Block::ToolUse {
+                id: "new-pair".into(),
+                name: "read_file".into(),
+                input: json!({"path":"current"}),
+            }],
+        },
+        Message {
+            role: "user".into(),
+            content: vec![tool_result_block("new-pair", "latest result", None)],
+        },
+        Message {
+            role: "user".into(),
+            content: vec![Block::Text {
+                text: "[queued-user-update] correction wins".into(),
+            }],
+        },
+    ]);
+    let tail = serde_json::to_value(&agent.history[split..])?;
+    tx.send("Short summary".into()).unwrap();
+    agent.background_wakeup().await;
+    assert!(agent.service_background(false).await);
+    assert_eq!(serde_json::to_value(&agent.history[2..])?, tail);
+    assert_eq!(agent.session_usage.input, 11);
+    assert_eq!(agent.session_usage.output, 7);
+    assert!(!agent.service_background(false).await);
+    assert_eq!(agent.session_usage.input, 11);
+    assert!(agent.background.job.is_none());
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn background_compaction_rejects_same_length_prefix_route_clear_and_fork_changes()
+-> Result<()> {
+    let root = temp_test_dir("background-invalidation");
+    for mutation in ["prefix", "route", "clear", "fork", "privacy", "epoch"] {
+        let mut agent = test_agent(&root);
+        background_test_history(&mut agent);
+        let tx = background_test_candidate(&mut agent);
+        match mutation {
+            "prefix" => {
+                let Block::Text { text } = &mut agent.history[0].content[0] else {
+                    unreachable!()
+                };
+                text.replace_range(0..2, "XX");
+            }
+            "route" => agent.base_url.push_str("/changed"),
+            "clear" => agent.history.clear(),
+            "fork" => agent.session_id = new_session_id(),
+            "privacy" => agent.privacy.enabled = false,
+            "epoch" => agent.background.history_epoch += 1,
+            _ => unreachable!(),
+        }
+        let expected = serde_json::to_value(&agent.history)?;
+        tx.send("stale summary".into()).unwrap();
+        agent.background_wakeup().await;
+        assert!(!agent.service_background(false).await, "{mutation}");
+        assert_eq!(
+            serde_json::to_value(&agent.history)?,
+            expected,
+            "{mutation}"
+        );
+        assert_eq!(
+            agent.session_usage.input, 11,
+            "discard accounting {mutation}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn background_compaction_policy_changes_cancel_and_account_once() -> Result<()> {
+    let root = temp_test_dir("background-policy");
+    for policy in ["approval", "sandbox", "budget"] {
+        let mut agent = test_agent(&root);
+        background_test_history(&mut agent);
+        let tx = background_test_candidate(&mut agent);
+        let expected = serde_json::to_value(&agent.history)?;
+        let epoch = agent.background.config_epoch;
+        match policy {
+            "approval" => {
+                agent.set_approval_profile(ApprovalProfile::Never);
+            }
+            "sandbox" => agent.set_sandbox_profile(SandboxProfile::ReadOnly),
+            "budget" => agent.set_budget_cap(BudgetCap::parse("100k tokens")),
+            _ => unreachable!(),
+        }
+        assert!(agent.background.config_epoch > epoch, "{policy}");
+        assert!(
+            agent
+                .background
+                .job
+                .as_ref()
+                .unwrap()
+                .worker
+                .cancel
+                .load(Ordering::SeqCst)
+        );
+        assert_eq!(agent.session_usage.input, 11);
+        assert_eq!(agent.session_usage.output, 7);
+        assert!(!agent.service_background(false).await, "{policy}");
+        assert!(tx.send("cancelled summary".into()).is_err());
+        assert!(agent.background.job.is_none());
+        assert_eq!(serde_json::to_value(&agent.history)?, expected);
+        assert_eq!(agent.session_usage.input, 11);
+        assert_eq!(agent.session_usage.output, 7);
+    }
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn background_compaction_wait_is_interruptible_and_off_budget_paths_do_not_spawn()
+-> Result<()> {
+    let root = temp_test_dir("background-interrupt");
+    let mut agent = test_agent(&root);
+    background_test_history(&mut agent);
+    agent.background.enabled = false;
+    agent.start_background("off")?;
+    assert!(agent.background.job.is_none());
+    agent.background.enabled = true;
+    agent.budget_cap = BudgetCap::parse("100k tokens");
+    agent.start_background("budget")?;
+    assert!(agent.background.job.is_none());
+    agent.budget_cap = None;
+    let _tx = background_test_candidate(&mut agent);
+    let cancel = agent.interrupt.clone();
+    let signal = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        cancel.store(true, Ordering::SeqCst);
+    });
+    let started = std::time::Instant::now();
+    assert!(!agent.service_background(true).await);
+    assert!(started.elapsed() < std::time::Duration::from_millis(500));
+    signal.await?;
+    assert!(agent.background.job.is_none());
+    assert_eq!(agent.session_usage.input, 11);
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn background_compaction_hard_limit_reuses_job_then_falls_back_if_insufficient() -> Result<()>
+{
+    let root = temp_test_dir("background-hard-limit");
+    let mut agent = test_agent(&root);
+    background_test_history(&mut agent);
+    let tx = background_test_candidate(&mut agent);
+    let threshold = agent.active_compact_threshold_chars();
+    agent.history.push(Message {
+        role: "user".into(),
+        content: vec![Block::Text {
+            text: "new tail ".repeat(3000),
+        }],
+    });
+    assert!(agent.history_chars() > threshold);
+    let release = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        tx.send("summary".into()).unwrap();
+    });
+    let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+    agent.set_sink(Box::new(ChannelSink { tx }));
+    assert!(
+        agent
+            .compact_if_over_threshold(threshold, "hard-limit-test")
+            .await
+    );
+    release.await?;
+    assert!(agent.background.job.is_none());
+    assert!(drain_events(&mut events).iter().any(|event| matches!(event, AgentEvent::BackgroundCompaction { phase, .. } if phase == "waiting")));
+    assert_eq!(agent.session_usage.input, 11);
+    // The appended tail still exceeds headroom after the speculative prefix shrinks.
+    // The normal blocking fallback may also be insufficient; request guards must reject it.
+    assert!(agent.history_chars() > threshold);
+    agent.max_iterations = Some(1);
+    let error = agent
+        .chat("Hello".into())
+        .await
+        .expect_err("never dispatch oversized foreground");
+    assert!(
+        error.to_string().contains("headroom exhausted"),
+        "{error:#}"
+    );
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn background_compaction_shutdown_settles_worker_and_hooks_fire_only_on_apply() -> Result<()>
+{
+    let root = temp_test_dir("background-shutdown-hooks");
+    let mut agent = test_agent(&root);
+    background_test_history(&mut agent);
+    agent.set_approval_profile(ApprovalProfile::Always);
+    agent.hooks.post_compact.push(Hook {
+        tool_match: None,
+        command: "printf x >> applied".into(),
+    });
+    let tx = background_test_candidate(&mut agent);
+    let handle = agent
+        .background
+        .job
+        .as_ref()
+        .unwrap()
+        .worker
+        .task
+        .abort_handle();
+    agent.settle_background("shutdown_test").await;
+    assert!(handle.is_finished());
+    assert!(tx.send("too late".into()).is_err());
+    assert!(!root.join("applied").exists());
+    assert_eq!(agent.session_usage.input, 11);
+    let tx = background_test_candidate(&mut agent);
+    tx.send("installed".into()).unwrap();
+    agent.background_wakeup().await;
+    assert!(agent.service_background(false).await);
+    assert_eq!(std::fs::read_to_string(root.join("applied"))?, "x");
+    assert_eq!(agent.session_usage.input, 22);
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
 }
 
 #[test]

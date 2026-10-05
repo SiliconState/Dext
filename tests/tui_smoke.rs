@@ -346,6 +346,129 @@ fn tui_path_picker_inserts_without_submitting_and_preserves_draft_on_cancel() {
 }
 
 #[test]
+fn tui_background_summary_applies_while_idle_and_keeps_input_available() {
+    let temp = TempDir::new("dext-tui-background").unwrap();
+    let sandbox = temp.path().join("sandbox");
+    let state = temp.path().join("state");
+    let home = temp.path().join("home");
+    for path in [&sandbox, &state, &home] {
+        fs::create_dir_all(path).unwrap();
+    }
+    let mut fixture = format!(
+        "{}\n",
+        serde_json::json!({"version":4,"model":"mock-model","system":"test","session_id":"background-source","sandbox":sandbox,"compact_threshold_chars":30000})
+    );
+    for index in 0..12 {
+        fixture.push_str(&format!("{}\n", serde_json::json!({"role":if index % 2 == 0 {"user"} else {"assistant"},"content":[{"type":"text","text":"context ".repeat(250)}]})));
+    }
+    fs::write(sandbox.join("source.jsonl"), fixture).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut completed = 0;
+        let mut summary = None;
+        let mut release_rx = Some(release_rx);
+        while completed < 2 && Instant::now() < deadline {
+            let (mut stream, _) = match listener.accept() {
+                Ok(value) => value,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(error) => panic!("background provider: {error}"),
+            };
+            stream.set_nonblocking(false).unwrap();
+            let request = read_mock_openai_request(&mut stream);
+            let end = request.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+            if request.len() == end {
+                stream
+                    .write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+                continue;
+            }
+            let value: serde_json::Value = serde_json::from_slice(&request[end..]).unwrap();
+            completed += 1;
+            if value["stream"] == false {
+                let release = release_rx.take().unwrap();
+                summary = Some(std::thread::spawn(move || {
+                    release.recv_timeout(Duration::from_secs(15)).unwrap();
+                    let body = r#"{"choices":[{"message":{"content":"background-idle-summary"}}],"usage":{"prompt_tokens":11,"completion_tokens":7}}"#;
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                }));
+            } else {
+                let body = "data: {\"choices\":[{\"delta\":{\"content\":\"Foreground TUI answer completed while the background summary worker is blocked; input stays usable and ready.\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        }
+        assert_eq!(completed, 2);
+        summary.unwrap().join().unwrap();
+    });
+    let mut pty = Pty::open(TUI_COLS, TUI_ROWS).unwrap();
+    let mut child = spawn_dext_with_env(
+        &pty,
+        &sandbox,
+        &state,
+        &home,
+        &[
+            ("DEXT_PROVIDER", "local"),
+            ("DEXT_BASE_URL", &base),
+            ("DEXT_MODEL", "mock-model"),
+            ("DEXT_MODEL_FORCE", "1"),
+            ("DEXT_BACKGROUND_COMPACT", "1"),
+        ],
+    )
+    .unwrap();
+    assert_visible(
+        &mut pty,
+        &mut child,
+        "Type a request",
+        Duration::from_secs(5),
+    );
+    pty.write_all_retry(b"/resume source.jsonl\r").unwrap();
+    assert_visible(
+        &mut pty,
+        &mut child,
+        "loaded 12 messages",
+        Duration::from_secs(5),
+    );
+    pty.write_all_retry(b"Hello\r").unwrap();
+    assert_visible(
+        &mut pty,
+        &mut child,
+        "Foreground TUI answer",
+        Duration::from_secs(5),
+    );
+    pty.pump_for(&mut child, Duration::from_millis(150))
+        .unwrap();
+    pty.write_all_retry(b"/history\r").unwrap();
+    assert_visible(
+        &mut pty,
+        &mut child,
+        "history: 14 messages",
+        Duration::from_secs(5),
+    );
+    release_tx.send(()).unwrap();
+    assert_visible(
+        &mut pty,
+        &mut child,
+        "background-idle-summary",
+        Duration::from_secs(5),
+    );
+    pty.write_all_retry(b"\x04").unwrap();
+    assert!(
+        wait_for_exit(&mut child, Duration::from_secs(5), &mut pty)
+            .unwrap()
+            .success()
+    );
+    server.join().unwrap();
+}
+
+#[test]
 fn tui_resume_picker_loads_selected_saved_session() {
     let temp = TempDir::new("dext-tui-resume-picker").expect("temp dir");
     let sandbox = temp.path().join("sandbox");
@@ -549,10 +672,7 @@ fn spawn_slow_openai_server() -> (
     (format!("http://{address}"), release_tx, server)
 }
 
-fn serve_mock_openai_request(
-    mut stream: TcpStream,
-    release: &std::sync::mpsc::Receiver<()>,
-) -> bool {
+fn read_mock_openai_request(stream: &mut TcpStream) -> Vec<u8> {
     stream
         .set_read_timeout(Some(Duration::from_secs(2)))
         .expect("set mock request timeout");
@@ -582,6 +702,15 @@ fn serve_mock_openai_request(
         assert!(read > 0, "client closed before mock request body");
         request.extend_from_slice(&buf[..read]);
     }
+
+    request
+}
+
+fn serve_mock_openai_request(
+    mut stream: TcpStream,
+    release: &std::sync::mpsc::Receiver<()>,
+) -> bool {
+    let request = read_mock_openai_request(&mut stream);
 
     if !String::from_utf8_lossy(&request).starts_with("POST /v1/chat/completions ") {
         stream

@@ -205,6 +205,10 @@ Seats deliberately do not own provider/model selection, permissions, tools, task
 
 If richer session navigation is requested again, first instrument actual demand. Prefer an on-demand, recent-first turn timeline derived from structured tool results and ledger facts: one row per user turn, no prose keyword classifier, no provider-visible tool, and no context mutation.
 
+## Speculative compaction
+
+`compaction.rs` splits owner-only preparation/application from isolated summary computation, reusing the shared request builder, bounded provider/SSE parser and history builder. `DEXT_BACKGROUND_COMPACT` defaults off; one job at 80% of the unchanged active threshold overlaps normal turns. Session/config/history epochs plus a pair-safe prefix digest fence rewrites without invalidating ordinary appends; application uses the current tail and persists before events/hooks. Hard headroom waits are cancellable and bounded, with unchanged blocking recovery and a post-recovery capacity check. Budgets disable speculation; 4 MiB bounds, 60-second job deadline, 30-second cooldown and no repeated prefix cap overhead. Jobs are disposable, not serialized state. Both TUI and NDJSON owners service idle completions; shutdown settles/aborts/reaps jobs. Known usage is collected per worker attempt and installed once, including discards; unobservable remote billing is explicitly unknown. Core events separate background status from user-turn work and legacy blocking compaction.
+
 ## Safety model
 
 Dext has three safety layers:

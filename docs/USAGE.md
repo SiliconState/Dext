@@ -187,6 +187,14 @@ cd /path/to/llama.cpp
 
 Use `--frugal --effort off` or `/context frugal` plus `/effort off` for the lowest local token/compute pressure. To preserve local reasoning across llama.cpp tool rounds, start a build/template that supports reasoning preservation (for current llama.cpp, `--reasoning-preserve`). Dext stores the returned reasoning but omits it from compaction transcripts and later fresh-user-turn requests.
 
+## Background compaction (opt-in)
+
+`DEXT_BACKGROUND_COMPACT=1` overlaps one speculative summary with foreground model/tool work. It defaults off. The soft trigger is 80% of the existing active blocking threshold; that threshold is unchanged. A bounded, pair-closed prefix is snapshotted at a safe boundary, while later tool results and steering keep appending. A separate summary worker owns its parser, retries, cancellation and immutable provider/auth/pricing request; it never clones or concurrently mutates the Agent.
+
+Application revalidates session/config/history epochs, prefix SHA-256 and tool pairing, requires a useful reduction, and splices onto the current tail. History is saved before publishing an application event. At headroom exhaustion the existing job gets a cancellable 10-second wait, followed by the normal blocking recovery if needed; an insufficient result cannot authorize an oversized foreground request. Speculation has a 60-second total deadline, existing four-attempt Responses retry ceiling, 4 MiB prefix/request/response bounds and a 30-second cooldown. Rate-limited speculation is not retried; the same prefix is not repeatedly resubmitted. Configured budgets disable speculation rather than guessing a spend reservation.
+
+Persistent TUI and NDJSON loops apply completions while idle without requiring new input. Background status does not mark a user turn working or disable input. Esc/interrupt, manual compaction, session/route/privacy/context/threshold changes and exit cancel or invalidate the job. One-shot exit applies a ready candidate and settles unfinished speculation within 100 ms before aborting/reaping it. Jobs and credentials are never persisted or inherited by kept forks. Known summary usage is added once, including discarded attempts; missing remote billing on cancellation is explicitly unknown, not claimed zero. `post_compact` runs only after application.
+
 ## Interactive workflow
 
 Start Dext:

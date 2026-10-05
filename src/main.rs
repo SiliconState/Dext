@@ -1,4 +1,5 @@
 mod claude_subscription;
+mod compaction;
 mod crash;
 mod events;
 mod git_checkpoints;
@@ -466,6 +467,7 @@ impl std::fmt::Display for ProviderTransportError {
 
 impl std::error::Error for ProviderTransportError {}
 
+#[cfg(test)]
 async fn send_provider_request(
     request: reqwest::RequestBuilder,
     timeout: std::time::Duration,
@@ -2015,11 +2017,17 @@ impl EventSink for ConsoleSink {
                     dim(&format!("[usage: {}]", usage.line()), self.pretty)
                 );
             }
+            AgentEvent::BackgroundCompaction { phase, .. } => {
+                if !matches!(phase.as_str(), "running" | "ready") {
+                    eprintln!("[background compaction: {phase}]");
+                }
+            }
             AgentEvent::CompactStart => {}
             AgentEvent::CompactEnd {
                 before,
                 after,
                 summary,
+                ..
             } => {
                 if !summary.trim().is_empty() {
                     println!("{summary}");
@@ -13863,6 +13871,7 @@ struct Agent {
     session_model_pins: HashMap<String, String>,
     partial_stream_text: Option<String>,
     quiet_stream_events: bool,
+    background: compaction::BackgroundState,
     compact_threshold_chars: Option<usize>,
     compact_threshold_percent: Option<u8>,
     context_window_tokens: u64,
@@ -14086,6 +14095,10 @@ impl Agent {
             session_model_pins: HashMap::new(),
             partial_stream_text: None,
             quiet_stream_events: false,
+            background: compaction::BackgroundState {
+                enabled: env_flag_default("DEXT_BACKGROUND_COMPACT", false),
+                ..Default::default()
+            },
             compact_threshold_chars: compact_threshold_percent
                 .map(|percent| compact_threshold_chars_for_window(context_window_tokens, percent)),
             compact_threshold_percent,
@@ -14326,6 +14339,9 @@ impl Agent {
         previous_model: &str,
         previous_route: &str,
     ) -> bool {
+        if previous_route != self.provider_route_identity() {
+            self.invalidate_background("provider_route");
+        }
         if self.history.is_empty() || previous_route == self.provider_route_identity() {
             return false;
         }
@@ -14794,6 +14810,9 @@ impl Agent {
         source: ApprovalPolicySource,
     ) -> usize {
         let profile_changed = self.approval_profile != profile;
+        if profile_changed {
+            self.invalidate_background("approval_policy");
+        }
         self.approval_policy_source = source;
         self.approval_profile = profile;
         let privileged: Vec<String> = self
@@ -14827,6 +14846,7 @@ impl Agent {
 
     fn set_sandbox_profile(&mut self, profile: SandboxProfile) {
         if self.sandbox_profile != profile {
+            self.invalidate_background("sandbox_policy");
             self.allowed.remove(HOOKS_APPROVAL_NAME);
             self.approved_pack_runtime = None;
             self.deactivate_pack_runtime();
@@ -14835,6 +14855,7 @@ impl Agent {
     }
 
     fn set_budget_cap(&mut self, cap: Option<BudgetCap>) {
+        self.invalidate_background("budget");
         self.budget_cap = cap;
         self.budget_exhausted = false;
     }
@@ -14852,6 +14873,7 @@ impl Agent {
     }
 
     fn note_runtime_model_change(&mut self, model: &str) -> Option<u64> {
+        self.invalidate_background("model");
         self.model = model.to_string();
         let provider_id = self.provider_id.clone();
         self.pin_model_for_provider(&provider_id, model);
@@ -15101,12 +15123,14 @@ impl Agent {
     }
 
     fn set_compact_threshold_auto(&mut self) {
+        self.invalidate_background("threshold");
         self.compact_threshold_chars = None;
         self.compact_threshold_percent = None;
         let _ = save_compact_threshold_percent_setting(None);
     }
 
     fn set_compact_threshold_percent(&mut self, percent: u8) -> usize {
+        self.invalidate_background("threshold");
         let percent = percent.clamp(1, 100);
         self.compact_threshold_chars = Some(compact_threshold_chars_for_window(
             self.context_window_tokens(),
@@ -15121,6 +15145,7 @@ impl Agent {
         if self.thinking_effort == effort {
             return false;
         }
+        self.invalidate_background("effort");
         self.thinking_effort = effort;
         true
     }
@@ -15129,16 +15154,19 @@ impl Agent {
         if self.reasoning_mode == mode {
             return false;
         }
+        self.invalidate_background("reasoning_mode");
         self.reasoning_mode = mode;
         true
     }
 
     fn cycle_reasoning_mode(&mut self) -> ReasoningMode {
+        self.invalidate_background("reasoning_mode");
         self.reasoning_mode = self.reasoning_mode.cycle();
         self.reasoning_mode
     }
 
     fn cycle_thinking_effort(&mut self, step: i8) -> ThinkingEffort {
+        self.invalidate_background("effort");
         self.thinking_effort = self.thinking_effort.cycle(step);
         self.thinking_effort
     }
@@ -15230,6 +15258,7 @@ impl Agent {
     }
 
     fn set_sandbox_root(&mut self, root: PathBuf) -> Result<()> {
+        self.invalidate_background("sandbox");
         let root = std::fs::canonicalize(&root)
             .with_context(|| format!("canonicalizing sandbox root {}", root.display()))?;
         if !std::fs::metadata(&root)
@@ -16729,6 +16758,9 @@ impl Agent {
     }
 
     fn set_context_mode_automatic(&mut self, mode: ContextMode) {
+        if self.context_mode != mode {
+            self.invalidate_background("context_mode");
+        }
         self.context_mode = mode;
     }
 
@@ -17700,6 +17732,7 @@ impl Agent {
         path: &Path,
         expected_seat: Option<&str>,
     ) -> Result<PathBuf> {
+        self.invalidate_background("session_load");
         let file =
             std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
         let mut reader = io::BufReader::new(file);
@@ -17998,6 +18031,7 @@ impl Agent {
     }
 
     fn rewrite_latest_tool_results_as_text_fallback(&mut self) -> bool {
+        self.invalidate_background("tool_result_rewrite");
         let Some(last) = self.history.last_mut() else {
             return false;
         };
@@ -18377,36 +18411,132 @@ impl Agent {
         }
     }
 
-    async fn send_responses_summary_request(
+    fn prepare_summary_request(
         &self,
-        contract: RequestContract,
-        body: &Value,
-    ) -> Result<reqwest::Response> {
-        let url = provider_request_url(&self.base_url, contract);
-        let bytes = serde_json::to_vec(body).map_err(|error| anyhow::anyhow!(error))?;
-        let req = apply_provider_headers(
-            self.provider_post(&url)?
-                .header("content-type", "application/json")
-                .header("accept", "text/event-stream")
-                .body(bytes),
+        old: &[Message],
+        evidence: &str,
+    ) -> Result<compaction::SummaryRequest> {
+        let transcript = render_transcript_for_summary(old, self.context_mode);
+        let user_text = self
+            .privacy
+            .redact_text(&compaction_user_text_with_evidence(&transcript, evidence))
+            .text;
+        let model = self.compact_summary_model();
+        let contract = self.request_contract_for_model(&model);
+        let effort = contract
+            .is_responses()
+            .then(|| self.responses_reasoning_effort_for_model(&model, ThinkingEffort::Low))
+            .flatten();
+        let thinking = effort.is_some()
+            || glm_forced_thinking_effort(&self.provider_id, &model, ThinkingEffort::Low).is_some()
+            || anthropic_required_adaptive_effort(&self.provider_id, &model, ThinkingEffort::Low)
+                .is_some();
+        let max_tokens = compact_summary_max_tokens(self.thinking_effort, thinking);
+        let bytes = if contract.is_responses() {
+            serde_json::to_vec(&build_responses_summary_body(
+                contract,
+                &model,
+                &user_text,
+                effort.as_deref(),
+                self.reasoning_mode_for_model(&model),
+                max_tokens,
+            ))?
+        } else if contract == RequestContract::OpenAiChatCompletions {
+            let (max_tokens, max_completion_tokens) =
+                oai_output_token_caps(&self.provider_id, &model, max_tokens);
+            serde_json::to_vec(&OaiRequest {
+                model: &model,
+                max_tokens,
+                max_completion_tokens,
+                messages: vec![
+                    OaiMessage {
+                        role: "system".into(),
+                        content: Some(Value::String(COMPACT_SYSTEM.into())),
+                        reasoning_content: None,
+                        tool_calls: None,
+                        tool_call_id: None,
+                    },
+                    OaiMessage {
+                        role: "user".into(),
+                        content: Some(Value::String(user_text.clone())),
+                        reasoning_content: None,
+                        tool_calls: None,
+                        tool_call_id: None,
+                    },
+                ],
+                tools: Vec::new(),
+                stream: false,
+                stream_options: None,
+                reasoning_effort: None,
+                grammar: None,
+                chat_template_kwargs: compact_summary_chat_template_kwargs(
+                    &self.provider_id,
+                    self.route_api_provider(),
+                    &self.base_url,
+                ),
+            })?
+        } else {
+            self.build_anthropic_summary_request(&model, &user_text, max_tokens)?
+        };
+        if bytes.len() > PROVIDER_JSON_BODY_CAP {
+            anyhow::bail!("summary request exceeded byte limit");
+        }
+        let mut builder = self
+            .provider_post(provider_request_url(&self.base_url, contract))?
+            .header("content-type", "application/json")
+            .body(bytes);
+        if contract.is_responses() {
+            builder = builder.header("accept", "text/event-stream");
+        }
+        let subscription =
+            contract == RequestContract::AnthropicMessages && self.anthropic_subscription_active();
+        let request = apply_provider_headers(
+            builder,
             contract,
             &self.api_key,
             self.provider_profile
                 .as_ref()
                 .is_some_and(|profile| is_official_kimi_profile(profile, &self.base_url)),
+            subscription,
             false,
-            false,
-            None,
-        )?;
-        let resp = send_provider_request(req, self.first_byte_timeout()).await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = read_provider_error_body(resp, self.stream_idle_timeout())
-                .await
-                .unwrap_or_else(|error| format!("[provider error body unavailable: {error}]"));
-            anyhow::bail!("summary {}", http_status_error(status, &text));
-        }
-        Ok(resp)
+            subscription.then_some(self.claude_session_id.as_str()),
+        )?
+        .build()?;
+        let pricing = self
+            .provider_profile
+            .as_ref()
+            .and_then(|profile| resolve_model_spec(profile, &model).pricing)
+            .as_ref()
+            .map_or_else(
+                || {
+                    usage_pricing_for(
+                        &self.provider_id,
+                        contract.api_provider(),
+                        &self.base_url,
+                        &model,
+                    )
+                },
+                |pricing| usage_pricing_from_env(UsagePricing::from(pricing)),
+            );
+        let override_wire_cost = provider_cost_estimate_overrides_wire_cost(
+            &self.provider_id,
+            contract.api_provider(),
+            &model,
+        );
+        Ok(compaction::SummaryRequest {
+            client: self.http_client().clone(),
+            request,
+            contract,
+            first_byte: self.first_byte_timeout(),
+            idle: self.stream_idle_timeout(),
+            provider: self.provider_id.clone(),
+            model,
+            pricing,
+            pricing_override: pricing_env_override_is_set(),
+            override_wire_cost,
+            input_tokens: (user_text.len() as u64).div_ceil(4).max(1),
+            speculative: false,
+        })
     }
 
     async fn one_shot_summary(
@@ -18414,270 +18544,36 @@ impl Agent {
         old: &[Message],
         evidence: &str,
     ) -> Result<(String, Usage)> {
-        // Responses-contract summaries reuse the shared streaming reader, which
-        // forwards deltas/blocks to the UI sink. Mute those events so every
-        // provider presents the summary exactly once through CompactEnd
-        // instead of some providers leaking it as live assistant output.
-        self.quiet_stream_events = true;
-        let result = self.one_shot_summary_request(old, evidence).await;
-        self.quiet_stream_events = false;
-        result
-    }
-
-    async fn one_shot_summary_request(
-        &mut self,
-        old: &[Message],
-        evidence: &str,
-    ) -> Result<(String, Usage)> {
-        let transcript = render_transcript_for_summary(old, self.context_mode);
-        let user_text = compaction_user_text_with_evidence(&transcript, evidence);
-        let summary_model = self.compact_summary_model();
-
-        #[derive(PartialEq, Eq)]
-        enum SummaryParse {
-            Anthropic,
-            OpenAi,
-            Responses(RequestContract),
-        }
-
-        let summary_contract = self.request_contract_for_model(&summary_model);
-        let is_responses_summary = summary_contract.is_responses();
-        let summary_reasoning_effort = is_responses_summary
-            .then(|| self.responses_reasoning_effort_for_model(&summary_model, ThinkingEffort::Low))
-            .flatten();
-        let summary_reasoning_enabled = summary_reasoning_effort.is_some()
-            || glm_forced_thinking_effort(&self.provider_id, &summary_model, ThinkingEffort::Low)
-                .is_some()
-            || anthropic_required_adaptive_effort(
-                &self.provider_id,
-                &summary_model,
-                ThinkingEffort::Low,
-            )
-            .is_some();
-        let summary_max_tokens =
-            compact_summary_max_tokens(self.thinking_effort, summary_reasoning_enabled);
-        let summary_reasoning_mode = self.reasoning_mode_for_model(&summary_model);
-        let make_responses_summary_body = || {
-            build_responses_summary_body(
-                summary_contract,
-                &summary_model,
-                &user_text,
-                summary_reasoning_effort.as_deref(),
-                summary_reasoning_mode,
-                summary_max_tokens,
-            )
+        let request = self.prepare_summary_request(old, evidence)?;
+        let mut worker = compaction::SummaryWorker::spawn(request, None);
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(25));
+        let result = loop {
+            if self.interrupt.load(Ordering::SeqCst) {
+                worker.cancel.store(true, Ordering::SeqCst);
+            }
+            tokio::select! {
+                result = &mut worker.task => break result.context("summary worker join")?,
+                _ = tick.tick() => {}
+            }
         };
-        let (mut resp, parse_mode): (reqwest::Response, SummaryParse) = if is_responses_summary {
-            let body = make_responses_summary_body();
-            (
-                self.send_responses_summary_request(summary_contract, &body)
-                    .await?,
-                SummaryParse::Responses(summary_contract),
-            )
-        } else if summary_contract == RequestContract::OpenAiChatCompletions {
-            let reasoning_effort = None;
-            let messages = vec![
-                OaiMessage {
-                    role: "system".to_string(),
-                    content: Some(Value::String(COMPACT_SYSTEM.to_string())),
-                    reasoning_content: None,
-                    tool_calls: None,
-                    tool_call_id: None,
-                },
-                OaiMessage {
-                    role: "user".to_string(),
-                    content: Some(Value::String(user_text.clone())),
-                    reasoning_content: None,
-                    tool_calls: None,
-                    tool_call_id: None,
-                },
-            ];
-            let (max_tokens, max_completion_tokens) =
-                oai_output_token_caps(&self.provider_id, &summary_model, summary_max_tokens);
-            let body = OaiRequest {
-                model: &summary_model,
-                max_tokens,
-                max_completion_tokens,
-                messages,
-                tools: Vec::new(),
-                stream: false,
-                stream_options: None,
-                reasoning_effort,
-                grammar: None,
-                chat_template_kwargs: compact_summary_chat_template_kwargs(
-                    &self.provider_id,
-                    self.route_api_provider(),
-                    &self.base_url,
-                ),
-            };
-            let mut req = self
-                .provider_post(provider_request_url(&self.base_url, summary_contract))?
-                .header("content-type", "application/json")
-                .json(&body);
-            if !self.api_key.trim().is_empty() {
-                req = req.header("authorization", format!("Bearer {}", self.api_key));
-            }
-            (
-                send_provider_request(req, self.first_byte_timeout()).await?,
-                SummaryParse::OpenAi,
-            )
-        } else {
-            let anthropic_subscription = self.anthropic_subscription_active();
-            let bytes = self.build_anthropic_summary_request(
-                &summary_model,
-                &user_text,
-                summary_max_tokens,
-            )?;
-            let req = apply_provider_headers(
-                self.provider_post(provider_request_url(&self.base_url, summary_contract))?
-                    .header("content-type", "application/json")
-                    .body(bytes),
-                summary_contract,
-                &self.api_key,
-                self.provider_profile
-                    .as_ref()
-                    .is_some_and(|profile| is_official_kimi_profile(profile, &self.base_url)),
-                anthropic_subscription,
-                false,
-                anthropic_subscription.then_some(self.claude_session_id.as_str()),
-            )?;
-            (
-                send_provider_request(req, self.first_byte_timeout()).await?,
-                SummaryParse::Anthropic,
-            )
-        };
-
-        let status = resp.status();
-        if !status.is_success() {
-            let text = read_provider_error_body(resp, self.stream_idle_timeout())
-                .await
-                .unwrap_or_else(|error| format!("[provider error body unavailable: {error}]"));
-            anyhow::bail!("summary {}", http_status_error(status, &text));
+        let accounting = worker.accounting.lock().unwrap_or_else(|e| e.into_inner());
+        for (attempt, wait_secs, reason) in &accounting.retries {
+            self.sink.emit(AgentEvent::HttpRetry {
+                attempt: *attempt,
+                wait_secs: *wait_secs,
+                reason: reason.clone(),
+            });
         }
-
-        let responses_contract = match parse_mode {
-            SummaryParse::Responses(contract) => Some(contract),
-            _ => None,
-        };
-        if let Some(responses_contract) = responses_contract {
-            let mut attempt = 0u32;
-            let mut summary_usage = Usage::default();
-            loop {
-                attempt += 1;
-                match self.read_stream_responses(resp, responses_contract).await {
-                    Ok(ParsedProviderStream {
-                        blocks,
-                        stop_reason,
-                        mut usage,
-                        ..
-                    }) => {
-                        let fallback_input =
-                            ((user_text.len() as u64).saturating_add(3) / 4).max(1);
-                        Self::fill_missing_usage_metrics(&mut usage, fallback_input, &blocks);
-                        self.finalize_usage_metrics_for_model(&mut usage, &summary_model);
-                        summary_usage.add(usage);
-                        if let Some(reason) =
-                            chatgpt_incomplete_reason(responses_contract, stop_reason.as_deref())
-                        {
-                            let incomplete = format!("summary response was incomplete ({reason})");
-                            if reason == "content_filter" {
-                                anyhow::bail!(incomplete);
-                            }
-                            if attempt >= MAX_STREAM_ATTEMPTS {
-                                anyhow::bail!(
-                                    "{incomplete} after {attempt} attempts; provider kept truncating compaction summaries"
-                                );
-                            }
-                            self.append_latest_log(
-                                "summary_stream_retry",
-                                &format!(
-                                    "attempt={attempt} kind=incomplete reason={reason} wait=0s"
-                                ),
-                            );
-                            self.sink.emit(AgentEvent::HttpRetry {
-                                attempt,
-                                wait_secs: 0,
-                                reason: format!("incomplete summary response ({reason})"),
-                            });
-                            let body = make_responses_summary_body();
-                            resp = self
-                                .send_responses_summary_request(responses_contract, &body)
-                                .await?;
-                            continue;
-                        }
-                        let text = blocks
-                            .into_iter()
-                            .filter_map(|b| match b {
-                                Block::Text { text } | Block::PartialStream { text } => Some(text),
-                                _ => None,
-                            })
-                            .collect::<Vec<_>>()
-                            .join("");
-                        if text.trim().is_empty() {
-                            anyhow::bail!("summary response had no text blocks");
-                        }
-                        return Ok((text, summary_usage));
-                    }
-                    Err(e) => {
-                        let body = stream_error_body(&e);
-                        let plan = orchestrator::classify_stream_error(&body);
-                        if plan.retry && attempt < MAX_STREAM_ATTEMPTS {
-                            let wait = jittered_backoff_secs(1u64 << (attempt - 1));
-                            self.append_latest_log(
-                                "summary_stream_retry",
-                                &format!(
-                                    "attempt={attempt} kind={} wait={wait}s body={body}",
-                                    plan.label()
-                                ),
-                            );
-                            self.sink.emit(AgentEvent::HttpRetry {
-                                attempt,
-                                wait_secs: wait,
-                                reason: format!("{} summary stream error", plan.label()),
-                            });
-                            let _ = self.interrupt_aware_sleep(wait).await;
-                            let body = make_responses_summary_body();
-                            resp = self
-                                .send_responses_summary_request(responses_contract, &body)
-                                .await?;
-                            continue;
-                        }
-                        anyhow::bail!(body);
-                    }
-                }
-            }
+        let mut usage = accounting.usage;
+        usage.add(accounting.inflight);
+        if result.is_err() {
+            self.session_usage.add(usage);
+            self.sink.emit(AgentEvent::UsageUpdate {
+                turn: Usage::default(),
+                session: self.session_usage,
+            });
         }
-
-        let json = read_provider_json_body(resp, self.stream_idle_timeout()).await?;
-        match parse_mode {
-            SummaryParse::Responses(_) => unreachable!("handled above"),
-            SummaryParse::OpenAi => {
-                let text = openai_summary_text_from_response(&json)?;
-                let mut usage = Usage::parse_openai(&json["usage"]);
-                self.finalize_usage_metrics_for_model(&mut usage, &summary_model);
-                Ok((text, usage))
-            }
-            SummaryParse::Anthropic => {
-                let text = json["content"]
-                    .as_array()
-                    .and_then(|arr| {
-                        arr.iter().find_map(|b| {
-                            if b["type"] == "text" {
-                                b["text"].as_str().map(String::from)
-                            } else {
-                                None
-                            }
-                        })
-                    })
-                    .unwrap_or_default();
-                if text.trim().is_empty() {
-                    anyhow::bail!("summary response had no text");
-                }
-                let mut usage = Usage::parse(&json["usage"]);
-                self.finalize_usage_metrics_for_model(&mut usage, &summary_model);
-                Ok((text, usage))
-            }
-        }
+        Ok((result?, usage))
     }
 
     #[cfg(test)]
@@ -18695,13 +18591,18 @@ impl Agent {
         threshold_chars: usize,
         checkpoint_label: &str,
     ) -> bool {
+        let applied = self
+            .service_background(self.history_chars() > threshold_chars)
+            .await;
         if self.history_chars() <= threshold_chars {
-            return false;
+            return applied;
         }
         let before_len = self.history.len();
         let before_chars = self.history_chars();
         let compacted = match self.compact().await {
-            Ok(()) => self.history.len() != before_len || self.history_chars() < before_chars,
+            Ok(()) => {
+                applied || self.history.len() != before_len || self.history_chars() < before_chars
+            }
             Err(_) => {
                 self.sink
                     .emit(AgentEvent::Info("[continuing without compaction]".into()));
@@ -18737,6 +18638,8 @@ impl Agent {
     }
 
     async fn compact(&mut self) -> Result<()> {
+        self.settle_background("blocking_or_manual").await;
+        self.background.history_epoch = self.background.history_epoch.wrapping_add(1);
         let Some(split) = self.find_compact_split() else {
             self.sink
                 .emit(AgentEvent::Info("[compact: nothing to compact yet]".into()));
@@ -18771,7 +18674,7 @@ impl Agent {
         } else {
             match self.one_shot_summary(&summary_input, &evidence).await {
                 Ok(v) => v,
-                Err(e) if !evidence.trim().is_empty() => {
+                Err(e) if !self.interrupt.load(Ordering::SeqCst) && !evidence.trim().is_empty() => {
                     let msg = format!(
                         "summary model failed; using deterministic compaction evidence: {e:#}"
                     );
@@ -18804,11 +18707,18 @@ impl Agent {
             before,
             after,
             summary: summary.clone(),
+            job_id: None,
+            background: false,
         });
         self.append_latest_log("compact_complete", &format!("{before} -> {after} messages"));
         self.checkpoint_latest_session("after_compact");
+        self.post_compact_hooks(&summary);
+        Ok(())
+    }
+
+    fn post_compact_hooks(&mut self, summary: &str) {
         if !self.hooks.post_compact.is_empty() && hooks_approved(self) {
-            let hook_summary = self.privacy.redact_text(&summary).text;
+            let hook_summary = self.privacy.redact_text(summary).text;
             let hook_env = [
                 ("DEXT_SESSION_ID", self.session_id.as_str()),
                 ("DEXT_COMPACT_SUMMARY", hook_summary.as_str()),
@@ -18829,7 +18739,6 @@ impl Agent {
                 }
             }
         }
-        Ok(())
     }
 
     async fn chat(&mut self, user_input: String) -> Result<()> {
@@ -18848,6 +18757,7 @@ impl Agent {
         self.append_latest_log("chat_start", &format!("chars={}", user_input.len()));
         let result = self.chat_inner(user_input, explicit_pack).await;
         if result.is_err() {
+            self.settle_background("turn_error_or_interrupt").await;
             let interrupted = self.interrupt.load(Ordering::SeqCst);
             if interrupted {
                 self.sink.emit(AgentEvent::Interrupted);
@@ -19100,6 +19010,24 @@ impl Agent {
                     }
                 }
                 self.checkpoint_latest_session("after_pre_request_hooks");
+            }
+            if self.background.enabled {
+                compacted_this_turn |= self.service_background(false).await;
+                if self.history_chars() > self.active_compact_threshold_chars() {
+                    compacted_this_turn |= self
+                        .compact_if_over_threshold(
+                            self.active_compact_threshold_chars(),
+                            "before_background_headroom_request",
+                        )
+                        .await;
+                    if self.history_chars() > self.active_compact_threshold_chars() {
+                        anyhow::bail!("context headroom exhausted after bounded compaction");
+                    }
+                }
+                if let Err(error) = self.start_background(&turn_id) {
+                    self.append_latest_log("background_prepare_failed", &error.to_string());
+                    self.background.cooldown = Some(std::time::Instant::now());
+                }
             }
             let chatgpt_session_id = self.request_contract().is_responses().then(|| {
                 format!(
@@ -19944,6 +19872,7 @@ impl Agent {
         {
             compacted_this_turn = true;
         }
+        compacted_this_turn |= self.service_background(false).await;
         self.sink.emit(AgentEvent::TurnDiagnostics {
             provider: self.provider_id.clone(),
             api_family: api_family_label(self.request_contract()).to_string(),
@@ -22547,6 +22476,9 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
     let mut parts = line[1..].splitn(2, char::is_whitespace);
     let cmd = parts.next().unwrap_or("");
     let arg = parts.next().unwrap_or("").trim();
+    if matches!(cmd, "privacy" | "system") && !matches!(arg, "" | "status") {
+        agent.invalidate_background("configuration");
+    }
 
     let mut out = String::new();
     let w = &mut out;
@@ -22702,6 +22634,7 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                     return Some(true);
                 }
             }
+            agent.invalidate_background("clear");
             agent.history.clear();
             agent.clear_pending_login();
             let _ = writeln!(w, "cleared {n} messages");
@@ -25899,6 +25832,8 @@ async fn agent_main() -> Result<()> {
 
     if let Some(task) = one_shot_task {
         let result = agent.chat(task).await;
+        agent.service_background(false).await;
+        agent.settle_background("one_shot_exit").await;
         autosave_latest(&mut agent);
         return match result {
             Ok(()) => {
@@ -26084,7 +26019,15 @@ async fn agent_main() -> Result<()> {
             stdout.flush()?;
         }
 
-        let input = match input_rx.recv().await {
+        let received = tokio::select! {
+            line = input_rx.recv() => line,
+            _ = agent.background_wakeup() => {
+                agent.service_background(false).await;
+                autosave_latest(&mut agent);
+                continue;
+            }
+        };
+        let input = match received {
             Some(line) => line,
             None => {
                 if !quiet {
@@ -26252,6 +26195,8 @@ async fn agent_main() -> Result<()> {
         autosave_latest(&mut agent);
     }
 
+    agent.service_background(false).await;
+    agent.settle_background("shutdown").await;
     autosave_latest(&mut agent);
     Ok(())
 }

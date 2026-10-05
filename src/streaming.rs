@@ -142,6 +142,14 @@ impl ProviderStreamParser {
         }
     }
 
+    pub(crate) fn known_usage(&self) -> Usage {
+        match &self.state {
+            ProviderState::Anthropic(state) => state.usage,
+            ProviderState::OpenAi(state) => state.usage,
+            ProviderState::ChatGpt(state) => state.usage,
+        }
+    }
+
     pub(crate) fn finish(self) -> Result<ParsedStream> {
         match self.state {
             ProviderState::Anthropic(state) => finish_anthropic(self.contract, state),
