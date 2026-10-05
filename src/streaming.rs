@@ -9,6 +9,15 @@ pub(crate) use crate::sse::{SseDecoder, SseFrame};
 const TOOL_ARGUMENT_BUFFER_CAP: usize = 256_000;
 const REASONING_BUFFER_CAP: usize = 4 * 1024 * 1024;
 
+pub(crate) fn sse_event_cap(contract: RequestContract) -> usize {
+    // Responses terminals include full output snapshots and opaque reasoning items.
+    if contract.is_responses() {
+        crate::PROVIDER_JSON_BODY_CAP
+    } else {
+        256_000
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum StreamUpdate {
     TextDelta(String),
@@ -2411,6 +2420,114 @@ mod tests {
             error.contains("delta.reasoning_content exceeded 4194304 bytes"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn responses_large_terminal_frames_preserve_text_usage_and_reasoning() {
+        let encrypted = "x".repeat(300_000);
+        let terminal = serde_json::json!({
+            "type": "response.completed",
+            "response": {
+                "status": "completed",
+                "usage": {"input_tokens": 17, "output_tokens": 9},
+                "output": [{"type": "reasoning", "id": "rs_large",
+                    "encrypted_content": encrypted, "summary": []}]
+            }
+        });
+        let wire = format!(
+            "data: {{\"type\":\"response.output_text.delta\",\"delta\":\"visible answer\"}}\n\nevent: response.completed\ndata: {terminal}\n\n"
+        );
+        assert!(wire.len() > 256_000);
+        assert!(SseDecoder::new(256_000).push(wire.as_bytes()).is_err());
+        for contract in [
+            RequestContract::ChatGptResponses,
+            RequestContract::OpenAiResponses,
+        ] {
+            for chunk_size in [4093, wire.len()] {
+                let mut decoder = SseDecoder::new(sse_event_cap(contract));
+                let mut parser = ProviderStreamParser::new(contract, false);
+                let mut updates = Vec::new();
+                for chunk in wire.as_bytes().chunks(chunk_size) {
+                    for frame in decoder.push(chunk).unwrap() {
+                        updates.extend(parser.push_frame(frame).unwrap());
+                    }
+                }
+                for frame in decoder.finish().unwrap() {
+                    updates.extend(parser.push_frame(frame).unwrap());
+                }
+                let parsed = parser.finish().unwrap();
+                assert_eq!(parsed.stop_reason.as_deref(), Some("completed"));
+                assert_eq!(parsed.usage.input, 17);
+                assert_eq!(parsed.usage.output, 9);
+                assert_eq!(
+                    updates,
+                    vec![StreamUpdate::TextDelta("visible answer".into())]
+                );
+                assert!(parsed.blocks.iter().any(|block| matches!(block,
+                    Block::Text { text } if text == "visible answer")));
+                let reasoning = parsed.blocks.iter().find_map(|block| match block {
+                    Block::ResponsesReasoning { item } => Some(item),
+                    _ => None,
+                });
+                if contract == RequestContract::OpenAiResponses {
+                    assert_eq!(reasoning.unwrap()["encrypted_content"], encrypted);
+                } else {
+                    assert!(reasoning.is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn responses_event_caps_still_reject_oversized_frames_and_tool_arguments() {
+        for contract in [
+            RequestContract::AnthropicMessages,
+            RequestContract::OpenAiChatCompletions,
+            RequestContract::ChatGptResponses,
+            RequestContract::OpenAiResponses,
+        ] {
+            let cap = sse_event_cap(contract);
+            assert_eq!(
+                cap,
+                if contract.is_responses() {
+                    4 * 1024 * 1024
+                } else {
+                    256_000
+                }
+            );
+            let mut decoder = SseDecoder::new(cap);
+            assert!(
+                decoder
+                    .push(&vec![b'x'; cap + 5])
+                    .unwrap_err()
+                    .to_string()
+                    .contains(&format!("event exceeded {cap} bytes"))
+            );
+        }
+        for contract in [
+            RequestContract::ChatGptResponses,
+            RequestContract::OpenAiResponses,
+        ] {
+            let wire = format!(
+                "data: {}\n\ndata: {}\n\n",
+                serde_json::json!({"type":"response.output_item.added", "item": {
+                    "type":"function_call", "id":"fc_large", "call_id":"call_large",
+                    "name":"write_file", "arguments":""}}),
+                serde_json::json!({"type":"response.function_call_arguments.done",
+                    "item_id":"fc_large", "arguments":"x".repeat(TOOL_ARGUMENT_BUFFER_CAP + 1)})
+            );
+            let mut decoder = SseDecoder::new(sse_event_cap(contract));
+            let mut parser = ProviderStreamParser::new(contract, false);
+            let mut frames = decoder.push(wire.as_bytes()).unwrap().into_iter();
+            parser.push_frame(frames.next().unwrap()).unwrap();
+            assert!(
+                parser
+                    .push_frame(frames.next().unwrap())
+                    .unwrap_err()
+                    .to_string()
+                    .contains("tool arguments exceeded buffer cap")
+            );
+        }
     }
 
     #[test]

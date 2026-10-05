@@ -13830,6 +13830,75 @@ fn provider_total_timeout_is_opt_in_independent_and_validated_per_request() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn provider_responses_large_terminal_frame_completes_over_http() -> Result<()> {
+    let terminal = json!({"type":"response.completed", "response": {
+        "status":"completed", "usage":{"input_tokens":17,"output_tokens":9},
+        "output":[{"type":"reasoning", "id":"rs_large", "summary":[],
+            "encrypted_content":"x".repeat(300_000)}]}});
+    let body = format!(
+        "data: {{\"type\":\"response.output_text.delta\",\"delta\":\"visible answer\"}}\n\nevent: response.completed\ndata: {terminal}\n\n"
+    );
+    for contract in [
+        RequestContract::ChatGptResponses,
+        RequestContract::OpenAiResponses,
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let body = body.clone();
+        let server = std::thread::spawn(move || -> Result<()> {
+            let (mut stream, _) = listener.accept()?;
+            stream.set_nonblocking(false)?;
+            stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+            stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+            let mut request = Vec::new();
+            let mut buffer = [0; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = stream.read(&mut buffer)?;
+                anyhow::ensure!(
+                    count > 0 && request.len() + count <= 16_384,
+                    "invalid test request"
+                );
+                request.extend_from_slice(&buffer[..count]);
+            }
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )?;
+            for chunk in body.as_bytes().chunks(4093) {
+                stream.write_all(chunk)?;
+            }
+            Ok(())
+        });
+        let response = reqwest::Client::new()
+            .get(format!("http://{address}"))
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await?;
+        let mut agent = test_agent(Path::new("."));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        agent.set_sink(Box::new(ChannelSink { tx }));
+        let parsed = agent.read_provider_stream(response, contract).await;
+        server.join().expect("test server join")?;
+        let parsed = parsed?;
+        assert_eq!(parsed.stop_reason.as_deref(), Some("completed"));
+        assert_eq!(parsed.usage.input, 17);
+        assert_eq!(parsed.usage.output, 9);
+        assert!(parsed.blocks.iter().any(|block| matches!(block,
+            Block::Text { text } if text == "visible answer")));
+        assert_eq!(
+            drain_events(&mut rx)
+                .iter()
+                .filter(|event| matches!(event,
+            AgentEvent::TextDelta(text) if text == "visible answer"))
+                .count(),
+            1
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn provider_total_timeout_bounds_headers_and_trickling_bodies() {
     let total_timeout = Duration::from_secs(2);
     let safety_timeout = Duration::from_secs(10);

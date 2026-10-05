@@ -150,7 +150,6 @@ const LATEST_LOG_ARCHIVE_MAX: u32 = 16;
 const SLASH_LIST_LIMIT: usize = 50;
 const SLASH_TEXT_CAP: usize = 8_000;
 const SESSION_STATE_LOCK_NAME: &str = "session.lock.json";
-const STREAM_EVENT_BUFFER_CAP: usize = 256_000;
 const TOOL_SUMMARY_CHAR_CAP: usize = 180;
 const TOOL_UI_CONTENT_CAP: usize = 8_000;
 const SUDO_ASKPASS_ENV: &str = "DEXT_SUDO_ASKPASS";
@@ -20025,7 +20024,7 @@ impl Agent {
             );
         let local_reasoning_enabled = contract == RequestContract::OpenAiChatCompletions
             && self.local_llama_reasoning_enabled();
-        let mut decoder = streaming::SseDecoder::new(STREAM_EVENT_BUFFER_CAP);
+        let mut decoder = streaming::SseDecoder::new(streaming::sse_event_cap(contract));
         let mut parser = streaming::ProviderStreamParser::new(contract, preserve_timing_cache)
             .capture_openai_reasoning(local_reasoning_enabled);
         let mut stream = resp.bytes_stream();

@@ -56,7 +56,7 @@ Dext is a Rust terminal agent packaged as one binary. Most behavior is still int
   - Pure protocol tests derived from public compatibility vectors; API-key and non-official/custom provider requests bypass this module.
 
 - `src/sse.rs`
-  - Capped SSE framing shared by the runtime and Criterion benchmark target.
+  - Capped SSE framing shared by the runtime and Criterion benchmark target. Foreground and summary Responses streams use a 4 MiB per-event bound for full terminal output/opaque reasoning snapshots; Messages and Chat Completions retain 256,000 bytes. The in-progress buffer adds at most four delimiter bytes, and tool arguments retain their independent 256,000-byte cap. Oversized events still fail closed without automatic replay of a partially visible response.
 
 - `src/streaming.rs`
   - Provider-specific event validation/assembly, including a uniform 4 MiB aggregate bound for displayable Anthropic, Responses, and local Chat thinking text.
