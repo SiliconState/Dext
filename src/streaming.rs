@@ -945,10 +945,15 @@ fn parse_openai_frame(
     }
     if let Some(usage) = data_object.get("usage") {
         recognized = true;
-        object(contract, "chunk", usage, "usage")?;
-        let parsed = Usage::parse_openai(usage);
-        if !(state.preserve_timing_cache && state.usage.cache_read > 0 && parsed.cache_read == 0) {
-            state.usage = parsed;
+        if !usage.is_null() {
+            object(contract, "chunk", usage, "usage")?;
+            let parsed = Usage::parse_openai(usage);
+            if !(state.preserve_timing_cache
+                && state.usage.cache_read > 0
+                && parsed.cache_read == 0)
+            {
+                state.usage = parsed;
+            }
         }
     }
     if !recognized {
@@ -2255,6 +2260,148 @@ mod tests {
     }
 
     #[test]
+    fn openai_null_usage_chunks_preserve_text_and_final_usage() {
+        let contract = RequestContract::OpenAiChatCompletions;
+        for usage_only_terminal in [false, true] {
+            let mut chunks = vec![
+                serde_json::json!({"choices":[{"delta":{"role":"assistant","content":""},"finish_reason":null}],"usage":null}),
+                serde_json::json!({"choices":[{"delta":{"content":"Hello é"},"finish_reason":null}],"usage":null}),
+            ];
+            let usage = serde_json::json!({
+                "prompt_tokens":17,"completion_tokens":9,"total_tokens":26,
+                "prompt_cache_hit_tokens":6,"prompt_cache_miss_tokens":11
+            });
+            chunks.push(serde_json::json!({
+                "choices":[{"delta":{},"finish_reason":"stop"}],
+                "usage":if usage_only_terminal { Value::Null } else { usage.clone() }
+            }));
+            if usage_only_terminal {
+                chunks.push(serde_json::json!({"choices":[],"usage":usage}));
+            }
+            let mut wire = chunks
+                .iter()
+                .map(|chunk| format!("data: {chunk}\r\n\r\n"))
+                .collect::<String>();
+            wire.push_str("data: [DONE]\r\n\r\n");
+            for chunk_size in [1, 7, wire.len()] {
+                let mut decoder = SseDecoder::new(sse_event_cap(contract));
+                let mut parser = ProviderStreamParser::new(contract, false);
+                let mut updates = Vec::new();
+                for bytes in wire.as_bytes().chunks(chunk_size) {
+                    for frame in decoder.push(bytes).unwrap() {
+                        updates.extend(parser.push_frame(frame).unwrap());
+                    }
+                }
+                for frame in decoder.finish().unwrap() {
+                    updates.extend(parser.push_frame(frame).unwrap());
+                }
+                assert_eq!(
+                    updates,
+                    [
+                        StreamUpdate::TextDelta(String::new()),
+                        StreamUpdate::TextDelta("Hello é".to_string()),
+                    ]
+                );
+                let parsed = parser.finish().unwrap();
+                assert!(matches!(
+                    parsed.blocks.as_slice(),
+                    [Block::Text { text }] if text == "Hello é"
+                ));
+                assert_eq!(parsed.stop_reason.as_deref(), Some("stop"));
+                assert_eq!(parsed.usage.input, 11);
+                assert_eq!(parsed.usage.cache_read, 6);
+                assert_eq!(parsed.usage.output, 9);
+                assert_eq!(parsed.unknown_events, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn openai_null_usage_preserves_tool_call_assembly() {
+        let mut parser = ProviderStreamParser::new(RequestContract::OpenAiChatCompletions, false);
+        for data in [
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"read_file","arguments":"{\"path\":"}}]},"finish_reason":null}],"usage":null}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"README.md\"}"}}]},"finish_reason":null}],"usage":null}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":12,"completion_tokens":4}}"#,
+            "[DONE]",
+        ] {
+            parser
+                .push_frame(SseFrame {
+                    event: None,
+                    data: Some(data.to_string()),
+                })
+                .unwrap();
+        }
+        let parsed = parser.finish().unwrap();
+        assert!(matches!(
+            parsed.blocks.as_slice(),
+            [Block::ToolUse { id, name, input }]
+                if id == "call_1" && name == "read_file" && input["path"] == "README.md"
+        ));
+        assert_eq!(parsed.stop_reason.as_deref(), Some("tool_calls"));
+        assert_eq!(parsed.usage.input, 12);
+        assert_eq!(parsed.usage.output, 4);
+        assert_eq!(parsed.unfinished_tool_calls, 0);
+    }
+
+    #[test]
+    fn openai_null_usage_does_not_clear_known_usage() {
+        for preserve_timing_cache in [false, true] {
+            for source in [
+                serde_json::json!({"usage":{"prompt_tokens":17,"completion_tokens":9,"prompt_cache_hit_tokens":6}}),
+                serde_json::json!({"timings":{"prompt_n":11,"predicted_n":9,"cache_n":6}}),
+            ] {
+                let mut parser = ProviderStreamParser::new(
+                    RequestContract::OpenAiChatCompletions,
+                    preserve_timing_cache,
+                );
+                let null_frame = || SseFrame {
+                    event: None,
+                    data: Some(r#"{"usage":null}"#.to_string()),
+                };
+                assert!(parser.push_frame(null_frame()).unwrap().is_empty());
+                assert_eq!(parser.known_usage().total_tokens(), 0);
+                parser
+                    .push_frame(SseFrame {
+                        event: None,
+                        data: Some(source.to_string()),
+                    })
+                    .unwrap();
+                assert!(parser.push_frame(null_frame()).unwrap().is_empty());
+                let known = parser.known_usage();
+                assert_eq!(known.input, 11);
+                assert_eq!(known.cache_read, 6);
+                assert_eq!(known.output, 9);
+                let parsed = parser.finish().unwrap();
+                assert_eq!(parsed.usage.total_tokens(), 26);
+                assert_eq!(parsed.unknown_events, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn openai_rejects_non_object_non_null_usage() {
+        for usage in [
+            serde_json::json!([]),
+            serde_json::json!("invalid-usage"),
+            serde_json::json!(42),
+            serde_json::json!(true),
+        ] {
+            let mut parser =
+                ProviderStreamParser::new(RequestContract::OpenAiChatCompletions, false);
+            let error = parser
+                .push_frame(SseFrame {
+                    event: None,
+                    data: Some(serde_json::json!({"choices":[],"usage":usage}).to_string()),
+                })
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("usage must be an object"), "{error}");
+            assert!(!error.contains("invalid-usage"), "{error}");
+        }
+    }
+
+    #[test]
     fn openai_rejects_malformed_json_incomplete_identity_and_bad_arguments() {
         let contract = RequestContract::OpenAiChatCompletions;
         let mut parser = ProviderStreamParser::new(contract, false);
@@ -2430,7 +2577,7 @@ mod tests {
     }
 
     #[test]
-    fn openai_reasoning_content_is_local_opt_in_and_strict_when_enabled() {
+    fn openai_reasoning_content_is_opt_in_and_strict_when_enabled() {
         let contract = RequestContract::OpenAiChatCompletions;
         let frame = || {
             SseFrame {

@@ -3402,6 +3402,8 @@ struct OaiRequest<'a> {
     stream_options: Option<OaiStreamOptions>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<DeepSeekThinking>,
     /// llama.cpp GBNF extension. Only ever set for the local llama.cpp
     /// provider (cloud OpenAI rejects unknown fields), and only when the
     /// user opts in — see `llama_tool_call_grammar`.
@@ -3409,6 +3411,11 @@ struct OaiRequest<'a> {
     grammar: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     chat_template_kwargs: Option<OaiChatTemplateKwargs>,
+}
+
+#[derive(Serialize)]
+struct DeepSeekThinking {
+    r#type: &'static str,
 }
 
 #[derive(Serialize)]
@@ -14478,6 +14485,44 @@ impl Agent {
             && self.resolved_model_spec().is_none_or(|spec| spec.reasoning)
     }
 
+    fn deepseek_chat_enabled(&self) -> bool {
+        self.request_contract() == RequestContract::OpenAiChatCompletions
+            && provider::is_deepseek_provider(
+                &self.provider_id,
+                self.route_api_provider(),
+                &self.base_url,
+            )
+    }
+
+    fn reasoning_route_start(&self) -> usize {
+        self.history.iter().rposition(|message| {
+            message.role == "user" && message.content.iter().any(|block| {
+                matches!(block, Block::Text { text } if text.starts_with(PROVIDER_ROUTE_CONTINUATION_PREFIX))
+            })
+        }).map_or(0, |index| index + 1)
+    }
+
+    fn chat_reasoning_replay_start(&self) -> Option<usize> {
+        let has_tools = self.model_supports_tools()
+            && (!self.tools.is_empty()
+                || self
+                    .active_pack_runtime
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.all_tools().next().is_some()));
+        if self.deepseek_chat_enabled() && has_tools {
+            Some(self.reasoning_route_start())
+        } else if self.local_llama_reasoning_enabled() {
+            Some(
+                self.history
+                    .iter()
+                    .rposition(is_fresh_user_prompt_message)
+                    .unwrap_or(0),
+            )
+        } else {
+            None
+        }
+    }
+
     fn model_supports_tools(&self) -> bool {
         self.resolved_model_spec().is_none_or(|spec| spec.tools)
     }
@@ -14549,6 +14594,21 @@ impl Agent {
     /// a value they understand.
     fn oai_chat_reasoning_effort(&self, effort: ThinkingEffort) -> Option<String> {
         let resolved_spec = self.resolved_model_spec();
+        if self.deepseek_chat_enabled() {
+            let mapped = match effort {
+                ThinkingEffort::Off => return None,
+                ThinkingEffort::Minimal | ThinkingEffort::Low => ThinkingEffort::Low,
+                ThinkingEffort::Medium | ThinkingEffort::High | ThinkingEffort::XHigh => {
+                    ThinkingEffort::High
+                }
+                ThinkingEffort::Max => ThinkingEffort::Max,
+            };
+            return resolved_spec
+                .as_ref()
+                .filter(|spec| !spec.effort_levels.is_empty())
+                .and_then(|spec| map_effort_to_provider_levels(&spec.effort_levels, mapped))
+                .or_else(|| Some(mapped.as_str().to_string()));
+        }
         resolved_spec
             .as_ref()
             .filter(|spec| !spec.effort_levels.is_empty())
@@ -16870,7 +16930,7 @@ impl Agent {
             .iter()
             .rposition(is_fresh_user_prompt_message)
             .unwrap_or(0);
-        let preserve_local_reasoning = self.local_llama_reasoning_enabled();
+        let reasoning_replay_start = self.chat_reasoning_replay_start();
         let valid_ids = Self::tool_use_ids_in_messages(history);
         let interrupt = Some(self.interrupt.as_ref());
         let current_image_target = self.image_disclosure_target();
@@ -17006,9 +17066,9 @@ impl Agent {
                     } else {
                         None
                     };
-                    let reasoning_content = (preserve_local_reasoning
-                        && message_index >= current_turn_start)
-                        .then(|| {
+                    let reasoning_content = reasoning_replay_start
+                        .filter(|start| message_index >= *start)
+                        .map(|_| {
                             m.content
                                 .iter()
                                 .filter_map(|block| match block {
@@ -17017,8 +17077,7 @@ impl Agent {
                                     }
                                     _ => None,
                                 })
-                                .collect::<Vec<_>>()
-                                .join("\n")
+                                .collect::<String>()
                         })
                         .filter(|reasoning| !reasoning.is_empty());
                     let content = if texts.is_empty() {
@@ -17379,6 +17438,11 @@ impl Agent {
                     &tool_names,
                     env_flag_default(LLAMA_TOOL_GRAMMAR_ENV, false),
                 );
+                let max_output_tokens = if self.deepseek_chat_enabled() {
+                    max_output_tokens.min(393_216)
+                } else {
+                    max_output_tokens
+                };
                 let (max_tokens, max_completion_tokens) =
                     oai_output_token_caps(&self.provider_id, &self.model, max_output_tokens);
                 let body = OaiRequest {
@@ -17390,6 +17454,13 @@ impl Agent {
                     stream: true,
                     stream_options,
                     reasoning_effort,
+                    thinking: self.deepseek_chat_enabled().then_some(DeepSeekThinking {
+                        r#type: if effort == ThinkingEffort::Off {
+                            "disabled"
+                        } else {
+                            "enabled"
+                        },
+                    }),
                     grammar,
                     chat_template_kwargs: local_llama.then_some(OaiChatTemplateKwargs {
                         enable_thinking: effort != ThinkingEffort::Off,
@@ -17981,7 +18052,15 @@ impl Agent {
             && provider_id == saved_provider_id
             && self.api_provider == provenance.api_provider
         {
-            self.model = model;
+            self.model = if self.deepseek_chat_enabled() {
+                self.provider_profile
+                    .as_ref()
+                    .map_or(model.clone(), |profile| {
+                        normalize_provider_model_value(profile, &model)
+                    })
+            } else {
+                model
+            };
         }
         self.refresh_context_window();
         self.system = system;
@@ -18138,12 +18217,7 @@ impl Agent {
     }
 
     fn history_chars(&self) -> usize {
-        let current_turn_start = self
-            .history
-            .iter()
-            .rposition(is_fresh_user_prompt_message)
-            .unwrap_or(0);
-        let preserve_current_thinking = self.local_llama_reasoning_enabled();
+        let reasoning_replay_start = self.chat_reasoning_replay_start();
         self.history
             .iter()
             .enumerate()
@@ -18153,13 +18227,12 @@ impl Agent {
                     .map(|b| match b {
                         Block::Text { text } | Block::PartialStream { text } => text.len(),
                         Block::Thinking { text, .. }
-                            if preserve_current_thinking && message_index >= current_turn_start =>
+                            if reasoning_replay_start
+                                .is_some_and(|start| message_index >= start) =>
                         {
                             text.len()
                         }
-                        // Prior-turn thinking is stripped at serialization time,
-                        // so only local reasoning replayed in the active tool loop
-                        // contributes to request-size compaction.
+                        // Count exactly the Chat reasoning eligible for wire replay.
                         Block::Thinking { .. } | Block::RedactedThinking { .. } => 0,
                         Block::ResponsesReasoning { item } => json_byte_len(item),
                         Block::ToolUse { input, .. } => json_byte_len(input),
@@ -18355,10 +18428,24 @@ impl Agent {
 
         let mut summary_msgs: Vec<Message> = Vec::new();
         let mut preserved_tool_msgs: Vec<Message> = Vec::new();
+        let reasoning_replay_start = self
+            .deepseek_chat_enabled()
+            .then(|| self.reasoning_route_start());
 
         for (idx, msg) in old.iter().enumerate() {
             if keep_set.contains(&idx) {
-                preserved_tool_msgs.push(msg.clone());
+                let mut preserved = msg.clone();
+                if reasoning_replay_start.is_some_and(|start| idx < start) {
+                    preserved.content.retain(|block| {
+                        !matches!(
+                            block,
+                            Block::Thinking { .. }
+                                | Block::RedactedThinking { .. }
+                                | Block::ResponsesReasoning { .. }
+                        )
+                    });
+                }
+                preserved_tool_msgs.push(preserved);
                 continue;
             }
 
@@ -18529,6 +18616,9 @@ impl Agent {
                 stream: false,
                 stream_options: None,
                 reasoning_effort: None,
+                thinking: self
+                    .deepseek_chat_enabled()
+                    .then_some(DeepSeekThinking { r#type: "disabled" }),
                 grammar: None,
                 chat_template_kwargs: compact_summary_chat_template_kwargs(
                     &self.provider_id,
@@ -20033,11 +20123,12 @@ impl Agent {
                 self.route_api_provider(),
                 &self.base_url,
             );
-        let local_reasoning_enabled = contract == RequestContract::OpenAiChatCompletions
-            && self.local_llama_reasoning_enabled();
+        let chat_reasoning_enabled = contract == RequestContract::OpenAiChatCompletions
+            && (self.local_llama_reasoning_enabled() || self.deepseek_chat_enabled())
+            && self.resolved_model_spec().is_none_or(|spec| spec.reasoning);
         let mut decoder = streaming::SseDecoder::new(streaming::sse_event_cap(contract));
         let mut parser = streaming::ProviderStreamParser::new(contract, preserve_timing_cache)
-            .capture_openai_reasoning(local_reasoning_enabled);
+            .capture_openai_reasoning(chat_reasoning_enabled);
         let mut stream = resp.bytes_stream();
         let idle_timeout = self.stream_idle_timeout();
 
@@ -20079,7 +20170,7 @@ impl Agent {
             for block in &parsed.blocks {
                 match block {
                     Block::Thinking { text, .. }
-                        if contract.is_responses() || local_reasoning_enabled =>
+                        if contract.is_responses() || chat_reasoning_enabled =>
                     {
                         self.sink
                             .emit(AgentEvent::ThinkingBlockComplete(text.clone()));

@@ -19885,8 +19885,8 @@ fn local_llama_replays_only_current_turn_reasoning_and_cloud_chat_omits_it() {
     assert_eq!(current["content"], "");
     assert_eq!(current["reasoning_content"], "inspect current todos");
 
-    agent.provider_id = "deepseek".to_string();
-    agent.base_url = "https://api.deepseek.com".to_string();
+    agent.provider_id = "openai".to_string();
+    agent.base_url = "https://api.openai.com".to_string();
     let cloud_history_chars = agent.history_chars();
     assert_eq!(
         local_history_chars - cloud_history_chars,
@@ -20128,18 +20128,18 @@ fn runtime_control_model_switch_updates_next_request_material() -> Result<()> {
 
         let applied = finish_active_runtime_controls(
             &mut agent,
-            vec!["/model deepseek/deepseek-reasoner".to_string()],
+            vec!["/model deepseek/deepseek-v4-pro".to_string()],
             true,
         );
         assert!(applied.changed_model);
         assert!(applied.aborted_stream);
         assert_eq!(agent.provider_id, "deepseek");
-        assert_eq!(agent.model, "deepseek-reasoner");
+        assert_eq!(agent.model, "deepseek-v4-pro");
         assert_eq!(agent.api_provider, ApiProvider::OpenAi);
         assert!(
             agent.history.iter().any(|message| {
                 message.content.iter().any(|block| {
-                    matches!(block, Block::Text { text } if text.starts_with("[provider-route continuation]") && text.contains("glm/") && text.contains("deepseek/deepseek-reasoner"))
+                    matches!(block, Block::Text { text } if text.starts_with("[provider-route continuation]") && text.contains("glm/") && text.contains("deepseek/deepseek-v4-pro"))
                 })
             }),
             "provider-route continuation missing"
@@ -20156,8 +20156,8 @@ fn runtime_control_model_switch_updates_next_request_material() -> Result<()> {
             agent.build_streaming_request("sys", "env", &[], &[], chatgpt_session_id)?;
         assert!(url.contains("api.deepseek.com"), "{url}");
         let body_json: Value = serde_json::from_slice(&body)?;
-        assert_eq!(body_json["model"], "deepseek-reasoner");
-        assert_eq!(body_json["max_tokens"], 8192);
+        assert_eq!(body_json["model"], "deepseek-v4-pro");
+        assert_eq!(body_json["max_tokens"], 393_216);
         assert_eq!(body_json["stream_options"]["include_usage"], true);
         Ok(())
     })();
@@ -20672,6 +20672,692 @@ fn provider_effort_mapping_prefers_exact_levels_before_clamping() {
         Some("medium")
     );
     assert!(map_effort_to_provider_levels(&levels, ThinkingEffort::Off).is_none());
+}
+
+#[test]
+fn deepseek_catalog_migrates_retired_selections_and_generated_metadata() {
+    let builtin = built_in_provider_profiles()
+        .into_iter()
+        .find(|profile| profile.id == "deepseek")
+        .expect("DeepSeek profile");
+    assert_eq!(builtin.default_model, "deepseek-flash");
+    assert_eq!(builtin.models, ["deepseek-flash", "deepseek-v4-pro"]);
+    for (model, image, input, output, cache) in [
+        ("deepseek-flash", true, 0.3, 1.2, 0.006),
+        ("deepseek-v4-pro", false, 1.32, 3.96, 0.044),
+    ] {
+        let spec = resolve_model_spec(&builtin, model);
+        assert_eq!(spec.context_window, Some(1_000_000));
+        assert_eq!(spec.max_output_tokens, Some(393_216));
+        assert_eq!(spec.effort_levels, ["low", "high", "max"]);
+        assert!(spec.tools && spec.reasoning && spec.prompt_cache);
+        assert_eq!(spec.image_input, image);
+        let pricing = spec.pricing.expect("model pricing");
+        let fallback = crate::usage::deepseek_pricing(model).expect("fallback pricing");
+        assert_eq!(pricing.input_usd_per_mtok, input);
+        assert_eq!(pricing.output_usd_per_mtok, output);
+        assert_eq!(pricing.cache_read_usd_per_mtok, cache);
+        assert_eq!(pricing.cache_create_usd_per_mtok, 0.0);
+        assert_eq!(fallback.input, input);
+        assert_eq!(fallback.output, output);
+        assert_eq!(fallback.cache_read, cache);
+    }
+    assert!(crate::usage::deepseek_pricing("not-deepseek-flash").is_none());
+    for version in [1, 2, 3] {
+        for (retired, current, pricing) in [
+            (
+                "deepseek-chat",
+                "deepseek-flash",
+                ModelPricing {
+                    input_usd_per_mtok: 0.27,
+                    output_usd_per_mtok: 1.1,
+                    cache_read_usd_per_mtok: 0.07,
+                    cache_create_usd_per_mtok: 0.27,
+                },
+            ),
+            (
+                "deepseek-reasoner",
+                "deepseek-v4-pro",
+                ModelPricing {
+                    input_usd_per_mtok: 0.55,
+                    output_usd_per_mtok: 2.19,
+                    cache_read_usd_per_mtok: 0.14,
+                    cache_create_usd_per_mtok: 0.55,
+                },
+            ),
+        ] {
+            let mut stored = builtin.clone();
+            stored.default_model = retired.to_string();
+            stored.models = vec![retired.to_string()];
+            stored.model_aliases.clear();
+            stored.context_window = Some(128_000);
+            stored.model_defaults.max_output_tokens = Some(8_192);
+            stored.model_specs = HashMap::from([(
+                retired.to_string(),
+                ModelSpec {
+                    context_window: Some(128_000),
+                    max_output_tokens: Some(8_192),
+                    pricing: Some(pricing),
+                    capabilities: ModelCapabilities {
+                        reasoning: Some(retired != "deepseek-chat"),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )]);
+            let migrated = crate::provider::normalize_provider_catalog(ProviderCatalog {
+                version,
+                active_provider: "deepseek".to_string(),
+                providers: vec![stored],
+            })
+            .expect("migration");
+            let profile = find_provider_profile(&migrated, "deepseek").expect("migrated profile");
+            assert_eq!(profile.default_model, current);
+            assert_eq!(profile.models, ["deepseek-flash", "deepseek-v4-pro"]);
+            let spec = resolve_model_spec(&profile, current);
+            assert_eq!(spec.context_window, Some(1_000_000));
+            assert_eq!(spec.max_output_tokens, Some(393_216));
+            assert!(spec.reasoning);
+            assert_eq!(spec.pricing, resolve_model_spec(&builtin, current).pricing);
+        }
+    }
+    let mut stored = builtin.clone();
+    stored.default_model = "deepseek-v4-flash".to_string();
+    stored.context_window = Some(42_000);
+    stored
+        .model_specs
+        .get_mut("deepseek-v4-pro")
+        .unwrap()
+        .pricing
+        .as_mut()
+        .unwrap()
+        .input_usd_per_mtok = 7.0;
+    let current = crate::provider::normalize_provider_catalog(ProviderCatalog {
+        version: crate::provider::default_provider_catalog_version(),
+        active_provider: "deepseek".to_string(),
+        providers: vec![stored],
+    })
+    .expect("current catalog");
+    let profile = find_provider_profile(&current, "deepseek").unwrap();
+    assert_eq!(profile.default_model, "deepseek-flash");
+    assert_eq!(profile.context_window, Some(42_000));
+    assert_eq!(
+        resolve_model_spec(&profile, "deepseek-v4-pro")
+            .pricing
+            .unwrap()
+            .input_usd_per_mtok,
+        7.0
+    );
+}
+
+#[test]
+fn deepseek_review_migrates_alias_targets_and_case_varied_metadata() {
+    let mut stored = built_in_provider_profiles()
+        .into_iter()
+        .find(|profile| profile.id == "deepseek")
+        .unwrap();
+    stored.default_model = "fast".into();
+    stored.model_aliases = HashMap::from([
+        ("fast".into(), "DEEPSEEK-CHAT".into()),
+        ("careful".into(), "deepseek-reasoner".into()),
+    ]);
+    stored.models = vec!["fast".into(), "careful".into()];
+    stored.model_specs = HashMap::from([(
+        "DEEPSEEK-CHAT".into(),
+        ModelSpec {
+            context_window: Some(128_000),
+            max_output_tokens: Some(8_192),
+            capabilities: ModelCapabilities {
+                reasoning: Some(false),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )]);
+    let catalog = crate::provider::normalize_provider_catalog(ProviderCatalog {
+        version: 3,
+        active_provider: "deepseek".into(),
+        providers: vec![stored],
+    })
+    .unwrap();
+    let profile = find_provider_profile(&catalog, "deepseek").unwrap();
+    assert_eq!(profile.default_model, "deepseek-flash");
+    assert_eq!(
+        normalize_provider_model_value(&profile, "fast"),
+        "deepseek-flash"
+    );
+    assert_eq!(
+        normalize_provider_model_value(&profile, "careful"),
+        "deepseek-v4-pro"
+    );
+    let spec = resolve_model_spec(&profile, "fast");
+    assert_eq!(spec.context_window, Some(1_000_000));
+    assert_eq!(spec.max_output_tokens, Some(393_216));
+    assert!(spec.reasoning);
+    let catalog = crate::provider::normalize_provider_catalog(catalog).unwrap();
+    let profile = find_provider_profile(&catalog, "deepseek").unwrap();
+    assert_eq!(profile.default_model, "deepseek-flash");
+    assert_eq!(
+        normalize_provider_model_value(&profile, "fast"),
+        "deepseek-flash"
+    );
+    assert_eq!(
+        resolve_model_spec(&profile, "fast").context_window,
+        Some(1_000_000)
+    );
+}
+
+#[test]
+fn deepseek_review_canonical_metadata_wins_alias_collisions_deterministically() {
+    for _ in 0..32 {
+        let mut stored = built_in_provider_profiles()
+            .into_iter()
+            .find(|profile| profile.id == "deepseek")
+            .unwrap();
+        stored.model_specs = HashMap::from([
+            (
+                "deepseek-chat".into(),
+                ModelSpec {
+                    context_window: Some(12_000),
+                    max_output_tokens: Some(2_000),
+                    capabilities: ModelCapabilities {
+                        tools: Some(false),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ),
+            (
+                "deepseek-flash".into(),
+                ModelSpec {
+                    context_window: Some(48_000),
+                    capabilities: ModelCapabilities {
+                        tools: Some(true),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ),
+        ]);
+        stored.model_context_windows = HashMap::from([
+            ("deepseek-chat".into(), 12_000),
+            ("deepseek-flash".into(), 48_000),
+        ]);
+        stored.model_effort_levels = HashMap::from([
+            ("deepseek-chat".into(), vec!["low".into()]),
+            ("deepseek-flash".into(), vec!["high".into()]),
+        ]);
+        let normalized = crate::provider::normalize_provider_profile(stored).unwrap();
+        let spec = resolve_model_spec(&normalized, "deepseek-flash");
+        assert_eq!(spec.context_window, Some(48_000));
+        assert_eq!(
+            spec.max_output_tokens,
+            Some(2_000),
+            "disjoint alias metadata was lost"
+        );
+        assert!(spec.tools);
+        assert_eq!(normalized.model_context_windows["deepseek-flash"], 48_000);
+        assert_eq!(normalized.model_effort_levels["deepseek-flash"], ["high"]);
+        let catalog = crate::provider::normalize_provider_catalog(ProviderCatalog {
+            version: 4,
+            active_provider: "deepseek".into(),
+            providers: vec![normalized],
+        })
+        .unwrap();
+        let profile = find_provider_profile(&catalog, "deepseek").unwrap();
+        let spec = resolve_model_spec(&profile, "deepseek-flash");
+        assert_eq!(spec.context_window, Some(48_000));
+        assert_eq!(spec.max_output_tokens, Some(2_000));
+        assert!(spec.tools);
+    }
+}
+
+#[test]
+fn deepseek_review_legacy_per_model_overrides_take_effect_after_merge() {
+    let mut stored = built_in_provider_profiles()
+        .into_iter()
+        .find(|profile| profile.id == "deepseek")
+        .unwrap();
+    stored.model_specs.clear();
+    stored.model_context_windows = HashMap::from([("deepseek-chat".into(), 42_000)]);
+    stored.model_effort_levels = HashMap::from([("deepseek-chat".into(), vec!["high".into()])]);
+    let catalog = crate::provider::normalize_provider_catalog(ProviderCatalog {
+        version: 3,
+        active_provider: "deepseek".into(),
+        providers: vec![stored],
+    })
+    .unwrap();
+    let profile = find_provider_profile(&catalog, "deepseek").unwrap();
+    let spec = resolve_model_spec(&profile, "deepseek-flash");
+    assert_eq!(spec.context_window, Some(42_000));
+    assert_eq!(spec.effort_levels, ["high"]);
+    assert_eq!(spec.max_output_tokens, Some(393_216));
+    let catalog = crate::provider::normalize_provider_catalog(catalog).unwrap();
+    let profile = find_provider_profile(&catalog, "deepseek").unwrap();
+    assert_eq!(
+        resolve_model_spec(&profile, "deepseek-flash").context_window,
+        Some(42_000)
+    );
+    let mut stored = profile;
+    stored
+        .model_specs
+        .get_mut("deepseek-flash")
+        .unwrap()
+        .context_window = Some(64_000);
+    stored
+        .model_specs
+        .get_mut("deepseek-flash")
+        .unwrap()
+        .effort_levels = vec!["low".into()];
+    let catalog = crate::provider::normalize_provider_catalog(ProviderCatalog {
+        version: 4,
+        active_provider: "deepseek".into(),
+        providers: vec![stored],
+    })
+    .unwrap();
+    let profile = find_provider_profile(&catalog, "deepseek").unwrap();
+    let spec = resolve_model_spec(&profile, "deepseek-flash");
+    assert_eq!(spec.context_window, Some(64_000));
+    assert_eq!(spec.effort_levels, ["low"]);
+}
+
+#[test]
+fn deepseek_review_respects_declared_effort_limits_and_loopback_vendor_isolation() -> Result<()> {
+    let root = temp_test_dir("deepseek-review-effort-limits");
+    let mut agent = test_agent(&root);
+    let mut profile = built_in_provider_profiles()
+        .into_iter()
+        .find(|profile| profile.id == "deepseek")
+        .unwrap();
+    profile
+        .model_specs
+        .get_mut("deepseek-flash")
+        .unwrap()
+        .effort_levels = vec!["low".into(), "high".into()];
+    agent.provider_id = profile.id.clone();
+    agent.api_provider = profile.api_provider;
+    agent.model = profile.default_model.clone();
+    agent.base_url = "http://127.0.0.1:8080".into();
+    agent.provider_profile = Some(profile);
+    agent.thinking_effort = ThinkingEffort::Max;
+    let (_, bytes) = agent.build_streaming_request("sys", "env", &[], &[], "unused")?;
+    let body: Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(body["reasoning_effort"], "high");
+    assert!(body.get("chat_template_kwargs").is_none());
+    assert_eq!(body["stream_options"]["include_usage"], true);
+    assert!(
+        llama_tool_grammar_for(
+            "deepseek",
+            ApiProvider::OpenAi,
+            &agent.base_url,
+            &["todo_read"],
+            true
+        )
+        .is_none()
+    );
+    let pricing = crate::usage::usage_pricing_default_for(
+        "deepseek",
+        ApiProvider::OpenAi,
+        &agent.base_url,
+        &agent.model,
+    );
+    assert_eq!(pricing.input, 0.3);
+    assert_eq!(pricing.output, 1.2);
+    let summary = agent.prepare_summary_request(&[], "")?;
+    let summary: Value = serde_json::from_slice(
+        summary
+            .request
+            .body()
+            .and_then(reqwest::Body::as_bytes)
+            .context("summary bytes")?,
+    )?;
+    assert!(summary.get("chat_template_kwargs").is_none());
+    assert_eq!(summary["thinking"]["type"], "disabled");
+    agent.tools.clear();
+    agent.history = vec![Message {
+        role: "assistant".into(),
+        content: vec![
+            Block::Thinking {
+                text: "not replayed without tools".into(),
+                signature: None,
+            },
+            Block::Text {
+                text: "answer".into(),
+            },
+        ],
+    }];
+    let messages = serde_json::to_value(agent.history_to_oai_messages("sys"))?;
+    assert!(
+        messages
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|message| message.get("reasoning_content").is_none())
+    );
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[test]
+fn deepseek_request_maps_effort_and_isolates_vendor_fields() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("deepseek-request-contract");
+    let mut agent = test_agent(&root);
+    let profile = built_in_provider_profiles()
+        .into_iter()
+        .find(|profile| profile.id == "deepseek")
+        .unwrap();
+    agent.provider_id = profile.id.clone();
+    agent.api_provider = profile.api_provider;
+    agent.base_url = profile.base_url.clone();
+    agent.model = profile.default_model.clone();
+    agent.provider_profile = Some(profile);
+    for (effort, wire) in [
+        (ThinkingEffort::Off, None),
+        (ThinkingEffort::Minimal, Some("low")),
+        (ThinkingEffort::Low, Some("low")),
+        (ThinkingEffort::Medium, Some("high")),
+        (ThinkingEffort::High, Some("high")),
+        (ThinkingEffort::XHigh, Some("high")),
+        (ThinkingEffort::Max, Some("max")),
+    ] {
+        agent.thinking_effort = effort;
+        let (url, bytes) = agent.build_streaming_request("sys", "env", &[], &[], "unused")?;
+        let body: Value = serde_json::from_slice(&bytes)?;
+        assert_eq!(url, "https://api.deepseek.com/v1/chat/completions");
+        assert_eq!(body["model"], "deepseek-flash");
+        assert_eq!(
+            body["thinking"]["type"],
+            if wire.is_some() {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        );
+        assert_eq!(body.get("reasoning_effort").and_then(Value::as_str), wire);
+        assert_eq!(body["max_tokens"], 393_216);
+        assert_eq!(body["stream_options"]["include_usage"], true);
+        assert!(body.get("chat_template_kwargs").is_none());
+        assert!(body.get("max_completion_tokens").is_none());
+    }
+    let old = std::env::var_os("DEXT_MAX_OUTPUT_TOKENS");
+    unsafe { std::env::set_var("DEXT_MAX_OUTPUT_TOKENS", "500000") };
+    let result = agent.build_streaming_request("sys", "env", &[], &[], "unused");
+    restore_env_var("DEXT_MAX_OUTPUT_TOKENS", old);
+    let body: Value = serde_json::from_slice(&result?.1)?;
+    assert_eq!(body["max_tokens"], 393_216);
+    let summary = agent.prepare_summary_request(&[], "")?;
+    let summary: Value = serde_json::from_slice(
+        summary
+            .request
+            .body()
+            .and_then(reqwest::Body::as_bytes)
+            .context("summary bytes")?,
+    )?;
+    assert_eq!(summary["thinking"]["type"], "disabled");
+    assert!(summary.get("tools").is_none());
+    assert!(summary.get("reasoning_effort").is_none());
+    agent.provider_profile = None;
+    agent.provider_id = "openai".to_string();
+    agent.base_url = "https://api.openai.com".to_string();
+    agent.model = "gpt-4o".to_string();
+    let (_, bytes) = agent.build_streaming_request("sys", "env", &[], &[], "unused")?;
+    let body: Value = serde_json::from_slice(&bytes)?;
+    assert!(body.get("thinking").is_none());
+    for (id, api, url, expected) in [
+        (
+            "custom",
+            ApiProvider::OpenAi,
+            "https://api.deepseek.com/v1",
+            true,
+        ),
+        (
+            "custom",
+            ApiProvider::OpenAi,
+            "https://example.test/api.deepseek.com",
+            false,
+        ),
+        (
+            "custom",
+            ApiProvider::OpenAi,
+            "https://api.deepseek.com.example.test",
+            false,
+        ),
+        (
+            "deepseek",
+            ApiProvider::Anthropic,
+            "https://api.deepseek.com/anthropic",
+            false,
+        ),
+    ] {
+        assert_eq!(
+            crate::provider::is_deepseek_provider(id, api, url),
+            expected
+        );
+    }
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[test]
+fn deepseek_replays_all_retained_turns_but_fences_route_changes() {
+    let root = temp_test_dir("deepseek-reasoning-replay");
+    let mut agent = test_agent(&root);
+    agent.provider_id = "deepseek".to_string();
+    agent.api_provider = ApiProvider::OpenAi;
+    agent.base_url = "https://api.deepseek.com".to_string();
+    agent.model = "deepseek-flash".to_string();
+    agent.history = vec![
+        Message {
+            role: "user".into(),
+            content: vec![Block::Text {
+                text: "old question".into(),
+            }],
+        },
+        Message {
+            role: "assistant".into(),
+            content: vec![
+                Block::Thinking {
+                    text: "old thought".into(),
+                    signature: None,
+                },
+                Block::Text {
+                    text: "old answer".into(),
+                },
+            ],
+        },
+        Message {
+            role: "user".into(),
+            content: vec![Block::Text {
+                text: "new question".into(),
+            }],
+        },
+        Message {
+            role: "assistant".into(),
+            content: vec![
+                Block::Thinking {
+                    text: "new ".into(),
+                    signature: None,
+                },
+                Block::Thinking {
+                    text: "thought".into(),
+                    signature: None,
+                },
+                Block::ToolUse {
+                    id: "call_1".into(),
+                    name: "todo_read".into(),
+                    input: json!({}),
+                },
+            ],
+        },
+        Message {
+            role: "user".into(),
+            content: vec![tool_result_block("call_1", "(no todos)", None)],
+        },
+    ];
+    let with_reasoning = agent.history_chars();
+    let wire = serde_json::to_value(agent.history_to_oai_messages("sys")).unwrap();
+    let assistant: Vec<_> = wire
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] == "assistant")
+        .collect();
+    assert_eq!(assistant[0]["reasoning_content"], "old thought");
+    assert_eq!(assistant[1]["reasoning_content"], "new thought");
+    let (_, kept) = agent.split_compaction_inputs(&agent.history);
+    assert!(
+        kept.iter()
+            .flat_map(|message| &message.content)
+            .any(|block| matches!(block, Block::Thinking { text, .. } if text == "new "))
+    );
+    agent.tools.clear();
+    let without_reasoning = agent.history_chars();
+    assert_eq!(
+        with_reasoning - without_reasoning,
+        "old thoughtnew thought".len()
+    );
+    let wire = serde_json::to_value(agent.history_to_oai_messages("sys")).unwrap();
+    assert!(
+        wire.as_array()
+            .unwrap()
+            .iter()
+            .all(|message| message.get("reasoning_content").is_none())
+    );
+    agent.tools = provider_tool_definitions();
+    agent.push_reasoning_replay_boundary("openai", "gpt-5");
+    let wire = serde_json::to_value(agent.history_to_oai_messages("sys")).unwrap();
+    assert!(
+        wire.as_array()
+            .unwrap()
+            .iter()
+            .all(|message| message.get("reasoning_content").is_none())
+    );
+    let (_, kept) = agent.split_compaction_inputs(&agent.history);
+    let compacted = build_compacted_history("Resume packet", kept, &[]);
+    let original = std::mem::replace(&mut agent.history, compacted);
+    let wire = serde_json::to_value(agent.history_to_oai_messages("sys")).unwrap();
+    assert!(
+        wire.as_array()
+            .unwrap()
+            .iter()
+            .all(|message| message.get("reasoning_content").is_none())
+    );
+    agent.history = original;
+    agent.history.push(Message {
+        role: "assistant".into(),
+        content: vec![
+            Block::Thinking {
+                text: "same route".into(),
+                signature: None,
+            },
+            Block::Text {
+                text: "new answer".into(),
+            },
+        ],
+    });
+    let wire = serde_json::to_value(agent.history_to_oai_messages("sys")).unwrap();
+    assert_eq!(
+        wire.as_array().unwrap().last().unwrap()["reasoning_content"],
+        "same route"
+    );
+    assert!(has_provider_bound_reasoning(&agent.history));
+    let route = provider_route_hash(
+        &agent.provider_id,
+        agent.request_contract(),
+        &agent.base_url,
+        &agent.model,
+        agent.auth_kind,
+    );
+    assert!(!resume_requires_reasoning_replay_boundary(
+        Some(&route),
+        &route,
+        &agent.history
+    ));
+    assert!(resume_requires_reasoning_replay_boundary(
+        Some("different"),
+        &route,
+        &agent.history
+    ));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn deepseek_saved_model_names_normalize_and_fence_migrated_reasoning() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("deepseek-saved-model-migration");
+    let keys = [
+        "DEXT_PROVIDER",
+        "DEXT_PROFILE",
+        "DEXT_API_PROVIDER",
+        "DEXT_MODEL",
+        "DEXT_MODEL_DEEPSEEK",
+    ];
+    let previous = keys.map(std::env::var_os);
+    for key in keys {
+        unsafe { std::env::remove_var(key) };
+    }
+    let result = (|| -> Result<()> {
+        let profile = built_in_provider_profiles()
+            .into_iter()
+            .find(|profile| profile.id == "deepseek")
+            .context("DeepSeek")?;
+        for (saved_model, current_model) in [
+            ("deepseek-flash", "deepseek-flash"),
+            ("deepseek-chat", "deepseek-flash"),
+            ("deepseek-reasoner", "deepseek-v4-pro"),
+        ] {
+            let path = root.join(format!("{saved_model}.jsonl"));
+            let mut saved = test_agent(&root);
+            saved.provider_id = "deepseek".into();
+            saved.api_provider = ApiProvider::OpenAi;
+            saved.provider_profile = Some(profile.clone());
+            saved.base_url = profile.base_url.clone();
+            saved.model = saved_model.into();
+            saved.history = vec![Message {
+                role: "assistant".into(),
+                content: vec![
+                    Block::Thinking {
+                        text: "saved thought".into(),
+                        signature: None,
+                    },
+                    Block::Text {
+                        text: "saved answer".into(),
+                    },
+                ],
+            }];
+            assert_eq!(
+                saved.session_header().version,
+                PROVIDER_REASONING_ROUTE_FORMAT_VERSION
+            );
+            saved.save_session_to_path(&path)?;
+            let mut resumed = test_agent(&root);
+            resumed.provider_id = "deepseek".into();
+            resumed.api_provider = ApiProvider::OpenAi;
+            resumed.provider_profile = Some(profile.clone());
+            resumed.base_url = profile.base_url.clone();
+            resumed.model = profile.default_model.clone();
+            resumed.load_session_from_path(&path)?;
+            assert_eq!(resumed.model, current_model);
+            assert_eq!(resumed.context_window_tokens(), 1_000_000);
+            let wire = serde_json::to_value(resumed.history_to_oai_messages("sys"))?;
+            let thought = wire
+                .as_array()
+                .context("messages")?
+                .iter()
+                .find_map(|message| message.get("reasoning_content").and_then(Value::as_str));
+            assert_eq!(
+                thought,
+                (saved_model == current_model).then_some("saved thought")
+            );
+        }
+        Ok(())
+    })();
+    for (key, value) in keys.into_iter().zip(previous) {
+        restore_env_var(key, value);
+    }
+    let _ = std::fs::remove_dir_all(root);
+    result
 }
 
 #[test]
@@ -26783,7 +27469,7 @@ fn legacy_bundled_providers_are_pruned_from_catalog() -> Result<()> {
         let deepseek = find_provider_profile(&catalog, "deepseek").context("deepseek")?;
         assert_eq!(deepseek.api_provider, ApiProvider::OpenAi);
         assert_eq!(deepseek.env_vars, vec!["DEEPSEEK_API_KEY"]);
-        assert_eq!(deepseek.default_model, "deepseek-chat");
+        assert_eq!(deepseek.default_model, "deepseek-flash");
 
         let local = find_provider_profile(&catalog, "local").context("local")?;
         assert_eq!(local.api_provider, ApiProvider::OpenAi);
@@ -27306,13 +27992,13 @@ fn provider_and_auth_future_versions_fail_without_rewriting_source() -> Result<(
     let result = (|| -> Result<()> {
         let provider_path = provider_catalog_path();
         std::fs::create_dir_all(provider_path.parent().unwrap_or(Path::new(".")))?;
-        let provider_bytes = br#"{"version":4,"active_provider":"glm","providers":[]}"#;
+        let provider_bytes = br#"{"version":5,"active_provider":"glm","providers":[]}"#;
         std::fs::write(&provider_path, provider_bytes)?;
         let error = load_provider_catalog()
             .expect_err("future provider catalog must fail")
             .to_string();
         assert!(
-            error.contains("unsupported provider catalog version 4"),
+            error.contains("unsupported provider catalog version 5"),
             "{error}"
         );
         assert_eq!(std::fs::read(&provider_path)?, provider_bytes);
@@ -29905,7 +30591,7 @@ fn openai_and_chatgpt_requests_keep_system_stable_and_append_tail_env() -> Resul
     let root = std::fs::canonicalize(&root)?;
     let mut agent = test_agent(&root);
     agent.api_provider = ApiProvider::OpenAi;
-    agent.model = "deepseek-chat".to_string();
+    agent.model = "deepseek-flash".to_string();
     agent.history = vec![Message {
         role: "user".to_string(),
         content: vec![Block::Text {
@@ -30139,7 +30825,7 @@ fn kimi_builtin_metadata_is_isolated_from_existing_provider_profiles() {
             ApiProvider::OpenAi,
             RequestContract::OpenAiChatCompletions,
             "https://api.deepseek.com",
-            "deepseek-chat",
+            "deepseek-flash",
         ),
         (
             "local",
@@ -31469,6 +32155,174 @@ async fn openai_chat_length_truncated_tool_call_automatically_continues() {
 }
 
 #[tokio::test]
+async fn deepseek_thinking_tool_rounds_and_prior_turn_replay_reach_wire() -> Result<()> {
+    let root = temp_test_dir("deepseek-thinking-tool-wire");
+    let root = std::fs::canonicalize(root)?;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    listener.set_nonblocking(true)?;
+    let addr = listener.local_addr()?;
+    let server = std::thread::spawn(move || -> Result<Vec<Value>> {
+        let mut bodies = Vec::new();
+        for round in 0usize..4 {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        anyhow::ensure!(
+                            std::time::Instant::now() < deadline,
+                            "mock accept timeout"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            };
+            stream.set_nonblocking(false)?;
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+            stream.set_write_timeout(Some(std::time::Duration::from_secs(5)))?;
+            let mut request = Vec::new();
+            let mut buf = [0u8; 4096];
+            let header_end = loop {
+                let read = stream.read(&mut buf)?;
+                anyhow::ensure!(
+                    read > 0 && request.len() < 4 * 1024 * 1024,
+                    "invalid mock request"
+                );
+                request.extend_from_slice(&buf[..read]);
+                if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break end + 4;
+                }
+            };
+            let length = String::from_utf8_lossy(&request[..header_end])
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                })
+                .context("content length")?;
+            anyhow::ensure!(length <= 4 * 1024 * 1024, "request body cap");
+            while request.len() < header_end + length {
+                let read = stream.read(&mut buf)?;
+                anyhow::ensure!(read > 0, "incomplete request body");
+                request.extend_from_slice(&buf[..read]);
+            }
+            let body: Value = serde_json::from_slice(&request[header_end..header_end + length])?;
+            assert_eq!(body["thinking"]["type"], "enabled");
+            assert_eq!(body["reasoning_effort"], "max");
+            assert!(body.get("chat_template_kwargs").is_none());
+            assert_eq!(body["stream_options"]["include_usage"], true);
+            let tool_results = body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|message| message["role"] == "tool")
+                .collect::<Vec<_>>();
+            assert_eq!(tool_results.len(), round.div_ceil(2));
+            for result in tool_results {
+                assert!(
+                    result["content"].as_str().unwrap().starts_with("(no todos"),
+                    "{result}"
+                );
+            }
+            let assistants = body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|message| message["role"] == "assistant")
+                .collect::<Vec<_>>();
+            assert_eq!(assistants.len(), round);
+            for (index, message) in assistants.iter().enumerate() {
+                assert_eq!(message["reasoning_content"], format!("reasoning {index}"));
+            }
+            bodies.push(body);
+            let delta = if round % 2 == 0 {
+                json!({"tool_calls":[{"index":0,"id":format!("call_{round}"),"type":"function","function":{"name":"todo_read","arguments":"{}"}}]})
+            } else {
+                json!({"content":format!("Done: answer {round}")})
+            };
+            let reasoning = json!({"choices":[{"delta":{"reasoning_content":format!("reasoning {round}")},"finish_reason":null}],"usage":null});
+            let content = json!({"choices":[{"delta":delta,"finish_reason":null}],"usage":null});
+            let terminal = json!({"choices":[{"delta":{},"finish_reason":if round % 2 == 0 { "tool_calls" } else { "stop" }}],"usage":{"prompt_tokens":17,"completion_tokens":9,"prompt_cache_hit_tokens":6}});
+            let response = format!(
+                "data: {reasoning}\n\ndata: {content}\n\ndata: {terminal}\n\ndata: [DONE]\n\n"
+            );
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                response.len()
+            )?;
+            for part in response.as_bytes().chunks(7) {
+                stream.write_all(part)?;
+            }
+        }
+        Ok(bodies)
+    });
+    let mut agent = test_agent(&root);
+    agent.provider_id = "deepseek".to_string();
+    agent.api_provider = ApiProvider::OpenAi;
+    agent.base_url = format!("http://{addr}");
+    agent.model = "deepseek-flash".to_string();
+    agent.provider_profile = built_in_provider_profiles()
+        .into_iter()
+        .find(|profile| profile.id == "deepseek");
+    agent.thinking_effort = ThinkingEffort::Max;
+    agent.max_iterations = Some(3);
+    agent.session_enabled = false;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    agent.set_sink(Box::new(ChannelSink { tx }));
+    let result = async {
+        agent.chat("Hello.".to_string()).await?;
+        agent.chat("Hello again.".to_string()).await
+    }
+    .await;
+    let requests = server.join().expect("mock server");
+    assert!(
+        requests.is_ok(),
+        "mock server failed: {requests:?}; client: {result:?}"
+    );
+    let events = drain_events(&mut rx);
+    assert!(
+        result.is_ok(),
+        "client failed: {result:?}; requests: {}; runtime notes: {:?}",
+        requests.as_ref().unwrap().len(),
+        events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Warn(text) | AgentEvent::Info(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    );
+    result?;
+    assert_eq!(requests?.len(), 4);
+    assert_eq!(agent.session_usage.input, 44);
+    assert_eq!(agent.session_usage.cache_read, 24);
+    assert_eq!(agent.session_usage.output, 36);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::ThinkingBlockComplete(_)))
+            .count(),
+        4
+    );
+    assert_eq!(
+        events.iter().filter(|event| matches!(event, AgentEvent::ToolCallResult { name, ok: true, .. } if name == "todo_read")).count(),
+        2
+    );
+    assert!(
+        agent
+            .history
+            .iter()
+            .flat_map(|message| &message.content)
+            .any(|block| { matches!(block, Block::Text { text } if text == "Done: answer 3") })
+    );
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[tokio::test]
 async fn local_llama_reasoning_content_reaches_sink_and_history_blocks() {
     let root = temp_test_dir("local-reasoning-content-stream");
     let root = std::fs::canonicalize(&root).expect("canonical temp dir");
@@ -32224,6 +33078,7 @@ fn tool_disabled_models_expose_no_static_or_dynamic_tools() {
         stream: false,
         stream_options: None,
         reasoning_effort: None,
+        thinking: None,
         grammar: None,
         chat_template_kwargs: None,
     };
