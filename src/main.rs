@@ -1,6 +1,7 @@
 mod claude_subscription;
 mod compaction;
 mod crash;
+mod diagram;
 mod events;
 mod git_checkpoints;
 mod image;
@@ -10675,6 +10676,7 @@ const DEFAULT_SYSTEM: &str = "You are dext, a terse coding CLI agent running loc
 - Bash calls are atomic: backgrounding/nohup/disown cannot persist; setsid is unsupported. Use an OS supervisor with a dext- unit for requested persistent services. Inspect stderr, validate external sources before scaling, and ask on auth failure.
 - Verify narrowly after changes. Final answers are terse: changes, tests, gaps.
 - Tables: one grouped table for related data; one physical line per row; plain cells without emoji, bold, unescaped `|`, or line breaks.
+- Diagrams: fenced mermaid; labels <24; flowchart, sequenceDiagram (no notes/loops), stateDiagram-v2.
 - Invoke requested packs directly. Reusable packs are user-global unless explicitly project-local.";
 
 const FRUGAL_TOOL_PROTOCOL_NOTE: &str = "Frugal workflow: never try to prefill the TUI input/composer. For nontrivial work, define small steps by required input and observable output; run independent reads in parallel, reuse verified results, and repair only the failed step.";

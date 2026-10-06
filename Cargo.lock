@@ -507,6 +507,7 @@ dependencies = [
  "image",
  "landlock",
  "libc",
+ "pulldown-cmark",
  "ra_ap_syntax",
  "ratatui",
  "ratatui-core",

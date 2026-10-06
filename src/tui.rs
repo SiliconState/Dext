@@ -258,6 +258,18 @@ enum Line_ {
         text: String,
         dim_prefix: bool,
     },
+    AnswerPart {
+        block_id: u64,
+        text: String,
+        first: bool,
+        last: bool,
+        dim_prefix: bool,
+        row_start: usize,
+        row_end: Option<usize>,
+    },
+    AnswerGap {
+        block_id: u64,
+    },
     Tool {
         call_tag: String,
         name: String,
@@ -1271,6 +1283,19 @@ impl StreamingPseudoToolFilter {
         }
     }
 
+    fn apply_truncated_boundary(&mut self, line: &BoundedThinkingLine, context_mode: ContextMode) {
+        if !line.truncated || !context_mode.is_frugal() {
+            return;
+        }
+        if let Some(open) = line.xml_open_at_end.filter(|_| !line.has_escape) {
+            self.redacting_xml = open;
+            self.redacting_payload = false;
+            self.redacting_until_blank = false;
+        } else if !self.redacting_xml {
+            self.redacting_until_blank = true;
+        }
+    }
+
     fn process_line(&mut self, raw: &str, context_mode: ContextMode) -> Vec<String> {
         let line = sanitize_display_text(raw);
         if !context_mode.is_frugal() {
@@ -1401,7 +1426,6 @@ impl ActiveThinking {
         }
 
         let section_start = !self.section_has_content;
-        let truncated = line.truncated;
         let display_text = line.display_text();
         let sanitized_empty = sanitize_display_text(&display_text).trim().is_empty();
         let visible = self.filter.process_line(&display_text, self.context_mode);
@@ -1409,17 +1433,8 @@ impl ActiveThinking {
         for (index, text) in visible.into_iter().enumerate() {
             self.push_unit(text, section_start && index == 0);
         }
-        if truncated && self.context_mode.is_frugal() {
-            // Keep only XML boundaries, never the omitted payload. Escape-bearing
-            // lines cannot safely re-establish state without the full sanitizer.
-            if let Some(open) = line.xml_open_at_end.filter(|_| !line.has_escape) {
-                self.filter.redacting_xml = open;
-                self.filter.redacting_payload = false;
-                self.filter.redacting_until_blank = false;
-            } else if !self.filter.redacting_xml {
-                self.filter.redacting_until_blank = true;
-            }
-        }
+        self.filter
+            .apply_truncated_boundary(&line, self.context_mode);
         if emitted {
             self.section_has_content = true;
         } else if sanitized_empty
@@ -1471,6 +1486,182 @@ impl ActiveThinking {
     }
 }
 
+struct ActiveAnswer {
+    block_id: u64,
+    sealed_bytes: usize,
+    dim_prefix: bool,
+    started: bool,
+    scan_at: usize,
+    scan_step: usize,
+    exhausted: bool,
+    visible: String,
+    completed_visible_bytes: usize,
+    completed_lines: usize,
+    decoder: ThinkingLineDecoder,
+    filter: StreamingPseudoToolFilter,
+    progressive_rows: Vec<Line<'static>>,
+    render_width: u16,
+    progressive_version: Option<(usize, usize, u16)>,
+    live_cache: std::cell::RefCell<Option<(u16, Vec<Line<'static>>)>>,
+}
+
+const ANSWER_DISPLAY_CAP: usize = 4 * 1024 * 1024;
+const ANSWER_SCAN_STEP: usize = 512;
+const ANSWER_LINE_LIMIT: usize = 4096;
+const ANSWER_ROW_LIMIT: usize = 4096;
+const ANSWER_DISPLAY_OMITTED: &str = "\n\n[answer display limit reached]";
+
+fn bounded_answer_text(source: &str, context_mode: ContextMode) -> String {
+    let mut end = source.len().min(ANSWER_DISPLAY_CAP);
+    while !source.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut truncated = false;
+    let mut decoder = ThinkingLineDecoder::default();
+    let mut filter = StreamingPseudoToolFilter::default();
+    let mut result = String::new();
+    let mut lines = 0;
+    decoder.push(&source[..end], |line| {
+        if truncated {
+            return;
+        }
+        if lines == ANSWER_LINE_LIMIT {
+            truncated = true;
+            return;
+        }
+        lines += 1;
+        truncated = !append_answer_line(&mut result, &mut filter, &line, context_mode, true);
+    });
+    for line in decoder.finish() {
+        if truncated || lines == ANSWER_LINE_LIMIT {
+            truncated = true;
+            break;
+        }
+        truncated = !append_answer_line(
+            &mut result,
+            &mut filter,
+            &line,
+            context_mode,
+            source[..end].ends_with('\r'),
+        );
+    }
+    if truncated || end < source.len() {
+        result.push_str(ANSWER_DISPLAY_OMITTED);
+    }
+    result
+}
+
+fn append_answer_line(
+    visible: &mut String,
+    filter: &mut StreamingPseudoToolFilter,
+    line: &BoundedThinkingLine,
+    context_mode: ContextMode,
+    terminated: bool,
+) -> bool {
+    let display = if line.truncated {
+        "[long answer line omitted]".to_string()
+    } else {
+        line.display_text()
+    };
+    let output = filter.process_line(&display, context_mode);
+    let mut fits = true;
+    if !line.has_non_whitespace && !filter.redacting_xml {
+        fits = append_answer_display(visible, if terminated { "\n" } else { "" });
+    } else {
+        let count = output.len();
+        for (index, text) in output.into_iter().enumerate() {
+            fits = append_answer_display(visible, &text)
+                && (!(terminated || index + 1 < count) || append_answer_display(visible, "\n"));
+            if !fits {
+                break;
+            }
+        }
+    }
+    filter.apply_truncated_boundary(line, context_mode);
+    fits
+}
+
+fn append_answer_display(target: &mut String, text: &str) -> bool {
+    let remaining = ANSWER_DISPLAY_CAP.saturating_sub(target.len());
+    let mut end = text.len().min(remaining);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    target.push_str(&text[..end]);
+    end == text.len()
+}
+
+fn answer_block_end(source: &str, end: usize) -> usize {
+    let content_end = source[..end]
+        .trim_end_matches([' ', '\t', '\r', '\n'])
+        .len();
+    source[content_end..end]
+        .find('\n')
+        .map_or(end, |offset| content_end + offset + 1)
+}
+
+fn answer_stable_end(source: &str) -> usize {
+    use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    let mut stable = 0usize;
+    let mut previous_end = 0usize;
+    let mut top_tag = None;
+    for (event, range) in Parser::new_ext(source, Options::ENABLE_TABLES).into_offset_iter() {
+        match event {
+            Event::Start(tag) => {
+                if depth == 0 {
+                    if previous_end > 0 {
+                        stable = previous_end;
+                    }
+                    start = range.start;
+                    top_tag = Some(tag.clone());
+                }
+                depth += 1;
+            }
+            Event::End(tag) => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    previous_end = answer_block_end(source, range.end);
+                    let terminated = match (&top_tag, tag) {
+                        (Some(Tag::CodeBlock(_)), TagEnd::CodeBlock) => {
+                            if !source[..range.end].ends_with('\n')
+                                && !source[range.end..].starts_with('\n')
+                            {
+                                continue;
+                            }
+                            let lines = source[start..range.end].lines().collect::<Vec<_>>();
+                            lines
+                                .first()
+                                .and_then(|line| fence_delimiter(line))
+                                .is_some_and(|delimiter| {
+                                    find_fence_close(&lines, 0, delimiter).is_some()
+                                })
+                        }
+                        (_, TagEnd::Paragraph) => {
+                            source[range.end..].starts_with('\n')
+                                && source[..range.end].ends_with('\n')
+                        }
+                        (_, TagEnd::Heading(_)) => source[..range.end].ends_with('\n'),
+                        _ => false,
+                    };
+                    if terminated {
+                        stable = previous_end;
+                    }
+                }
+            }
+            Event::Rule if depth == 0 => {
+                if source[..range.end].ends_with('\n') {
+                    stable = range.end;
+                }
+                previous_end = range.end;
+            }
+            _ => {}
+        }
+    }
+    stable
+}
+
 struct TuiState {
     pending_insert: Vec<Line_>,
     prepared_insert_retry: Vec<Line_>,
@@ -1515,12 +1706,17 @@ struct TuiState {
     sandbox_path: PathBuf,
     git_epoch: u64,
     streaming_text: String,
+    active_answer: Option<ActiveAnswer>,
+    provisional_answers: Vec<u64>,
+    provisional_answer_chars: u64,
+    next_answer_block_id: u64,
+    canonical_answers: HashMap<u64, (String, bool)>,
     streaming_thinking: String,
     active_thinking: Option<ActiveThinking>,
     provisional_thinking: Vec<ActiveThinking>,
     next_thinking_block_id: u64,
     thinking_reconcile_mismatches: u64,
-    thinking_visual_transaction_pending: bool,
+    visual_transaction_pending: bool,
     stream_started_at: Option<Instant>,
     agent_active_elapsed: Duration,
     agent_active_started_at: Option<Instant>,
@@ -1658,12 +1854,17 @@ impl TuiState {
             git_epoch: 0,
             sandbox,
             streaming_text: String::new(),
+            active_answer: None,
+            provisional_answers: Vec::new(),
+            provisional_answer_chars: 0,
+            next_answer_block_id: 1,
+            canonical_answers: HashMap::new(),
             streaming_thinking: String::new(),
             active_thinking: None,
             provisional_thinking: Vec::new(),
             next_thinking_block_id: 1,
             thinking_reconcile_mismatches: 0,
-            thinking_visual_transaction_pending: false,
+            visual_transaction_pending: false,
             stream_started_at: None,
             agent_active_elapsed: Duration::ZERO,
             agent_active_started_at: None,
@@ -2085,9 +2286,12 @@ impl TuiState {
             .or_else(|| self.transcript.last())
     }
 
-    // Gaps adjacent to thinking history are tagged with that block so rolling
-    // the block back also removes its spacing instead of leaving a stray blank.
+    // Provisional blocks own adjacent gaps so rollback cannot leave stray spacing.
     fn history_separator(last: &Line_, next: &Line_) -> Line_ {
+        if let Some(block_id) = Self::answer_block_id(next).or_else(|| Self::answer_block_id(last))
+        {
+            return Line_::AnswerGap { block_id };
+        }
         Self::thinking_block_id(next)
             .or_else(|| Self::thinking_block_id(last))
             .map_or(Line_::Blank, |block_id| Line_::ThinkingGap { block_id })
@@ -2109,6 +2313,511 @@ impl TuiState {
         }
     }
 
+    fn answer_block_id(line: &Line_) -> Option<u64> {
+        match line {
+            Line_::AnswerPart { block_id, .. } | Line_::AnswerGap { block_id } => Some(*block_id),
+            _ => None,
+        }
+    }
+
+    fn rollback_answer_blocks(&mut self, discarded: &HashSet<u64>) {
+        self.canonical_answers
+            .retain(|id, _| !discarded.contains(id));
+        let mut removed = false;
+        for (index, items) in [
+            &mut self.transcript,
+            &mut self.prepared_insert_retry,
+            &mut self.pending_insert,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let before = items.len();
+            items.retain(|line| {
+                Self::answer_block_id(line).is_none_or(|id| !discarded.contains(&id))
+            });
+            removed |= before != items.len();
+            if before != items.len() && index < 2 {
+                self.transcript_needs_rebuild = true;
+            }
+        }
+        if removed {
+            self.repair_history_spacing();
+            self.visual_transaction_pending = true;
+        }
+    }
+
+    fn commit_answer_preview(&mut self) {
+        self.provisional_answers.clear();
+        self.provisional_answer_chars = 0;
+    }
+
+    fn discard_answer_preview(&mut self) {
+        let discarded = self
+            .provisional_answers
+            .drain(..)
+            .chain(self.active_answer.take().map(|answer| answer.block_id))
+            .collect();
+        self.rollback_answer_blocks(&discarded);
+        self.streaming_text.clear();
+        self.stream_started_at = None;
+    }
+
+    fn sync_answer_visibility(&mut self) {
+        let Some(previous) = self.active_answer.take() else {
+            return;
+        };
+        let exhausted = previous.exhausted;
+        self.rollback_answer_blocks(&HashSet::from([previous.block_id]));
+        let raw = std::mem::take(&mut self.streaming_text);
+        let mut active = self.start_answer();
+        active.block_id = previous.block_id;
+        active.dim_prefix = previous.dim_prefix;
+        self.active_answer = Some(active);
+        self.push_answer_delta(&raw);
+        if exhausted
+            && let Some(active) = self.active_answer.as_mut()
+            && !active.exhausted
+        {
+            active.exhausted = true;
+            active.visible.push_str(ANSWER_DISPLAY_OMITTED);
+            active.live_cache.get_mut().take();
+        }
+    }
+
+    fn start_answer(&mut self) -> ActiveAnswer {
+        let block_id = self.next_answer_block_id;
+        self.next_answer_block_id = self.next_answer_block_id.wrapping_add(1).max(1);
+        ActiveAnswer {
+            block_id,
+            sealed_bytes: 0,
+            dim_prefix: self.assistant_prefix_seen,
+            started: false,
+            scan_at: 0,
+            scan_step: ANSWER_SCAN_STEP,
+            exhausted: false,
+            visible: String::new(),
+            completed_visible_bytes: 0,
+            completed_lines: 0,
+            decoder: ThinkingLineDecoder::default(),
+            filter: StreamingPseudoToolFilter::default(),
+            progressive_rows: Vec::new(),
+            render_width: self.transcript_rendered_width,
+            progressive_version: None,
+            live_cache: std::cell::RefCell::new(None),
+        }
+    }
+
+    fn push_answer_delta(&mut self, text: &str) {
+        let mut active = self
+            .active_answer
+            .take()
+            .unwrap_or_else(|| self.start_answer());
+        active.live_cache.get_mut().take();
+        if !active.exhausted {
+            let remaining = ANSWER_DISPLAY_CAP.saturating_sub(self.streaming_text.len());
+            let mut end = text.len().min(remaining);
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            self.streaming_text.push_str(&text[..end]);
+            active.visible.truncate(active.completed_visible_bytes);
+            let mut decoder = std::mem::take(&mut active.decoder);
+            decoder.push(&text[..end], |line| {
+                if active.exhausted {
+                    return;
+                }
+                if active.completed_lines == ANSWER_LINE_LIMIT {
+                    active.exhausted = true;
+                    return;
+                }
+                active.completed_lines += 1;
+                active.exhausted = !append_answer_line(
+                    &mut active.visible,
+                    &mut active.filter,
+                    &line,
+                    self.context_mode,
+                    true,
+                );
+            });
+            active.completed_visible_bytes = active.visible.len();
+            if !active.exhausted
+                && let Some(open) = decoder.open_display_text()
+            {
+                let open = if decoder.line.truncated {
+                    "[long answer line omitted]".to_string()
+                } else {
+                    open
+                };
+                let mut filter = active.filter.clone();
+                let preview = filter.process_line(&open, self.context_mode);
+                active.exhausted = !append_answer_display(&mut active.visible, &preview.join("\n"));
+            }
+            active.decoder = decoder;
+            active.exhausted |= end < text.len();
+            if active.exhausted {
+                active.visible.push_str(ANSWER_DISPLAY_OMITTED);
+            }
+        }
+        self.active_answer = Some(active);
+        self.seal_answer_progress(false);
+    }
+
+    fn seal_answer_progress(&mut self, force: bool) {
+        let Some(mut active) = self.active_answer.take() else {
+            return;
+        };
+        let pending_bytes = self.streaming_text.len().saturating_sub(active.scan_at);
+        let mutable_bytes = active.visible.len().saturating_sub(active.sealed_bytes);
+        let has_newline = self.streaming_text[active.scan_at..].contains('\n');
+        if !force
+            && pending_bytes < active.scan_step
+            && !(mutable_bytes <= 16 * 1024 && has_newline)
+        {
+            self.active_answer = Some(active);
+            return;
+        }
+        active.scan_at = self.streaming_text.len();
+        let end = active.sealed_bytes
+            + answer_stable_end(
+                &active.visible[active.sealed_bytes..active.completed_visible_bytes],
+            );
+        if end > active.sealed_bytes {
+            let mut text = active.visible[active.sealed_bytes..end].to_string();
+            if !active.progressive_rows.is_empty() {
+                let mut rows = Vec::new();
+                push_answer_part(
+                    &mut rows,
+                    &text,
+                    false,
+                    false,
+                    active.dim_prefix,
+                    transcript_render_width(active.render_width),
+                );
+                if !rows.starts_with(&active.progressive_rows) {
+                    self.rollback_answer_blocks(&HashSet::from([active.block_id]));
+                    active.sealed_bytes = 0;
+                    active.progressive_rows.clear();
+                    active.started = false;
+                    text = active.visible[..end].to_string();
+                }
+            }
+            self.queue(Line_::AnswerPart {
+                block_id: active.block_id,
+                text,
+                first: !active.started,
+                last: false,
+                dim_prefix: active.dim_prefix,
+                row_start: active.progressive_rows.len(),
+                row_end: None,
+            });
+            active.progressive_rows.clear();
+            active.live_cache.get_mut().take();
+            active.sealed_bytes = end;
+            active.scan_step = ANSWER_SCAN_STEP;
+            active.started = true;
+            self.assistant_prefix_seen = true;
+            self.visual_transaction_pending = true;
+        } else {
+            active.scan_step = active.scan_step.saturating_mul(2).min(64 * 1024);
+        }
+        self.active_answer = Some(active);
+    }
+
+    fn progressive_answer_rows(&mut self, width: u16) {
+        let Some(mut active) = self.active_answer.take() else {
+            return;
+        };
+        let version = (self.streaming_text.len(), active.sealed_bytes, width);
+        if active.progressive_version == Some(version) {
+            self.active_answer = Some(active);
+            return;
+        }
+        active.progressive_version = Some(version);
+        let source = &active.visible[active.sealed_bytes..];
+        if source.is_empty() || source.len() > 32 * 1024 || width < 8 {
+            self.active_answer = Some(active);
+            return;
+        }
+        let mut depth = 0usize;
+        let mut blocks = 0usize;
+        let mut progressive = true;
+        for event in pulldown_cmark::Parser::new_ext(source, pulldown_cmark::Options::ENABLE_TABLES)
+        {
+            match event {
+                pulldown_cmark::Event::Start(tag) => {
+                    if depth == 0 {
+                        blocks += 1;
+                        progressive &= match tag {
+                            pulldown_cmark::Tag::Paragraph
+                            | pulldown_cmark::Tag::List(_)
+                            | pulldown_cmark::Tag::BlockQuote(_) => true,
+                            pulldown_cmark::Tag::CodeBlock(
+                                pulldown_cmark::CodeBlockKind::Fenced(info),
+                            ) => !matches!(
+                                info.split_whitespace()
+                                    .next()
+                                    .unwrap_or_default()
+                                    .to_ascii_lowercase()
+                                    .as_str(),
+                                "mermaid" | "md" | "markdown"
+                            ),
+                            _ => false,
+                        };
+                    }
+                    depth += 1;
+                }
+                pulldown_cmark::Event::End(_) => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+        if !progressive || blocks != 1 || source.contains('|') {
+            self.active_answer = Some(active);
+            return;
+        }
+        let mut rows = Vec::new();
+        push_answer_part(
+            &mut rows,
+            source,
+            false,
+            false,
+            active.dim_prefix,
+            transcript_render_width(width),
+        );
+        let emitted = active.progressive_rows.len();
+        if !rows.starts_with(&active.progressive_rows) {
+            self.rollback_answer_blocks(&HashSet::from([active.block_id]));
+            active.sealed_bytes = 0;
+            active.progressive_rows.clear();
+            active.started = false;
+            self.active_answer = Some(active);
+            self.sync_answer_visibility();
+            return;
+        }
+        let end = rows.len().saturating_sub(1);
+        if end > emitted {
+            self.queue(Line_::AnswerPart {
+                block_id: active.block_id,
+                text: source.to_string(),
+                first: !active.started,
+                last: false,
+                dim_prefix: active.dim_prefix,
+                row_start: emitted,
+                row_end: Some(end),
+            });
+            active.progressive_rows = rows.drain(..end).collect();
+            active.live_cache.get_mut().take();
+            active.started = true;
+            self.assistant_prefix_seen = true;
+            self.visual_transaction_pending = true;
+        }
+        self.active_answer = Some(active);
+    }
+
+    fn consolidate_completed_answer(
+        &mut self,
+        id: u64,
+        text: String,
+        dim_prefix: bool,
+        include_pending: bool,
+    ) {
+        let mut remaining = self
+            .transcript
+            .iter()
+            .chain(if include_pending {
+                self.prepared_insert_retry.iter()
+            } else {
+                [].iter()
+            })
+            .chain(if include_pending {
+                self.pending_insert.iter()
+            } else {
+                [].iter()
+            })
+            .filter(|line| matches!(line, Line_::AnswerPart { block_id, .. } if *block_id == id))
+            .count();
+        let mut source = Some(text);
+        for items in [
+            &mut self.transcript,
+            &mut self.prepared_insert_retry,
+            &mut self.pending_insert,
+        ]
+        .into_iter()
+        .take(if include_pending { 3 } else { 1 })
+        {
+            items.retain_mut(|line| {
+                if matches!(line, Line_::AnswerPart { block_id, .. } if *block_id == id) {
+                    remaining -= 1;
+                    if remaining == 0 {
+                        *line = Line_::AnswerPart {
+                            block_id: id,
+                            text: source.take().expect("canonical answer source"),
+                            first: true,
+                            last: true,
+                            dim_prefix,
+                            row_start: 0,
+                            row_end: None,
+                        };
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    true
+                }
+            });
+        }
+    }
+
+    fn set_answer_width(&mut self, width: u16) {
+        if width == 0 {
+            return;
+        }
+        if self.transcript_needs_rebuild
+            || (self.transcript_rendered_width != 0 && self.transcript_rendered_width != width)
+        {
+            for (id, (text, dim_prefix)) in std::mem::take(&mut self.canonical_answers) {
+                self.consolidate_completed_answer(id, text, dim_prefix, true);
+            }
+        }
+        if let Some(active) = self.active_answer.as_mut() {
+            if active.render_width != 0
+                && (active.render_width != width || self.transcript_needs_rebuild)
+            {
+                self.sync_answer_visibility();
+            }
+            if let Some(active) = self.active_answer.as_mut() {
+                active.render_width = width;
+            }
+        }
+        self.progressive_answer_rows(width);
+    }
+
+    fn canonicalize_completed_answers(&mut self) {
+        let ready = self.canonical_answers.keys().copied().filter(|id| {
+            self.transcript.iter().any(|line| matches!(line, Line_::AnswerPart { block_id, last: true, .. } if block_id == id))
+        }).collect::<Vec<_>>();
+        for id in ready {
+            let Some((text, dim_prefix)) = self.canonical_answers.remove(&id) else {
+                continue;
+            };
+            self.consolidate_completed_answer(id, text, dim_prefix, false);
+        }
+    }
+
+    fn answer_matches_canonical(&self, active: &ActiveAnswer, rendered: &str) -> bool {
+        let Some(tail) = rendered.get(active.sealed_bytes..) else {
+            return false;
+        };
+        let width = transcript_render_width(active.render_width.max(1));
+        let mut expected = Vec::new();
+        push_answer_part(
+            &mut expected,
+            rendered,
+            true,
+            true,
+            active.dim_prefix,
+            width,
+        );
+        let mut remaining = Vec::new();
+        push_answer_part(&mut remaining, tail, false, false, active.dim_prefix, width);
+        if !remaining.starts_with(&active.progressive_rows) {
+            return false;
+        }
+        let remaining = remaining.into_iter().skip(active.progressive_rows.len());
+        let mut closing = Vec::new();
+        push_answer_part(&mut closing, "", false, true, active.dim_prefix, width);
+        self.transcript.iter()
+            .chain(&self.prepared_insert_retry)
+            .chain(&self.pending_insert)
+            .filter(|line| matches!(line, Line_::AnswerPart { block_id, .. } if *block_id == active.block_id))
+            .flat_map(|line| line_to_text(line, width).lines)
+            .chain(remaining)
+            .chain(closing)
+            .eq(expected)
+    }
+
+    fn complete_answer(&mut self, full: String) {
+        self.complete_answer_display(bounded_answer_text(&full, self.context_mode));
+    }
+
+    fn complete_answer_display(&mut self, rendered: String) {
+        let mut active = self
+            .active_answer
+            .take()
+            .unwrap_or_else(|| self.start_answer());
+        {
+            let previous = &mut active;
+            let mismatch = rendered.is_empty()
+                || !rendered.starts_with(&previous.visible[..previous.sealed_bytes])
+                || (previous.started && !self.answer_matches_canonical(previous, &rendered));
+            if mismatch {
+                self.rollback_answer_blocks(&HashSet::from([previous.block_id]));
+                previous.started = false;
+                previous.sealed_bytes = 0;
+                previous.progressive_rows.clear();
+            }
+        }
+        if !rendered.is_empty() {
+            if active.started {
+                self.queue(Line_::AnswerPart {
+                    block_id: active.block_id,
+                    text: rendered[active.sealed_bytes..].to_string(),
+                    first: false,
+                    last: true,
+                    dim_prefix: active.dim_prefix,
+                    row_start: active.progressive_rows.len(),
+                    row_end: None,
+                });
+                self.canonical_answers
+                    .insert(active.block_id, (rendered, active.dim_prefix));
+                self.provisional_answers.push(active.block_id);
+            } else {
+                self.queue(Line_::AnswerPart {
+                    block_id: active.block_id,
+                    text: rendered.clone(),
+                    first: true,
+                    last: true,
+                    dim_prefix: active.dim_prefix,
+                    row_start: 0,
+                    row_end: None,
+                });
+                self.canonical_answers
+                    .insert(active.block_id, (rendered, active.dim_prefix));
+                self.provisional_answers.push(active.block_id);
+            }
+            self.assistant_prefix_seen = true;
+            self.visual_transaction_pending = true;
+            self.provisional_answer_chars = self
+                .provisional_answer_chars
+                .saturating_add(self.stream_chars);
+        }
+        self.streaming_text.clear();
+        self.stream_started_at = None;
+        self.stream_chars = 0;
+    }
+
+    fn end_answer_turn(&mut self) {
+        if self.active_answer.is_some() && !self.streaming_text.trim().is_empty() {
+            let exhausted = self
+                .active_answer
+                .as_ref()
+                .is_some_and(|answer| answer.exhausted);
+            let mut partial = bounded_answer_text(&self.streaming_text, self.context_mode);
+            if exhausted && !partial.ends_with(ANSWER_DISPLAY_OMITTED) {
+                partial.push_str(ANSWER_DISPLAY_OMITTED);
+            }
+            partial.push_str("\n\n[stream ended early; preserved partial response]");
+            self.complete_answer_display(partial);
+        } else if self.active_answer.is_some() {
+            self.discard_answer_preview();
+        }
+        self.active_answer = None;
+        self.provisional_answers.clear();
+        self.provisional_answer_chars = 0;
+        self.streaming_text.clear();
+    }
+
     fn queue_active_thinking_units(&mut self, active: &mut ActiveThinking) {
         if !self.verbose || active.queued_units >= active.units.len() {
             return;
@@ -2121,7 +2830,7 @@ impl TuiState {
             });
         }
         active.queued_units = active.units.len();
-        self.thinking_visual_transaction_pending = true;
+        self.visual_transaction_pending = true;
     }
 
     fn start_active_thinking(&mut self) -> ActiveThinking {
@@ -2173,7 +2882,7 @@ impl TuiState {
         }
         if pending_removed || retry_removed || transcript_removed {
             self.repair_history_spacing();
-            self.thinking_visual_transaction_pending = true;
+            self.visual_transaction_pending = true;
         }
     }
 
@@ -2264,7 +2973,10 @@ impl TuiState {
     fn line_needs_history_spacing(line: &Line_) -> bool {
         matches!(
             line,
-            Line_::Assistant { .. } | Line_::Tool { .. } | Line_::ThinkingUnit { .. }
+            Line_::Assistant { .. }
+                | Line_::AnswerPart { .. }
+                | Line_::Tool { .. }
+                | Line_::ThinkingUnit { .. }
         )
     }
 
@@ -2282,11 +2994,16 @@ impl TuiState {
     }
 
     fn spacing_needed_between(left: &Line_, right: &Line_) -> bool {
-        !matches!(left, Line_::Blank | Line_::ThinkingGap { .. })
-            && !matches!(right, Line_::Blank | Line_::ThinkingGap { .. })
-            && Self::line_precedes_history_spacing(left)
+        !matches!(
+            left,
+            Line_::Blank | Line_::ThinkingGap { .. } | Line_::AnswerGap { .. }
+        ) && !matches!(
+            right,
+            Line_::Blank | Line_::ThinkingGap { .. } | Line_::AnswerGap { .. }
+        ) && Self::line_precedes_history_spacing(left)
             && Self::line_needs_history_spacing(right)
             && !Self::same_thinking_block(left, right)
+            && Self::answer_block_id(left).is_none_or(|id| Self::answer_block_id(right) != Some(id))
     }
 
     fn repair_spacing_within(items: &mut Vec<Line_>) {
@@ -2623,7 +3340,7 @@ impl TuiState {
         self.push_debug_event(format!("slash/system · {}", sanitize_display_text(&output)));
         self.compacting = false;
         self.compacting_resume_busy = false;
-        self.streaming_text.clear();
+        self.end_answer_turn();
         self.discard_open_thinking_block();
         self.stream_started_at = None;
         self.stream_chars = 0;
@@ -2641,6 +3358,7 @@ impl TuiState {
         match ev {
             AgentEvent::TurnStart => {
                 self.commit_turn_thinking();
+                self.end_answer_turn();
                 self.push_debug_event("turn start");
                 self.compacting = false;
                 self.compacting_resume_busy = false;
@@ -2668,15 +3386,10 @@ impl TuiState {
                         self.status = "scroll: live".into();
                     }
                 }
-                let visible = if self.context_mode.is_frugal() {
-                    t
-                } else {
-                    legacy_pseudo_tool_protocol_redact_lines(&t)
-                };
-                let char_count = visible.chars().count() as u64;
+                let char_count = t.chars().count() as u64;
                 self.stream_chars = self.stream_chars.saturating_add(char_count);
                 self.history_chars = self.history_chars.saturating_add(char_count);
-                self.streaming_text.push_str(&visible);
+                self.push_answer_delta(&t);
             }
             AgentEvent::TextBlockComplete(full) => {
                 self.push_debug_event(format!(
@@ -2686,18 +3399,7 @@ impl TuiState {
                 if full.is_empty() && self.stream_chars > 0 {
                     self.history_chars = self.history_chars.saturating_sub(self.stream_chars);
                 }
-                let rendered = self.pseudo_tool_display_text(&full);
-                if !rendered.is_empty() {
-                    let dim_prefix = self.assistant_prefix_seen;
-                    self.assistant_prefix_seen = true;
-                    self.queue(Line_::Assistant {
-                        text: rendered,
-                        dim_prefix,
-                    });
-                }
-                self.streaming_text.clear();
-                self.stream_started_at = None;
-                self.stream_chars = 0;
+                self.complete_answer(full);
             }
             AgentEvent::ThinkingDelta(t) => {
                 self.push_debug_event(format!("thinking delta · {} chars", t.chars().count()));
@@ -2729,6 +3431,7 @@ impl TuiState {
             }
             AgentEvent::ThinkingPreviewCommitted => {
                 self.commit_thinking_preview();
+                self.commit_answer_preview();
             }
             AgentEvent::ToolCallPreview {
                 call_id,
@@ -2961,6 +3664,13 @@ impl TuiState {
                 reason,
             } => {
                 self.discard_uncommitted_thinking();
+                self.history_chars = self.history_chars.saturating_sub(
+                    self.stream_chars
+                        .saturating_add(self.provisional_answer_chars),
+                );
+                self.stream_chars = 0;
+                self.provisional_answer_chars = 0;
+                self.discard_answer_preview();
                 self.push_debug_event(format!(
                     "http retry · attempt {attempt}/4 · wait {wait_secs}s · {reason}"
                 ));
@@ -3002,6 +3712,7 @@ impl TuiState {
                 {
                     self.context_mode = context_mode;
                     self.sync_active_thinking_visibility();
+                    self.sync_answer_visibility();
                 }
                 self.workaround_fired = workaround_fired;
             }
@@ -3037,8 +3748,12 @@ impl TuiState {
                     "runtime control applied · commands={commands} abort={stream_aborted}"
                 ));
                 if stream_aborted {
-                    self.history_chars = self.history_chars.saturating_sub(self.stream_chars);
-                    self.streaming_text.clear();
+                    self.history_chars = self.history_chars.saturating_sub(
+                        self.stream_chars
+                            .saturating_add(self.provisional_answer_chars),
+                    );
+                    self.provisional_answer_chars = 0;
+                    self.discard_answer_preview();
                     self.discard_uncommitted_thinking();
                     self.stream_started_at = None;
                     self.stream_chars = 0;
@@ -3097,12 +3812,12 @@ impl TuiState {
                         "{tool_total} {tool_noun} · {elapsed}{error_note} · {tool_summary}",
                     )));
                 }
+                self.end_answer_turn();
                 self.set_agent_busy(false);
                 self.status = "ready".into();
                 self.retry_status = None;
                 self.stream_started_at = None;
                 self.stream_chars = 0;
-                self.streaming_text.clear();
                 self.commit_turn_thinking();
                 self.live_tools.clear();
             }
@@ -3194,12 +3909,12 @@ impl TuiState {
                 self.push_debug_event("interrupted");
                 self.compacting = false;
                 self.compacting_resume_busy = false;
+                self.end_answer_turn();
                 self.queue(Line_::Warn("interrupted".into()));
                 self.set_agent_busy(false);
                 self.status = "ready".into();
                 self.stream_started_at = None;
                 self.stream_chars = 0;
-                self.streaming_text.clear();
                 self.discard_uncommitted_thinking();
                 self.live_tools.clear();
             }
@@ -3582,6 +4297,69 @@ fn live_indicator_detail(state: &TuiState, width: u16) -> Vec<Line<'static>> {
     }
     let max_cells = width.saturating_sub(4) as usize;
     if !state.streaming_text.is_empty() {
+        if let Some(active) = state.active_answer.as_ref() {
+            if let Some((cached_width, rows)) = active.live_cache.borrow().as_ref()
+                && *cached_width == width
+            {
+                return rows.clone();
+            }
+            let tail = active
+                .visible
+                .get(active.sealed_bytes..)
+                .unwrap_or_default();
+            let omitted = tail.len() > 32 * 1024;
+            let tail = if omitted {
+                let mut start = tail.len() - 32 * 1024;
+                while !tail.is_char_boundary(start) {
+                    start += 1;
+                }
+                &tail[start..]
+            } else {
+                tail
+            };
+            if !tail.trim().is_empty() {
+                let mut lines = Vec::new();
+                if omitted {
+                    lines.push(Line::from(Span::styled(
+                        "│ … earlier content remains in the active block",
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+                let content_width = width.saturating_sub(2).max(1);
+                let body = collect_wrapped_tail(
+                    &answer_live_markdown_text(tail, content_width),
+                    content_width,
+                    if omitted {
+                        0
+                    } else {
+                        active.progressive_rows.len()
+                    },
+                    7,
+                );
+                if !active.started && !omitted {
+                    push_answer_part(&mut lines, "", true, false, active.dim_prefix, width);
+                }
+                push_prefixed_text(
+                    &mut lines,
+                    Text::from(body),
+                    "│ ",
+                    Style::default().fg(Color::DarkGray),
+                    width,
+                );
+                if lines.len() > 8 {
+                    let start = lines.len() - 7;
+                    let mut capped = vec![Line::from(Span::styled(
+                        "│ …",
+                        Style::default().fg(Color::DarkGray),
+                    ))];
+                    capped.extend(lines.drain(start..));
+                    lines = capped;
+                }
+                *active.live_cache.borrow_mut() = Some((width, lines.clone()));
+                return lines;
+            }
+            return Vec::new();
+        }
         let rendered_text =
             pseudo_tool_protocol_text_for_context(&state.streaming_text, state.context_mode);
         let tail = rendered_text
@@ -5654,7 +6432,6 @@ fn buffer_to_lines(buffer: &ratatui::buffer::Buffer, area: Rect) -> Vec<Line<'st
 
 const TABLE_CELL_PADDING: usize = 1;
 const TABLE_CELL_MIN_WIDTH: usize = 3;
-const TABLE_CELL_SOFT_MAX_WIDTH: usize = 42;
 const TABLE_RECORD_FALLBACK_MIN_WIDTH: usize = 8;
 
 fn table_cell_text(cell: &str) -> String {
@@ -5695,29 +6472,30 @@ fn table_grid_widths(
     let uncapped = table_uncapped_widths(table);
     let content_budget =
         max_total_width.saturating_sub(col_count * (TABLE_CELL_PADDING * 2 + 1) + 1);
-    let soft_max = match col_count {
-        0 => TABLE_CELL_MIN_WIDTH,
-        1 => content_budget.max(TABLE_CELL_MIN_WIDTH),
-        2 => TABLE_CELL_SOFT_MAX_WIDTH
-            .max(24)
-            .min(content_budget.max(TABLE_CELL_MIN_WIDTH)),
-        _ => TABLE_CELL_SOFT_MAX_WIDTH.min(content_budget.max(TABLE_CELL_MIN_WIDTH)),
-    };
     let mut widths = uncapped
         .iter()
-        .map(|width| (*width).clamp(TABLE_CELL_MIN_WIDTH, soft_max))
+        .map(|width| (*width).max(TABLE_CELL_MIN_WIDTH))
         .collect::<Vec<_>>();
 
-    while widths.iter().sum::<usize>() > content_budget {
-        let Some((idx, _)) = widths
-            .iter()
-            .enumerate()
-            .filter(|(_, width)| **width > TABLE_CELL_MIN_WIDTH)
-            .max_by_key(|(_, width)| **width)
-        else {
-            break;
-        };
-        widths[idx] -= 1;
+    let mut low = TABLE_CELL_MIN_WIDTH;
+    let mut high = content_budget.max(low);
+    while low < high {
+        let mid = low + (high - low).div_ceil(2);
+        if widths.iter().map(|width| (*width).min(mid)).sum::<usize>() <= content_budget {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    for width in &mut widths {
+        *width = (*width).min(low);
+    }
+    let mut remaining = content_budget.saturating_sub(widths.iter().sum());
+    for (width, natural) in widths.iter_mut().zip(&uncapped) {
+        if remaining > 0 && *width < *natural {
+            *width += 1;
+            remaining -= 1;
+        }
     }
 
     (widths.iter().sum::<usize>() <= content_budget).then_some((widths, uncapped))
@@ -6010,7 +6788,10 @@ fn has_table_marker(text: &str) -> bool {
 }
 
 fn fence_delimiter(line: &str) -> Option<char> {
-    let trimmed = line.trim_start();
+    let trimmed = line.trim_start_matches(' ');
+    if line.len() - trimmed.len() > 3 {
+        return None;
+    }
     if trimmed.starts_with("```") {
         Some('`')
     } else if trimmed.starts_with("~~~") {
@@ -6022,11 +6803,8 @@ fn fence_delimiter(line: &str) -> Option<char> {
 
 fn fence_info(line: &str) -> Option<(char, &str)> {
     let trimmed = line.trim_start();
-    if let Some(rest) = trimmed.strip_prefix("```") {
-        Some(('`', rest.trim()))
-    } else {
-        trimmed.strip_prefix("~~~").map(|rest| ('~', rest.trim()))
-    }
+    let delimiter = fence_delimiter(line)?;
+    Some((delimiter, trimmed.trim_start_matches(delimiter).trim()))
 }
 
 fn markdown_table_fence_delimiter(line: &str) -> Option<char> {
@@ -6042,11 +6820,23 @@ fn markdown_table_fence_delimiter(line: &str) -> Option<char> {
 }
 
 fn find_fence_close(lines: &[&str], start: usize, delimiter: char) -> Option<usize> {
+    let count = lines[start]
+        .trim_start()
+        .chars()
+        .take_while(|ch| *ch == delimiter)
+        .count();
     lines
         .iter()
         .enumerate()
-        .skip(start.saturating_add(1))
-        .find_map(|(idx, line)| (fence_delimiter(line) == Some(delimiter)).then_some(idx))
+        .skip(start + 1)
+        .find_map(|(idx, line)| {
+            let trimmed = line.trim();
+            let closing = trimmed.chars().take_while(|ch| *ch == delimiter).count();
+            (fence_delimiter(line) == Some(delimiter)
+                && closing >= count
+                && trimmed[closing..].trim().is_empty())
+            .then_some(idx)
+        })
 }
 
 fn has_parseable_table(lines: &[&str], start: usize, end: usize) -> bool {
@@ -6069,10 +6859,19 @@ fn push_table_blocks<'a>(
     raw_lines: &'a [&'a str],
     start: usize,
     end: usize,
+    protected: &HashMap<usize, usize>,
 ) {
     let mut markdown_start = start;
     let mut i = start;
     while i < end {
+        if let Some(&block_end) = protected.get(&i) {
+            i = block_end.min(end);
+            continue;
+        }
+        if let Some(delimiter) = fence_delimiter(raw_lines[i]) {
+            i = find_fence_close(raw_lines, i, delimiter).map_or(end, |close| close + 1);
+            continue;
+        }
         let parsed = parse_markdown_table_block(raw_lines, i)
             .or_else(|| parse_ascii_table_block(raw_lines, i));
         if let Some((mut table, consumed)) = parsed
@@ -6097,7 +6896,59 @@ fn push_table_blocks<'a>(
 fn markdown_text(body: &str, base_style: Style, max_total_width: u16) -> Text<'static> {
     let sanitized = sanitize_display_text(body);
     let options = MarkdownOptions::new(DextMarkdownStyleSheet);
-    if !has_table_marker(&sanitized) {
+    let parser = pulldown_cmark::Parser::new(&sanitized);
+    let mut definitions = parser
+        .reference_definitions()
+        .iter()
+        .map(|(_, definition)| definition.span.clone())
+        .collect::<Vec<_>>();
+    definitions.sort_by_key(|range| range.start);
+    let definitions = definitions
+        .into_iter()
+        .map(|range| &sanitized[range])
+        .collect::<Vec<_>>()
+        .join("\n");
+    let line_offsets = std::iter::once(0)
+        .chain(sanitized.match_indices('\n').map(|(offset, _)| offset + 1))
+        .collect::<Vec<_>>();
+    let mut protected = HashMap::new();
+    let mut fences = HashMap::new();
+    let mut depth = 0usize;
+    for (event, range) in parser.into_offset_iter() {
+        match event {
+            pulldown_cmark::Event::Start(tag) => {
+                if depth == 0 {
+                    let start = line_offsets
+                        .partition_point(|&offset| offset <= range.start)
+                        .saturating_sub(1);
+                    let end = line_offsets.partition_point(|&offset| offset < range.end);
+                    if matches!(
+                        tag,
+                        pulldown_cmark::Tag::CodeBlock(_)
+                            | pulldown_cmark::Tag::List(_)
+                            | pulldown_cmark::Tag::BlockQuote(_)
+                            | pulldown_cmark::Tag::HtmlBlock
+                    ) {
+                        protected.insert(start, end);
+                    }
+                    if matches!(
+                        tag,
+                        pulldown_cmark::Tag::CodeBlock(pulldown_cmark::CodeBlockKind::Fenced(_))
+                    ) {
+                        fences.insert(start, end);
+                    }
+                }
+                depth += 1;
+            }
+            pulldown_cmark::Event::End(_) => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    if !has_table_marker(&sanitized)
+        && !sanitized
+            .lines()
+            .any(|line| fence_delimiter(line).is_some())
+    {
         return clean_markdown_text(hide_plain_text_code_fence_lines(
             text_to_static(from_str_with_options(&sanitized, &options)).style(base_style),
         ));
@@ -6109,39 +6960,111 @@ fn markdown_text(body: &str, base_style: Style, max_total_width: u16) -> Text<'s
     let mut i = 0usize;
 
     while i < raw_lines.len() {
-        if let Some(delim) = fence_delimiter(raw_lines[i]) {
-            if let Some(close) = find_fence_close(&raw_lines, i, delim) {
-                if markdown_table_fence_delimiter(raw_lines[i]).is_some()
+        if let Some(&end) = fences.get(&i)
+            && let Some(delim) = fence_delimiter(raw_lines[i])
+        {
+            if let Some(close) = find_fence_close(&raw_lines[..end.min(raw_lines.len())], i, delim)
+            {
+                if fence_info(raw_lines[i]).is_some_and(|(_, info)| {
+                    info.split_whitespace()
+                        .next()
+                        .is_some_and(|lang| lang.eq_ignore_ascii_case("mermaid"))
+                }) {
+                    push_table_blocks(&mut blocks, &raw_lines, markdown_start, i, &protected);
+                    blocks.push(EitherBlock::Diagram(&raw_lines[i + 1..close]));
+                } else if markdown_table_fence_delimiter(raw_lines[i]).is_some()
                     && has_parseable_table(&raw_lines, i + 1, close)
                 {
-                    push_table_blocks(&mut blocks, &raw_lines, markdown_start, i);
-                    push_table_blocks(&mut blocks, &raw_lines, i + 1, close);
+                    push_table_blocks(&mut blocks, &raw_lines, markdown_start, i, &protected);
+                    push_table_blocks(&mut blocks, &raw_lines, i + 1, close, &protected);
                 } else {
-                    push_table_blocks(&mut blocks, &raw_lines, markdown_start, i);
-                    blocks.push(EitherBlock::Markdown(&raw_lines[i..=close]));
+                    i = close + 1;
+                    continue;
                 }
                 i = close + 1;
                 markdown_start = i;
                 continue;
             }
-            push_table_blocks(&mut blocks, &raw_lines, markdown_start, i);
+            push_table_blocks(&mut blocks, &raw_lines, markdown_start, i, &protected);
             blocks.push(EitherBlock::Markdown(&raw_lines[i..]));
             markdown_start = raw_lines.len();
             break;
         }
 
-        i += 1;
+        i = protected.get(&i).copied().unwrap_or(i + 1);
     }
 
-    push_table_blocks(&mut blocks, &raw_lines, markdown_start, raw_lines.len());
+    push_table_blocks(
+        &mut blocks,
+        &raw_lines,
+        markdown_start,
+        raw_lines.len(),
+        &protected,
+    );
 
     let mut result_lines: Vec<Line<'static>> = Vec::new();
+    let mut pending_gap = false;
     for block in blocks {
+        if let EitherBlock::Markdown(lines) = &block {
+            if lines.iter().all(|line| line.trim().is_empty()) {
+                pending_gap |= !lines.is_empty();
+                continue;
+            }
+            pending_gap |= lines.first().is_some_and(|line| line.trim().is_empty());
+        }
+        if pending_gap
+            && result_lines
+                .last()
+                .is_some_and(|line| !rendered_line_text(line).trim().is_empty())
+        {
+            result_lines.push(Line::default());
+        }
+        pending_gap = false;
         match block {
             EitherBlock::Markdown(lines) => {
-                let joined = lines.join("\n");
+                pending_gap = lines.last().is_some_and(|line| line.trim().is_empty());
+                let joined = if definitions.is_empty() {
+                    lines.join("\n")
+                } else {
+                    format!("{definitions}\n\n{}", lines.join("\n"))
+                };
                 let rendered = text_to_static(from_str_with_options(&joined, &options));
-                result_lines.extend(rendered.style(base_style).lines);
+                result_lines.extend(
+                    clean_markdown_text(hide_plain_text_code_fence_lines(
+                        rendered.style(base_style),
+                    ))
+                    .lines,
+                );
+            }
+            EitherBlock::Diagram(source) => {
+                let source = source.join("\n");
+                match crate::diagram::render(&source, max_total_width as usize) {
+                    Ok(diagram) => result_lines.extend(diagram.into_iter().map(|row| {
+                        Line::from(
+                            row.into_iter()
+                                .map(|span| {
+                                    let style = match span.role {
+                                        crate::diagram::Role::Node => base_style.fg(Color::Cyan),
+                                        crate::diagram::Role::Edge => base_style.fg(Color::Blue),
+                                        crate::diagram::Role::Label => base_style,
+                                    };
+                                    Span::styled(span.text, style)
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                    })),
+                    Err(error) => {
+                        result_lines.push(Line::from(Span::styled(
+                            error.notice(),
+                            base_style.fg(Color::DarkGray),
+                        )));
+                        result_lines.extend(
+                            source
+                                .lines()
+                                .map(|line| Line::from(Span::styled(line.to_string(), base_style))),
+                        );
+                    }
+                }
             }
             EitherBlock::Table(table) => {
                 result_lines.extend(render_table_lines(
@@ -6153,11 +7076,12 @@ fn markdown_text(body: &str, base_style: Style, max_total_width: u16) -> Text<'s
         }
     }
 
-    clean_markdown_text(hide_plain_text_code_fence_lines(Text::from(result_lines)))
+    Text::from(result_lines)
 }
 
 enum EitherBlock<'a> {
     Markdown(&'a [&'a str]),
+    Diagram(&'a [&'a str]),
     Table(ParsedTable),
 }
 
@@ -6185,8 +7109,8 @@ fn push_prefixed_text(
             if remaining == 0 {
                 break;
             }
-            let content = strip_markdown_markers(span.content.as_ref());
-            let width = text_width(&content);
+            let content = span.content.into_owned();
+            let width = unicode_width::UnicodeWidthStr::width(content.as_str());
             if width <= remaining {
                 remaining = remaining.saturating_sub(width);
                 spans.push(Span::styled(content, span.style));
@@ -6350,6 +7274,121 @@ fn push_wrapped_spans_with_prefix(
 
         lines.push(Line::from(line_spans));
         first = false;
+    }
+}
+
+fn answer_live_markdown_text(body: &str, width: u16) -> Text<'static> {
+    use pulldown_cmark::{CodeBlockKind, Event, Parser, Tag};
+    let mut depth = 0usize;
+    for (event, range) in Parser::new(body).into_offset_iter() {
+        let top_level = depth == 0;
+        match &event {
+            Event::Start(_) => depth += 1,
+            Event::End(_) => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        if top_level
+            && let Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info))) = event
+            && info
+                .split_whitespace()
+                .next()
+                .is_some_and(|lang| lang.eq_ignore_ascii_case("mermaid"))
+        {
+            let block = &body[range.clone()];
+            let lines = block.lines().collect::<Vec<_>>();
+            let closed = lines
+                .first()
+                .and_then(|line| fence_delimiter(line))
+                .is_some_and(|delimiter| find_fence_close(&lines, 0, delimiter).is_some())
+                && (block.ends_with('\n') || body[range.end..].starts_with('\n'));
+            if !closed {
+                let mut text = answer_markdown_text(&body[..range.start], width);
+                text.lines.push(Line::from(Span::styled(
+                    "Diagram · drawing…",
+                    Style::default().fg(Color::DarkGray),
+                )));
+                return text;
+            }
+        }
+    }
+    answer_markdown_text(body, width)
+}
+
+fn answer_markdown_text(body: &str, width: u16) -> Text<'static> {
+    let mut text = markdown_text(body, Style::default(), width);
+    // Block slices retain the blank separator after the preceding block. An
+    // isolated Markdown parse would otherwise discard it as leading whitespace.
+    if body.starts_with('\n') && !body.trim().is_empty() {
+        text.lines.insert(0, Line::default());
+    }
+    text
+}
+
+fn push_answer_part(
+    lines: &mut Vec<Line<'static>>,
+    body: &str,
+    first: bool,
+    last: bool,
+    dim_prefix: bool,
+    width: u16,
+) {
+    if first {
+        lines.push(Line::from(vec![
+            Span::styled("┌─ ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "dext",
+                Style::default()
+                    .fg(if dim_prefix {
+                        Color::DarkGray
+                    } else {
+                        Color::Blue
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+    }
+    if !body.is_empty() {
+        let content_width = width.saturating_sub(2).max(1);
+        let text = answer_markdown_text(body, content_width);
+        let height = count_lines_by_width(&text, content_width);
+        let area = Rect::new(0, 0, content_width, height.min(ANSWER_ROW_LIMIT) as u16);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        Widget::render(
+            Paragraph::new(text.clone()).wrap(Wrap { trim: false }),
+            area,
+            &mut buffer,
+        );
+        let mut wrapped = buffer_to_lines(&buffer, area);
+        if height > ANSWER_ROW_LIMIT {
+            let marker = collect_wrapped_lines(
+                &Text::raw("[answer row display limit reached]"),
+                content_width,
+            );
+            let suffix = Text::from(text.lines[text.lines.len().saturating_sub(4)..].to_vec());
+            let mut tail = collect_wrapped_tail(&suffix, content_width, 0, 8);
+            if tail
+                .first()
+                .is_some_and(|line| rendered_line_text(line) == "…")
+            {
+                tail.remove(0);
+            }
+            wrapped.truncate(ANSWER_ROW_LIMIT.saturating_sub(marker.len() + tail.len()));
+            wrapped.extend(marker);
+            wrapped.extend(tail);
+        }
+        push_prefixed_text(
+            lines,
+            Text::from(wrapped),
+            "│ ",
+            Style::default().fg(Color::DarkGray),
+            width,
+        );
+    }
+    if last {
+        lines.push(Line::from(Span::styled(
+            "└",
+            Style::default().fg(Color::DarkGray),
+        )));
     }
 }
 
@@ -6751,6 +7790,26 @@ fn line_to_text(item: &Line_, width: u16) -> Text<'static> {
                 Style::default(),
                 width,
             );
+        }
+        Line_::AnswerPart {
+            text,
+            first,
+            last,
+            dim_prefix,
+            row_start,
+            row_end,
+            ..
+        } => {
+            let mut body = Vec::new();
+            push_answer_part(&mut body, text, false, false, *dim_prefix, width);
+            if *first {
+                push_answer_part(&mut lines, "", true, false, *dim_prefix, width);
+            }
+            let end = row_end.unwrap_or(body.len()).min(body.len());
+            lines.extend(body.into_iter().take(end).skip(*row_start));
+            if *last {
+                push_answer_part(&mut lines, "", false, true, *dim_prefix, width);
+            }
         }
         Line_::RuntimeView {
             pack,
@@ -7271,7 +8330,7 @@ fn line_to_text(item: &Line_, width: u16) -> Text<'static> {
                 ),
             ]));
         }
-        Line_::ThinkingGap { .. } => lines.push(Line::from("")),
+        Line_::ThinkingGap { .. } | Line_::AnswerGap { .. } => lines.push(Line::from("")),
         Line_::ThinkingUnit {
             text,
             section_start,
@@ -8011,7 +9070,45 @@ fn flush_pending_insert<B: Backend>(
     }
 }
 
+fn consolidate_progressive_answer_parts(items: Vec<Line_>) -> Vec<Line_> {
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        if let Line_::AnswerPart {
+            block_id,
+            text,
+            first: false,
+            last,
+            dim_prefix,
+            row_start,
+            row_end,
+        } = &item
+            && let Some(Line_::AnswerPart {
+                block_id: previous_id,
+                text: previous_text,
+                last: previous_last,
+                dim_prefix: previous_dim,
+                row_start: _,
+                row_end: previous_end,
+                ..
+            }) = out.last_mut()
+            && *previous_id == *block_id
+            && *previous_dim == *dim_prefix
+            && !*previous_last
+            && *previous_end == Some(*row_start)
+            && text.starts_with(previous_text.as_str())
+        {
+            previous_text.clone_from(text);
+            *previous_end = *row_end;
+            *previous_last = *last;
+        } else {
+            out.push(item);
+        }
+    }
+    out
+}
+
 fn prepare_pending_items(state: &mut TuiState, items: &mut Vec<Line_>) {
+    *items = consolidate_progressive_answer_parts(std::mem::take(items));
     *items = merge_consecutive_tools(std::mem::take(items));
     mark_retry_cycles(items);
     // Inline viewport output is real terminal scrollback: already-inserted lines cannot be
@@ -8062,6 +9159,8 @@ fn flush_prepared_items<B: Backend>(
     )?;
     state.tool_tint_parity = tool_tint_parity;
     state.transcript.append(items);
+    state.transcript = consolidate_progressive_answer_parts(std::mem::take(&mut state.transcript));
+    state.canonicalize_completed_answers();
     state.transcript_rendered_width = width;
     Ok(true)
 }
@@ -8129,9 +9228,30 @@ fn transcript_live_indicator_text(state: &TuiState, width: u16) -> Option<Text<'
         top.push(Span::styled("  ·  ", Style::default().fg(Color::DarkGray)));
         top.push(Span::styled(elapsed, Style::default().fg(Color::Yellow)));
     }
-    let mut lines = vec![Line::from(top)];
-    lines.extend(live_indicator_detail(state, width));
+    let status_line = Line::from(top);
+    let mut lines = live_indicator_detail(state, width);
+    if state.active_answer.is_some() {
+        lines.push(status_line);
+    } else {
+        lines.insert(0, status_line);
+    }
     Some(Text::from(lines))
+}
+
+fn cap_answer_live_lines(mut lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
+    const ANSWER_TAIL_ROWS: usize = 8;
+    if lines.len() <= ANSWER_TAIL_ROWS + 1 {
+        return lines;
+    }
+    let status = lines.pop();
+    let start = lines.len().saturating_sub(ANSWER_TAIL_ROWS - 1);
+    let mut tail = vec![Line::from(Span::styled(
+        "│ …",
+        Style::default().fg(Color::DarkGray),
+    ))];
+    tail.extend(lines.drain(start..));
+    tail.extend(status);
+    tail
 }
 
 fn cap_live_indicator_detail(mut lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
@@ -8191,6 +9311,106 @@ fn count_lines_by_width(text: &Text<'_>, width: u16) -> usize {
     text_visual_height(text, width) as usize
 }
 
+fn wrapped_tail_source(text: &Text<'static>, width: u16, max_rows: usize) -> Text<'static> {
+    let mut lines = Vec::new();
+    let mut rows = 0;
+    for line in text.lines.iter().rev() {
+        let mut line = line.clone();
+        let height = Paragraph::new(Text::from(line.clone()))
+            .wrap(Wrap { trim: false })
+            .line_count(width);
+        if height > u16::MAX as usize {
+            let mut cells = (max_rows + 2).saturating_mul(width as usize);
+            let mut spans = Vec::new();
+            for span in line.spans.iter().rev() {
+                let mut start = span.content.len();
+                for cluster in display_clusters(span.content.as_ref()).into_iter().rev() {
+                    if cluster.width > cells {
+                        break;
+                    }
+                    cells -= cluster.width;
+                    start = cluster.byte_start;
+                }
+                if start < span.content.len() {
+                    spans.push(Span::styled(span.content[start..].to_string(), span.style));
+                }
+                if start > 0 {
+                    break;
+                }
+            }
+            spans.reverse();
+            line.spans = spans;
+        }
+        rows += Paragraph::new(Text::from(line.clone()))
+            .wrap(Wrap { trim: false })
+            .line_count(width);
+        lines.push(line);
+        if rows >= max_rows {
+            break;
+        }
+    }
+    lines.reverse();
+    Text {
+        lines,
+        style: text.style,
+        alignment: text.alignment,
+    }
+}
+
+fn collect_wrapped_tail(
+    text: &Text<'static>,
+    width: u16,
+    skip: usize,
+    max_rows: usize,
+) -> Vec<Line<'static>> {
+    if width == 0 || max_rows == 0 {
+        return Vec::new();
+    }
+    let total = Paragraph::new(borrowed_text_lines(text, 0, text.lines.len()))
+        .wrap(Wrap { trim: false })
+        .line_count(width);
+    let start = skip.max(total.saturating_sub(max_rows));
+    let max_rows = total.saturating_sub(start).min(max_rows);
+    if start > u16::MAX as usize && max_rows > 0 {
+        let suffix = wrapped_tail_source(text, width, max_rows);
+        let suffix_total = Paragraph::new(borrowed_text_lines(&suffix, 0, suffix.lines.len()))
+            .wrap(Wrap { trim: false })
+            .line_count(width);
+        let mut rows = collect_wrapped_tail(&suffix, width, 0, max_rows);
+        if suffix_total > max_rows {
+            rows.remove(0);
+        }
+        if start > skip {
+            rows.insert(
+                0,
+                Line::from(Span::styled("…", Style::default().fg(Color::DarkGray))),
+            );
+        }
+        return rows;
+    }
+    let height = max_rows as u16;
+    if height == 0 {
+        return Vec::new();
+    }
+    let area = Rect::new(0, 0, width, height);
+    let mut buffer = ratatui::buffer::Buffer::empty(area);
+    Widget::render(
+        Paragraph::new(text.clone())
+            .wrap(Wrap { trim: false })
+            .scroll((start.min(u16::MAX as usize) as u16, 0)),
+        area,
+        &mut buffer,
+    );
+    let mut rows = buffer_to_lines(&buffer, area);
+    if start > skip {
+        rows.insert(
+            0,
+            Line::from(Span::styled("…", Style::default().fg(Color::DarkGray))),
+        );
+    }
+    rows
+}
+
 fn collect_wrapped_lines(text: &Text<'static>, width: u16) -> Vec<Line<'static>> {
     if width == 0 {
         return Vec::new();
@@ -8217,6 +9437,8 @@ fn render_transcript(frame: &mut ratatui::Frame, state: &mut TuiState, transcrip
             let lines = collect_wrapped_lines(text, content_width);
             if prompt_active {
                 cap_permission_prompt_lines(lines, transcript_area.height as usize)
+            } else if state.active_answer.is_some() {
+                cap_answer_live_lines(lines)
             } else {
                 cap_live_indicator_detail(lines)
             }
@@ -8225,6 +9447,10 @@ fn render_transcript(frame: &mut ratatui::Frame, state: &mut TuiState, transcrip
     if !live_lines.is_empty()
         && transcript_area.height as usize > live_lines.len()
         && state.last_line_needs_history_spacing()
+        && !state
+            .active_answer
+            .as_ref()
+            .is_some_and(|answer| answer.started)
     {
         live_lines.insert(0, Line::from(""));
     }
@@ -8253,22 +9479,25 @@ fn render_transcript(frame: &mut ratatui::Frame, state: &mut TuiState, transcrip
     }
 
     let live_height = live_indicator_lines.min(transcript_area.height as usize) as u16;
+    let live_start = if state.active_answer.is_some() && !prompt_active {
+        0
+    } else {
+        transcript_area.height.saturating_sub(live_height) as usize
+    };
     let live_area = Rect::new(
         content_area.x,
-        content_area
-            .y
-            .saturating_add(transcript_area.height.saturating_sub(live_height)),
+        content_area.y.saturating_add(live_start as u16),
         content_area.width,
         live_height,
     );
-    let text = Text::from(live_lines.clone());
+    let first_visible = live_lines.len().saturating_sub(live_height as usize);
+    let text = Text::from(live_lines[first_visible..].to_vec());
     render_widget_safe(
         frame,
         Paragraph::new(text).wrap(Wrap { trim: false }),
         live_area,
     );
 
-    let live_start = transcript_area.height.saturating_sub(live_height) as usize;
     state.set_transcript_layout(TranscriptLayoutState {
         transcript_area: content_area,
         input_area: state.input_area,
@@ -11521,7 +12750,9 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
         }
         if terminal_has_render_area(&terminal)? {
             let width = current_transcript_pane_width(&mut terminal, &state)?;
-            if state.thinking_visual_transaction_pending && width > 0 {
+            state.set_answer_width(width);
+            state.seal_answer_progress(false);
+            if state.visual_transaction_pending && width > 0 {
                 crossterm::execute!(terminal.backend_mut().inner, BeginSynchronizedUpdate)?;
                 let update = (|| {
                     if transcript_requires_rebuild(&state, width) {
@@ -11535,7 +12766,7 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
                 })();
                 let end = crossterm::execute!(terminal.backend_mut().inner, EndSynchronizedUpdate);
                 update.and(end)?;
-                state.thinking_visual_transaction_pending = false;
+                state.visual_transaction_pending = false;
             } else {
                 if transcript_requires_rebuild(&state, width) {
                     purge_and_rebuild_transcript(&mut terminal, &mut state, width)?;
@@ -12335,6 +13566,1033 @@ mod tests {
         }
     }
 
+    fn answer_test_state() -> TuiState {
+        let mut state = TuiState::new(
+            "test-model".into(),
+            100_000,
+            ".".into(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.agent_busy = true;
+        state
+    }
+
+    fn answer_parts(state: &TuiState) -> String {
+        state
+            .transcript
+            .iter()
+            .chain(&state.prepared_insert_retry)
+            .chain(&state.pending_insert)
+            .filter_map(|line| match line {
+                Line_::AnswerPart { text, .. } | Line_::Assistant { text, .. } => {
+                    Some(text.as_str())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn answer_review_stream_matches_canonical_styles_and_structure() {
+        let cases = [
+            "See [guide][g].\n\nAnother paragraph.\n\n[g]: https://example.com\n",
+            "- first item\n- second item\n\n  second paragraph in the second item\n\nOutside.\n",
+            "> quoted paragraph\n>\n> another paragraph\n\nOutside.\n",
+            "Heading\n======\n\nParagraph.\n",
+            "   ```mermaid\n   graph LR\n   A --> B\n   ```\n\nOutside.\n",
+            "    ```mermaid\n    graph LR\n    A --> B\n    ```\n\nOutside.\n",
+            "# Heading\n\n```rust\nlet x = 1;\n```\n# Next\n",
+            "first line\n\n    indented code\n\nlast line\n",
+            "<div>\ntext\n</div>\n\nOutside.\n",
+        ];
+        let mut failures = Vec::new();
+        for source in cases {
+            for width in [20, 60, 100] {
+                let mut state = answer_test_state();
+                state.transcript_rendered_width = width;
+                for ch in source.chars() {
+                    state.apply_event(AgentEvent::TextDelta(ch.to_string()));
+                    state.set_answer_width(width);
+                    state.transcript.append(&mut state.pending_insert);
+                    state.transcript =
+                        consolidate_progressive_answer_parts(std::mem::take(&mut state.transcript));
+                }
+                state.apply_event(AgentEvent::TextBlockComplete(source.into()));
+                let actual = state
+                    .transcript
+                    .iter()
+                    .chain(&state.pending_insert)
+                    .flat_map(|line| line_to_text(line, width - 1).lines)
+                    .collect::<Vec<_>>();
+                let mut expected = Vec::new();
+                push_answer_part(&mut expected, source, true, true, false, width - 1);
+                if actual != expected {
+                    failures.push(format!("source {source:?}, width {width}:\nactual {actual:?}\nexpected {expected:?}"));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn review_reference_injection_preserves_leading_markdown_metadata() {
+        let prefix = "---\ntitle: example\n---\n\nSee [guide][g].\n";
+        let definitions = "[g]: https://example.com";
+        let source = format!("{prefix}\n```mermaid\ngraph LR\nA --> B\n```\n\n{definitions}");
+        let expected = clean_markdown_text(hide_plain_text_code_fence_lines(text_to_static(
+            from_str_with_options(
+                &format!("{prefix}\n{definitions}"),
+                &MarkdownOptions::new(DextMarkdownStyleSheet),
+            ),
+        )));
+        let actual = markdown_text(&source, Style::default(), 100);
+        assert!(
+            actual.lines.starts_with(&expected.lines),
+            "{actual:?}\n{expected:?}"
+        );
+    }
+
+    #[test]
+    fn review_protected_markdown_regions_do_not_transform_code_or_break_neighbors() {
+        for source in [
+            "> quote\n>\n> ```mermaid\n> graph LR\n> X --> Y\n> ```\n\n```mermaid\ngraph LR\nA --> B\n```",
+            "    | Header | Code |\n    | --- | --- |\n    | not | a table |\n\n```mermaid\ngraph LR\nA --> B\n```",
+            "- item\n\n  ```rust\n  code\n  ```\n\n| Header | Value |\n| --- | --- |\n| test | ready |\n\n```mermaid\ngraph LR\nA --> B\n```",
+        ] {
+            let rows = flatten_lines(&markdown_text(source, Style::default(), 100)).join("\n");
+            assert_eq!(rows.matches('▶').count(), 1, "{rows}");
+            assert!(!rows.contains("graph LR\nA --> B"), "{rows}");
+        }
+        for source in [
+            "[g]: https://example.com\n\n```mermaid\ngraph LR\nA --> B\n```\n\n    indented code",
+            "[g]: https://example.com\n\n```mermaid\ngraph LR\nA --> B\n```\n\n<div>\nhtml data",
+        ] {
+            let rows = flatten_lines(&markdown_text(source, Style::default(), 100)).join("\n");
+            assert!(!rows.contains("https://example.com"), "{rows}");
+        }
+    }
+
+    #[test]
+    fn review_tail_rebasing_respects_near_end_skip() {
+        let text = Text::from(
+            (0..70_000)
+                .map(|index| Line::raw(format!("row {index}")))
+                .collect::<Vec<_>>(),
+        );
+        let rows = collect_wrapped_tail(&text, 20, 69_999, 8);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rendered_line_text(&rows[0]).trim_end(), "row 69999");
+        let mut text = text;
+        *text.lines.last_mut().unwrap() = Line::raw("…");
+        let rows = collect_wrapped_tail(&text, 20, 69_999, 8);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rendered_line_text(&rows[0]).trim_end(), "…");
+    }
+
+    #[test]
+    fn review_wrapped_tail_overflow_preserves_styles_wide_symbols_and_skip() {
+        let mut text = Text::from(vec![
+            Line::raw("row\n".repeat(70_000)),
+            Line::from(vec![
+                Span::styled("x ".repeat(70_000), Style::default().fg(Color::Green)),
+                Span::styled("終端42", Style::default().fg(Color::Red)),
+            ]),
+        ]);
+        for width in [2, 8, 20] {
+            let rows = collect_wrapped_tail(&text, width, 0, 8);
+            let joined = rows
+                .iter()
+                .map(rendered_line_text)
+                .collect::<String>()
+                .replace(' ', "");
+            assert!(joined.contains("終端42"), "{joined}");
+            assert!(
+                rows.iter()
+                    .flat_map(|row| &row.spans)
+                    .any(|span| span.style.fg == Some(Color::Red))
+            );
+            assert!(rows.len() <= 9);
+            assert!(
+                rows.iter()
+                    .all(|row| text_width(&rendered_line_text(row)) <= width as usize)
+            );
+        }
+        assert!(collect_wrapped_tail(&text, 2, 0, 0).is_empty());
+        let count = Paragraph::new(text.clone())
+            .wrap(Wrap { trim: false })
+            .line_count(2);
+        assert!(collect_wrapped_tail(&text, 2, count, 8).is_empty());
+        text.lines = (0..70_000)
+            .map(|index| Line::raw(format!("row {index}")))
+            .collect();
+        let rows = collect_wrapped_tail(&text, 20, 0, 8);
+        assert!(rendered_line_text(rows.last().unwrap()).contains("69999"));
+    }
+
+    #[test]
+    fn review_nested_fence_does_not_disable_unrelated_top_level_diagram() {
+        let source = "- item\n\n  ```rust\n  code\n  ```\n\n```mermaid\ngraph LR\nA --> B\n```";
+        let rows = flatten_lines(&markdown_text(source, Style::default(), 100)).join("\n");
+        assert!(rows.contains('▶'), "{rows}");
+        assert!(!rows.contains("graph LR"), "{rows}");
+    }
+
+    #[test]
+    fn review_indented_code_cannot_supply_a_mermaid_closing_fence() {
+        let source = "    ```\n\n```mermaid\ngraph LR\nA --> B\n```";
+        let rows = flatten_lines(&markdown_text(source, Style::default(), 100)).join("\n");
+        assert!(rows.contains('▶'), "{rows}");
+    }
+
+    #[test]
+    fn review_reference_definitions_are_not_appended_inside_open_code_fences() {
+        let source = "[g]: https://example.com\n\n```mermaid\ngraph LR\nA --> B\n```\n\n```rust\nvisible code";
+        let rows = flatten_lines(&markdown_text(source, Style::default(), 100)).join("\n");
+        assert!(rows.contains("visible code"));
+        assert!(!rows.contains("https://example.com"), "{rows}");
+    }
+
+    #[test]
+    fn review_answer_tail_keeps_true_end_after_more_than_u16_wrapped_rows() {
+        let body = format!("{}END42", "x ".repeat(80_000));
+        let mut rows = Vec::new();
+        push_answer_part(&mut rows, &body, true, true, false, 3);
+        let tail = rows
+            .iter()
+            .rev()
+            .take(20)
+            .rev()
+            .map(rendered_line_text)
+            .collect::<String>();
+        let tail = tail.replace("│ ", "").replace(' ', "");
+        assert!(tail.contains("END42"), "{tail}");
+    }
+
+    #[test]
+    fn answer_review_references_resolve_across_transformed_blocks() {
+        let source =
+            "See [guide][g].\n\n```mermaid\ngraph LR\nA --> B\n```\n\n[g]: https://example.com\n";
+        let rows = flatten_lines(&markdown_text(source, Style::default(), 100)).join("\n");
+        assert!(
+            rows.contains("See guide") && rows.contains("https://example.com"),
+            "{rows}"
+        );
+        assert!(!rows.contains("[guide][g]"));
+        assert!(rows.contains('▶'));
+    }
+
+    #[test]
+    fn answer_review_completion_limits_and_interrupt_markers_are_preserved() {
+        let huge = format!("{}é", "x".repeat(ANSWER_DISPLAY_CAP));
+        let display = bounded_answer_text(&huge, ContextMode::Standard);
+        assert!(display.contains("long answer line omitted"));
+        assert!(display.ends_with(ANSWER_DISPLAY_OMITTED));
+        let lines = "x\n".repeat(ANSWER_LINE_LIMIT + 1);
+        let display = bounded_answer_text(&lines, ContextMode::Standard);
+        assert_eq!(display.matches("x\n").count(), ANSWER_LINE_LIMIT);
+        assert!(display.ends_with(ANSWER_DISPLAY_OMITTED));
+        for source in [huge, lines] {
+            let mut state = answer_test_state();
+            state.apply_event(AgentEvent::TextDelta(source));
+            state.apply_event(AgentEvent::Interrupted);
+            let parts = answer_parts(&state);
+            assert!(parts.contains("preserved partial response"));
+            assert!(parts.contains("answer display limit reached"));
+        }
+        let source = format!(
+            "<tool_call>\n{}\nsecret payload\n</tool_call>\n\nSafe.",
+            "x".repeat(THINKING_LINE_DISPLAY_BYTES + 1)
+        );
+        let display = bounded_answer_text(&source, ContextMode::Frugal);
+        assert!(!display.contains("secret payload"));
+        assert!(display.contains("Safe."));
+    }
+
+    #[test]
+    fn answer_review_row_limit_is_explicit_not_silent_truncation() {
+        let body = format!(
+            "{}\n\n[stream ended early; preserved partial response]",
+            "word ".repeat(10_000)
+        );
+        let mut rows = Vec::new();
+        push_answer_part(&mut rows, &body, true, true, false, 8);
+        assert_eq!(rows.len(), ANSWER_ROW_LIMIT + 2);
+        let notice = rows
+            .iter()
+            .skip(ANSWER_ROW_LIMIT - 24)
+            .take(25)
+            .map(|row| {
+                rendered_line_text(row)
+                    .trim_start_matches("│ ")
+                    .trim()
+                    .to_string()
+            })
+            .collect::<String>();
+        assert!(
+            notice.contains("rowdisplaylimitreached")
+                || notice.contains("row display limit reached"),
+            "{notice}"
+        );
+        assert!(
+            notice.replace(' ', "").contains("preservedpartialresponse"),
+            "{notice}"
+        );
+        assert_eq!(rendered_line_text(rows.last().unwrap()), "└");
+    }
+
+    #[test]
+    fn answer_review_nested_fences_preserve_markdown_context() {
+        let source = "- before\n\n  ```rust\n  code\n  ```\n\n  after\n\n- next\n";
+        let expected = clean_markdown_text(hide_plain_text_code_fence_lines(text_to_static(
+            from_str_with_options(source, &MarkdownOptions::new(DextMarkdownStyleSheet)),
+        )));
+        let actual = markdown_text(source, Style::default(), 80);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn answer_review_indented_mermaid_is_code_not_diagram() {
+        let source = "    ```mermaid\n    graph LR\n    A --> B\n    ```";
+        let rows = flatten_lines(&markdown_text(source, Style::default(), 100)).join("\n");
+        assert!(rows.contains("graph LR"), "{rows}");
+        assert!(!rows.contains('▶'), "{rows}");
+    }
+
+    #[test]
+    fn answer_stream_waits_for_real_line_endings_not_parser_eof() {
+        let mut state = answer_test_state();
+        state.apply_event(AgentEvent::TextDelta("# Work in".into()));
+        assert!(state.pending_insert.is_empty());
+        state.apply_event(AgentEvent::TextDelta(" progress\n\nNext".into()));
+        assert_eq!(answer_parts(&state).trim(), "# Work in progress");
+        assert_eq!(answer_stable_end("---"), 0);
+        let mut state = answer_test_state();
+        state.apply_event(AgentEvent::TextDelta(
+            "```mermaid\ngraph LR\nA --> B\n```".into(),
+        ));
+        assert!(state.pending_insert.is_empty());
+        state.apply_event(AgentEvent::TextDelta("not a closer\n".into()));
+        assert!(state.pending_insert.is_empty());
+        state.apply_event(AgentEvent::TextDelta("```\n\nDone".into()));
+        assert!(answer_parts(&state).contains("not a closer"));
+    }
+
+    #[test]
+    fn answer_snapshot_only_blocks_are_provisional_and_estimates_roll_back() {
+        let mut state = answer_test_state();
+        state.history_chars = 100;
+        state.apply_event(AgentEvent::TextDelta("accepted".into()));
+        state.apply_event(AgentEvent::TextBlockComplete("accepted".into()));
+        state.commit_answer_preview();
+        state.apply_event(AgentEvent::TextBlockComplete(
+            "snapshot without deltas".into(),
+        ));
+        state.apply_event(AgentEvent::TextDelta("discarded".into()));
+        state.apply_event(AgentEvent::TextBlockComplete("discarded".into()));
+        state.apply_event(AgentEvent::HttpRetry {
+            attempt: 1,
+            wait_secs: 1,
+            reason: "test retry".into(),
+        });
+        assert_eq!(answer_parts(&state), "accepted");
+        assert_eq!(state.history_chars, 108);
+        assert_eq!(state.provisional_answer_chars, 0);
+    }
+
+    #[test]
+    fn answer_redaction_expansion_is_bounded_and_limit_survives_resize() {
+        let mut state = answer_test_state();
+        let raw = "to=functions.bash\n".repeat(100_000);
+        assert!(raw.len() < ANSWER_DISPLAY_CAP);
+        state.apply_event(AgentEvent::TextDelta(raw));
+        let active = state.active_answer.as_ref().unwrap();
+        assert!(active.exhausted);
+        assert!(active.visible.len() <= ANSWER_DISPLAY_CAP + ANSWER_DISPLAY_OMITTED.len());
+        assert_eq!(
+            active
+                .visible
+                .matches("answer display limit reached")
+                .count(),
+            1
+        );
+        state.set_answer_width(80);
+        state.set_answer_width(100);
+        assert!(state.active_answer.as_ref().unwrap().exhausted);
+        assert!(
+            state
+                .active_answer
+                .as_ref()
+                .unwrap()
+                .visible
+                .ends_with(ANSWER_DISPLAY_OMITTED)
+        );
+    }
+
+    #[test]
+    fn answer_consolidation_preserves_intervening_history_order() {
+        let mut state = answer_test_state();
+        state.transcript_rendered_width = 42;
+        let source = "ordinary prose words ".repeat(80);
+        state.apply_event(AgentEvent::TextDelta(source.clone()));
+        state.set_answer_width(42);
+        state.transcript.append(&mut state.pending_insert);
+        state.queue(Line_::Warn("intervening warning".into()));
+        state.apply_event(AgentEvent::TextBlockComplete(source.clone()));
+        state.set_answer_width(80);
+        let lines = state
+            .transcript
+            .iter()
+            .chain(&state.pending_insert)
+            .collect::<Vec<_>>();
+        let warning = lines
+            .iter()
+            .position(|line| matches!(line, Line_::Warn(_)))
+            .unwrap();
+        let answer = lines
+            .iter()
+            .position(|line| matches!(line, Line_::AnswerPart { .. }))
+            .unwrap();
+        assert!(warning < answer);
+        assert_eq!(answer_parts(&state), source);
+    }
+
+    #[test]
+    fn answer_progressive_snapshots_coalesce_in_history() {
+        let mut state = answer_test_state();
+        state.transcript_rendered_width = 42;
+        for _ in 0..30 {
+            state.apply_event(AgentEvent::TextDelta("ordinary prose words ".repeat(3)));
+            state.set_answer_width(42);
+            state.transcript.append(&mut state.pending_insert);
+            state.transcript =
+                consolidate_progressive_answer_parts(std::mem::take(&mut state.transcript));
+        }
+        assert_eq!(
+            state
+                .transcript
+                .iter()
+                .filter(|line| matches!(line, Line_::AnswerPart { .. }))
+                .count(),
+            1
+        );
+        let active = state.active_answer.as_ref().unwrap();
+        assert!(active.started);
+        assert!(!active.progressive_rows.is_empty());
+    }
+
+    #[test]
+    fn answer_live_tail_rasterizes_only_the_bounded_suffix() {
+        let text = Text::from(
+            (0..10_000)
+                .map(|i| Line::raw(format!("row {i}")))
+                .collect::<Vec<_>>(),
+        );
+        let rows = collect_wrapped_tail(&text, 8, 0, 7);
+        assert_eq!(rows.len(), 8);
+        assert!(rendered_line_text(rows.last().unwrap()).contains("9999"));
+        assert!(rendered_line_text(&rows[0]).contains('…'));
+    }
+
+    #[test]
+    fn answer_rendered_history_and_live_tail_match_one_markdown_surface() {
+        for width in [60, 100, 160] {
+            let mut state = answer_test_state();
+            state.transcript_rendered_width = width;
+            let source = format!(
+                "# Review\n\nFirst paragraph.\n\n{}",
+                "The second paragraph continues across the available terminal columns. ".repeat(8)
+            );
+            for delta in source.as_bytes().chunks(17) {
+                state.apply_event(AgentEvent::TextDelta(
+                    String::from_utf8(delta.to_vec()).unwrap(),
+                ));
+                state.set_answer_width(width);
+                state.transcript.append(&mut state.pending_insert);
+                state.transcript =
+                    consolidate_progressive_answer_parts(std::mem::take(&mut state.transcript));
+            }
+            let render_width = transcript_render_width(width);
+            let mut actual = state
+                .transcript
+                .iter()
+                .flat_map(|line| flatten_lines(&line_to_text(line, render_width)))
+                .collect::<Vec<_>>();
+            actual.extend(
+                live_indicator_detail(&state, render_width)
+                    .iter()
+                    .map(rendered_line_text),
+            );
+            let mut expected = Vec::new();
+            push_answer_part(&mut expected, &source, true, false, false, render_width);
+            let expected = expected.iter().map(rendered_line_text).collect::<Vec<_>>();
+            assert_eq!(actual, expected, "history/live seam at width {width}");
+            let screen = draw_to_lines(width, VIEWPORT_HEIGHT, &mut state);
+            assert!(
+                !screen[0].trim().is_empty(),
+                "live answer detached from history: {screen:?}"
+            );
+            assert_eq!(state.live_indicator_top_padding, 0);
+        }
+    }
+
+    #[test]
+    fn mixed_answer_stream_matches_final_render_at_every_width() {
+        let source = "# Findings\n\nIntro paragraph.\n\n- First finding with **emphasis**\n- Second finding\n\n```rust\nfn main() {\n    println!(\"ready\");\n}\n```\n\n| Field | Value |\n| --- | --- |\n| State | Ready |\n\n```mermaid\nflowchart LR\nA[Check] --> B[Done]\n```\n\nFinal paragraph.";
+        for width in [60, 100, 160] {
+            let mut state = answer_test_state();
+            state.transcript_rendered_width = width;
+            for delta in source.as_bytes().chunks(17) {
+                state.apply_event(AgentEvent::TextDelta(
+                    String::from_utf8(delta.to_vec()).unwrap(),
+                ));
+                state.set_answer_width(width);
+                state.transcript.append(&mut state.pending_insert);
+                state.transcript =
+                    consolidate_progressive_answer_parts(std::mem::take(&mut state.transcript));
+            }
+            state.apply_event(AgentEvent::TextBlockComplete(source.into()));
+            let actual = state
+                .transcript
+                .iter()
+                .chain(&state.pending_insert)
+                .flat_map(|line| flatten_lines(&line_to_text(line, width - 1)))
+                .collect::<Vec<_>>();
+            let expected = flatten_lines(&line_to_text(
+                &Line_::Assistant {
+                    text: source.into(),
+                    dim_prefix: false,
+                },
+                width - 1,
+            ));
+            assert_eq!(actual, expected, "mixed streaming width {width}");
+        }
+    }
+
+    #[test]
+    fn live_mermaid_waits_without_flashing_source_and_final_fallback_retains_it() {
+        let mut state = answer_test_state();
+        state.apply_event(AgentEvent::TextDelta(
+            "```mermaid\nflowchart LR\nA[Check] --> B[Done]\n".into(),
+        ));
+        let live = flatten_lines(&transcript_live_indicator_text(&state, 80).unwrap()).join("\n");
+        assert!(live.contains("drawing"), "{live}");
+        assert!(
+            !live.contains("flowchart") && !live.contains("A[Check]"),
+            "{live}"
+        );
+        state.apply_event(AgentEvent::TextDelta("```\n\nNext".into()));
+        let history = state
+            .pending_insert
+            .iter()
+            .flat_map(|line| flatten_lines(&line_to_text(line, 80)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            history.contains('▶') && history.contains("Check"),
+            "{history}"
+        );
+        let final_text = markdown_text("```mermaid\nunsupported family\n```", Style::default(), 80);
+        assert!(
+            flatten_lines(&final_text)
+                .join("\n")
+                .contains("unsupported family")
+        );
+    }
+
+    #[test]
+    fn streamed_answer_uses_real_inline_backend_without_duplicate_completion() {
+        use ratatui::backend::TestBackend;
+        for width in [60, 100, 160] {
+            let mut terminal = Terminal::with_options(
+                TestBackend::new(width, 28),
+                TerminalOptions {
+                    viewport: Viewport::Inline(VIEWPORT_HEIGHT),
+                },
+            )
+            .unwrap();
+            let mut state = answer_test_state();
+            let source = format!(
+                "# Result\n\n{}\n\nFinal marker.",
+                "One two three four five six seven eight nine ten. ".repeat(12)
+            );
+            for chunk in source.as_bytes().chunks(31) {
+                state.apply_event(AgentEvent::TextDelta(
+                    String::from_utf8(chunk.to_vec()).unwrap(),
+                ));
+                state.set_answer_width(width);
+                flush_pending_insert(&mut terminal, &mut state, width).unwrap();
+                terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+                assert!(
+                    !state.transcript_needs_rebuild,
+                    "ordinary streaming rebuilt at {width}"
+                );
+            }
+            state.apply_event(AgentEvent::TextBlockComplete(source.clone()));
+            flush_pending_insert(&mut terminal, &mut state, width).unwrap();
+            state.agent_busy = false;
+            terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+            let backend = terminal.backend();
+            let rendered = [backend.scrollback(), backend.buffer()]
+                .into_iter()
+                .flat_map(|buffer| {
+                    buffer_to_lines(buffer, buffer.area)
+                        .into_iter()
+                        .map(|line| rendered_line_text(&line))
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert_eq!(rendered.matches("┌─ dext").count(), 1, "{rendered}");
+            assert_eq!(rendered.matches("Final marker.").count(), 1, "{rendered}");
+            assert_eq!(answer_parts(&state), source);
+        }
+    }
+
+    #[test]
+    fn wide_tables_use_available_columns_without_fixed_cell_caps() {
+        let body = format!(
+            "| Item | Details |\n| --- | --- |\n| Test | {} |",
+            "readable content ".repeat(7)
+        );
+        let source = body.lines().collect::<Vec<_>>();
+        let (table, _) = parse_markdown_table_block(&source, 0).unwrap();
+        let (narrow, _) = table_grid_widths(&table, 60).unwrap();
+        let (wide, _) = table_grid_widths(&table, 160).unwrap();
+        assert!(wide[1] > 80, "{wide:?}");
+        assert!(wide[1] > narrow[1]);
+        for width in [60, 100, 160] {
+            let text = markdown_text(&body, Style::default(), width);
+            assert!(
+                flatten_lines(&text)
+                    .iter()
+                    .all(
+                        |row| unicode_width::UnicodeWidthStr::width(row.as_str()) <= width as usize
+                    )
+            );
+        }
+    }
+
+    #[test]
+    fn answer_stream_hands_stable_markdown_to_history_without_duplicate_cards() {
+        let mut state = answer_test_state();
+        let first = "First **paragraph**.\n\n";
+        state.apply_event(AgentEvent::TextDelta(first.into()));
+        state.apply_event(AgentEvent::TextDelta("Second unfinished".into()));
+        assert_eq!(answer_parts(&state).trim(), first.trim());
+        let live = flatten_lines(&transcript_live_indicator_text(&state, 80).unwrap()).join("\n");
+        assert!(live.contains("Second unfinished"), "{live}");
+        assert!(!live.contains("First"), "{live}");
+        assert!(!live.contains("┌─ dext"), "{live}");
+        let full = format!("{first}Second unfinished paragraph.");
+        state.apply_event(AgentEvent::TextBlockComplete(full.clone()));
+        assert_eq!(answer_parts(&state), full);
+        let rendered = state
+            .pending_insert
+            .iter()
+            .flat_map(|line| flatten_lines(&line_to_text(line, 80)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(rendered.matches("┌─ dext").count(), 1, "{rendered}");
+        assert_eq!(
+            rendered.lines().filter(|line| *line == "└").count(),
+            1,
+            "{rendered}"
+        );
+        assert!(state.visual_transaction_pending);
+    }
+
+    #[test]
+    fn answer_stream_holds_tables_lists_and_incomplete_diagrams() {
+        let mut state = answer_test_state();
+        state.apply_event(AgentEvent::TextDelta(
+            "Intro.\n\n| Name | State |\n| --- | --- |\n| A | Ready |\n".into(),
+        ));
+        assert_eq!(answer_parts(&state).trim(), "Intro.");
+        state.apply_event(AgentEvent::TextDelta(
+            "| Longer name | Running |\n\n```mermaid\nflowchart LR\nA[Start] --> B[Done]\n".into(),
+        ));
+        assert!(answer_parts(&state).contains("Longer name"));
+        assert!(!answer_parts(&state).contains("mermaid"));
+        state.apply_event(AgentEvent::TextDelta("```\n\nAfter diagram".into()));
+        assert!(answer_parts(&state).contains("mermaid"));
+        let rendered = state
+            .pending_insert
+            .iter()
+            .flat_map(|line| flatten_lines(&line_to_text(line, 100)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("Start"));
+        assert!(rendered.contains('▶'), "{rendered}");
+        assert!(!rendered.contains("flowchart LR"), "{rendered}");
+        assert_eq!(answer_stable_end("- first\n- second\n"), 0);
+    }
+
+    #[test]
+    fn answer_empty_completion_and_mismatch_remove_pending_retry_and_history() {
+        for replacement in ["", "Corrected answer."] {
+            let mut state = answer_test_state();
+            state.apply_event(AgentEvent::TextDelta("Incorrect.\n\nNext".into()));
+            state.transcript.append(&mut state.pending_insert);
+            state.apply_event(AgentEvent::TextBlockComplete(replacement.into()));
+            assert_eq!(answer_parts(&state), replacement);
+            assert!(state.transcript_needs_rebuild);
+            assert!(state.active_answer.is_none());
+        }
+    }
+
+    #[test]
+    fn answer_retry_discard_keeps_committed_answers_and_thinking_independent() {
+        let mut state = answer_test_state();
+        state.apply_event(AgentEvent::TextDelta("Committed.\n\nDone".into()));
+        state.apply_event(AgentEvent::TextBlockComplete("Committed.\n\nDone".into()));
+        state.commit_answer_preview();
+        state.apply_event(AgentEvent::TextDelta("Discard.\n\nTail".into()));
+        state.transcript.append(&mut state.pending_insert);
+        state.apply_event(AgentEvent::ThinkingDelta("thought\nopen".into()));
+        state.apply_event(AgentEvent::HttpRetry {
+            attempt: 1,
+            wait_secs: 1,
+            reason: "test retry".into(),
+        });
+        assert_eq!(answer_parts(&state), "Committed.\n\nDone");
+        assert!(state.active_thinking.is_none());
+        assert!(state.streaming_text.is_empty());
+        assert!(state.transcript_needs_rebuild);
+    }
+
+    #[test]
+    fn answer_interrupt_retains_partial_content_and_closes_the_card_once() {
+        let mut state = answer_test_state();
+        state.apply_event(AgentEvent::TextDelta("Visible.\n\nPartial tail".into()));
+        state.apply_event(AgentEvent::Interrupted);
+        let parts = answer_parts(&state);
+        assert!(parts.contains("Visible."));
+        assert!(parts.contains("Partial tail"));
+        assert_eq!(parts.matches("preserved partial response").count(), 1);
+        assert!(state.active_answer.is_none());
+        assert!(!state.agent_busy);
+    }
+
+    #[test]
+    fn answer_privacy_filter_survives_delta_and_history_boundaries() {
+        let mut state = answer_test_state();
+        state.context_mode = ContextMode::Frugal;
+        for delta in [
+            "Before.\n\n<tool_",
+            "call>\n{\n\"command\":\"secret operation\"\n",
+            "}\n</tool_call>\n\nAfter.\n\nTail",
+        ] {
+            state.apply_event(AgentEvent::TextDelta(delta.into()));
+        }
+        let displayed = format!(
+            "{}\n{}",
+            answer_parts(&state),
+            flatten_lines(&transcript_live_indicator_text(&state, 80).unwrap()).join("\n")
+        );
+        assert!(displayed.contains("Before."));
+        assert!(displayed.contains("After."));
+        assert!(!displayed.contains("secret operation"), "{displayed}");
+        assert!(!displayed.contains("\"command\""), "{displayed}");
+    }
+
+    #[test]
+    fn answer_partitioning_is_independent_of_provider_delta_boundaries() {
+        let full =
+            "# Result\n\nFirst paragraph.\n\n```mermaid\nflowchart TD\nA --> B\n```\n\nLast line.";
+        for step in [1, 7, 29, full.len()] {
+            let mut state = answer_test_state();
+            for chunk in full.as_bytes().chunks(step) {
+                state.apply_event(AgentEvent::TextDelta(
+                    String::from_utf8(chunk.to_vec()).unwrap(),
+                ));
+            }
+            state.apply_event(AgentEvent::TextBlockComplete(full.into()));
+            assert_eq!(answer_parts(&state), full, "step {step}");
+            assert!(
+                !state.transcript_needs_rebuild,
+                "unnecessary reconciliation at step {step}"
+            );
+        }
+    }
+
+    #[test]
+    fn answer_progressive_rows_finish_once_and_replay_from_canonical_source() {
+        let mut state = answer_test_state();
+        state.transcript_rendered_width = 42;
+        let source = (0..60).map(|i| format!("word{i:02} ")).collect::<String>();
+        state.apply_event(AgentEvent::TextDelta(source.clone()));
+        state.set_answer_width(42);
+        let active = state.active_answer.as_ref().unwrap();
+        assert!(!active.progressive_rows.is_empty());
+        assert_eq!(active.sealed_bytes, 0);
+        state.transcript.append(&mut state.pending_insert);
+        let final_source = format!("{source}complete.");
+        state.apply_event(AgentEvent::TextBlockComplete(final_source.clone()));
+        let rows = state
+            .transcript
+            .iter()
+            .chain(&state.pending_insert)
+            .flat_map(|line| flatten_lines(&line_to_text(line, 41)))
+            .collect::<Vec<_>>();
+        let expected = flatten_lines(&line_to_text(
+            &Line_::Assistant {
+                text: final_source.clone(),
+                dim_prefix: false,
+            },
+            41,
+        ));
+        assert_eq!(rows, expected);
+        assert!(!state.transcript_needs_rebuild);
+        state.transcript.append(&mut state.pending_insert);
+        state.canonicalize_completed_answers();
+        assert_eq!(answer_parts(&state), final_source);
+        assert_eq!(
+            state
+                .transcript
+                .iter()
+                .filter(|line| matches!(line, Line_::AnswerPart { .. }))
+                .count(),
+            1
+        );
+        for width in [25, 100] {
+            let actual = state
+                .transcript
+                .iter()
+                .flat_map(|line| flatten_lines(&line_to_text(line, width)))
+                .collect::<Vec<_>>();
+            let expected = flatten_lines(&line_to_text(
+                &Line_::Assistant {
+                    text: final_source.clone(),
+                    dim_prefix: false,
+                },
+                width,
+            ));
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn answer_progressive_rows_reconcile_corrections_and_resize_before_flush() {
+        for corrected in [false, true] {
+            let mut state = answer_test_state();
+            state.transcript_rendered_width = 42;
+            let source = "the quick brown fox follows the river into the forest ".repeat(12);
+            state.apply_event(AgentEvent::TextDelta(source.clone()));
+            state.set_answer_width(42);
+            state.transcript.append(&mut state.pending_insert);
+            let full = if corrected {
+                "Corrected authoritative answer.".to_string()
+            } else {
+                format!("{source}Done.")
+            };
+            state.apply_event(AgentEvent::TextBlockComplete(full.clone()));
+            state.set_answer_width(80);
+            assert_eq!(answer_parts(&state), full);
+            assert!(state.transcript_needs_rebuild || !corrected);
+        }
+    }
+
+    #[test]
+    fn answer_correction_handles_changed_utf8_boundaries_after_progressive_history() {
+        let mut state = answer_test_state();
+        state.transcript_rendered_width = 42;
+        state.apply_event(AgentEvent::TextDelta(format!(
+            "a\n\n{}",
+            "prose words ".repeat(80)
+        )));
+        state.set_answer_width(42);
+        let active = state.active_answer.as_ref().unwrap();
+        assert!(!active.progressive_rows.is_empty());
+        let offset = active.sealed_bytes;
+        let replacement = format!("{}é corrected answer", "x".repeat(offset - 1));
+        assert!(!replacement.is_char_boundary(offset));
+        state.transcript.append(&mut state.pending_insert);
+        state.apply_event(AgentEvent::TextBlockComplete(replacement.clone()));
+        assert_eq!(answer_parts(&state), replacement);
+        assert!(state.transcript_needs_rebuild);
+    }
+
+    #[test]
+    fn answer_stream_normalizes_crlf_and_bounds_hostile_display_input() {
+        let mut state = answer_test_state();
+        for delta in ["first\r", "\n\r", "\nsecond"] {
+            state.apply_event(AgentEvent::TextDelta(delta.into()));
+        }
+        assert!(answer_parts(&state).contains("first"));
+        let live = flatten_lines(&transcript_live_indicator_text(&state, 80).unwrap()).join("\n");
+        assert!(live.contains("second"));
+        let mut state = answer_test_state();
+        state.context_mode = ContextMode::Frugal;
+        state.apply_event(AgentEvent::TextDelta(format!(
+            "<tool_call>\n{}\nsecret payload\n</tool_call>\n\nSafe.\n\nTail",
+            "x".repeat(THINKING_LINE_DISPLAY_BYTES + 1)
+        )));
+        let visible = format!(
+            "{}\n{}",
+            answer_parts(&state),
+            state.active_answer.as_ref().unwrap().visible
+        );
+        assert!(!visible.contains("secret payload"));
+        assert!(visible.contains("Safe."));
+        state.apply_event(AgentEvent::TextDelta(
+            "x\n".repeat(ANSWER_DISPLAY_CAP / 2 + 1),
+        ));
+        assert!(state.streaming_text.len() <= ANSWER_DISPLAY_CAP);
+        assert!(state.active_answer.as_ref().unwrap().exhausted);
+        assert!(state.active_answer.as_ref().unwrap().visible.len() <= ANSWER_DISPLAY_CAP + 256);
+    }
+
+    #[test]
+    fn review_nested_live_mermaid_preserves_surrounding_markdown() {
+        for source in [
+            "- item\n\n  ```mermaid\n  graph LR\n  A --> B\n",
+            "> intro\n>\n> ```mermaid\n> graph LR\n> A --> B\n",
+        ] {
+            let expected = answer_markdown_text(source, 80);
+            let actual = answer_live_markdown_text(source, 80);
+            assert_eq!(
+                actual, expected,
+                "nested Mermaid was not an eligible diagram"
+            );
+        }
+    }
+
+    #[test]
+    fn review_supplied_architectures_stream_complete_and_replay_without_source_fallback() {
+        let source = format!(
+            "# Architecture\n\n```mermaid\n{}\n```\n\n```mermaid\n{}\n```\n\nFinal marker.",
+            crate::diagram::COMPONENTS_FIXTURE,
+            crate::diagram::DEPLOYMENT_FIXTURE
+        );
+        for width in [83, 103, 163, 243] {
+            let mut state = answer_test_state();
+            state.transcript_rendered_width = width;
+            for delta in source.as_bytes().chunks(31) {
+                state.apply_event(AgentEvent::TextDelta(
+                    String::from_utf8(delta.to_vec()).unwrap(),
+                ));
+                state.set_answer_width(width);
+                state.transcript.append(&mut state.pending_insert);
+                state.transcript =
+                    consolidate_progressive_answer_parts(std::mem::take(&mut state.transcript));
+            }
+            state.apply_event(AgentEvent::TextBlockComplete(source.clone()));
+            let actual = state
+                .transcript
+                .iter()
+                .chain(&state.pending_insert)
+                .flat_map(|line| line_to_text(line, width - 1).lines)
+                .collect::<Vec<_>>();
+            let expected = line_to_text(
+                &Line_::Assistant {
+                    text: source.clone(),
+                    dim_prefix: false,
+                },
+                width - 1,
+            )
+            .lines;
+            assert_eq!(actual, expected, "streaming mismatch at {width}");
+            let rendered = actual
+                .iter()
+                .map(rendered_line_text)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(!rendered.contains("Mermaid source"), "{rendered}");
+            assert_eq!(rendered.matches(['▶', '◀', '▲', '▼']).count(), 26);
+            assert!(actual.iter().all(|line| line.width() < width as usize));
+            state.commit_answer_preview();
+            state.transcript.append(&mut state.pending_insert);
+            state.canonicalize_completed_answers();
+            let item = state.transcript.last().unwrap().clone();
+            for replay_width in [163, 83, 243] {
+                let replay = cached_transcript_render(&mut state, &item, replay_width).0;
+                let rows = flatten_lines(&replay).join("\n");
+                assert!(!rows.contains("Mermaid source"), "{rows}");
+                assert_eq!(rows.matches(['▶', '◀', '▲', '▼']).count(), 26);
+            }
+            assert!(matches!(&item, Line_::AnswerPart { text, .. } if text == &source));
+        }
+    }
+
+    #[test]
+    fn mermaid_fences_are_themed_and_fall_back_without_discarding_source() {
+        let body = "Before\n\n````Mermaid\nflowchart LR\nA[Start] --> B[Done]\n````\n\nAfter";
+        let text = markdown_text(body, Style::default(), 100);
+        let rendered = flatten_lines(&text).join("\n");
+        assert!(rendered.contains("Before") && rendered.contains("After"));
+        assert!(rendered.contains('▶'), "{rendered}");
+        assert!(!rendered.contains("flowchart"), "{rendered}");
+        assert!(
+            text.lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.style.fg == Some(Color::Cyan))
+        );
+        let narrow = flatten_lines(&markdown_text(body, Style::default(), 6)).join("\n");
+        assert!(narrow.contains("does not fit"), "{narrow}");
+        assert!(narrow.contains("A[Start] --> B[Done]"), "{narrow}");
+        let unsupported = flatten_lines(&markdown_text(
+            "```mermaid\npie\nDogs: 4\n```",
+            Style::default(),
+            80,
+        ))
+        .join("\n");
+        assert!(unsupported.contains("unsupported syntax"));
+        assert!(unsupported.contains("Dogs: 4"));
+        let incomplete = flatten_lines(&markdown_text(
+            "```mermaid\nflowchart LR\nA --> B",
+            Style::default(),
+            80,
+        ))
+        .join("\n");
+        assert!(incomplete.contains("flowchart LR"), "{incomplete}");
+    }
+
+    #[test]
+    fn mermaid_zoom_replay_reflows_and_restores_horizontal_source() {
+        let mut state = answer_test_state();
+        let source = "```mermaid\nflowchart LR\nV[\"view line 0+64\"] -->|\"zoom(0,64)\"| A[\"0+32, 32+32\"]\nA -->|\"zoom(32,32)\"| B[\"32+16, 48+16\"]\nB -->|\"3 more zooms\"| C[\"40+2, 42+2\"]\nC -->|\"zoom(40,2)\"| D[\"40+1, 41+1\"]\nD -->|\"zoom(41,1)\"| E[\"msg 41, whole\"]\n```";
+        state.apply_event(AgentEvent::TextBlockComplete(source.into()));
+        state.commit_answer_preview();
+        state.set_answer_width(240);
+        state.transcript.append(&mut state.pending_insert);
+        state.canonicalize_completed_answers();
+        let item = state.transcript.last().unwrap().clone();
+        for width in [240, 80, 240] {
+            let text = cached_transcript_render(&mut state, &item, width).0;
+            let rendered = flatten_lines(&text).join("\n");
+            assert!(rendered.contains("view line 0+64") && rendered.contains("msg 41, whole"));
+            assert!(!rendered.contains("Mermaid source"), "{rendered}");
+            assert_eq!(
+                rendered
+                    .matches(if width == 80 { '▼' } else { '▶' })
+                    .count(),
+                5,
+                "{rendered}"
+            );
+            assert_eq!(rendered.contains("vertical reflow"), width == 80);
+        }
+        assert!(matches!(&item, Line_::AnswerPart { text, .. } if text == source));
+    }
+
+    #[test]
+    fn mermaid_replay_changes_representation_without_changing_transcript_source() {
+        let mut state = answer_test_state();
+        let source = "```mermaid\nflowchart LR\nA[Start journey] --> B[Done]\n```";
+        let item = Line_::Assistant {
+            text: source.into(),
+            dim_prefix: false,
+        };
+        let wide = cached_transcript_render(&mut state, &item, 100).0;
+        let narrow = cached_transcript_render(&mut state, &item, 12).0;
+        assert!(flatten_lines(&wide).join("\n").contains('▶'));
+        let fallback = flatten_lines(&narrow).join("\n");
+        assert!(fallback.contains("source"), "{fallback}");
+        assert!(!fallback.contains(['▶', '▼']), "{fallback}");
+        assert!(matches!(&item, Line_::Assistant { text, .. } if text == source));
+    }
+
     fn thinking_units(state: &TuiState) -> Vec<&ThinkingDisplayUnit> {
         state
             .active_thinking
@@ -12645,7 +14903,7 @@ mod tests {
                 .any(|line| thinking_line_belongs_to(line, block_id))
         );
         assert!(state.transcript_needs_rebuild);
-        assert!(state.thinking_visual_transaction_pending);
+        assert!(state.visual_transaction_pending);
         assert!(state.active_thinking.is_none());
         assert!(state.provisional_thinking.is_empty());
     }
@@ -14911,10 +17169,16 @@ mod tests {
         ));
         let text = transcript_live_indicator_text(&standard, 80).expect("live indicator");
         let lines = flatten_lines(&text);
-        assert!(lines[1].contains("to="), "{lines:?}");
-        assert!(lines[1].contains("tool call redacted"), "{lines:?}");
-        assert!(!lines[1].contains("functions.bash"), "{lines:?}");
-        assert!(!lines[1].contains("cargo test"), "{lines:?}");
+        assert!(
+            lines.iter().any(|line| line.contains("tool call redacted")),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .all(|line| !line.contains("functions.bash") && !line.contains("cargo test")),
+            "{lines:?}"
+        );
 
         let mut frugal = TuiState::new(
             "test-model".to_string(),
@@ -14932,12 +17196,15 @@ mod tests {
         let text = transcript_live_indicator_text(&frugal, 80).expect("live indicator");
         let lines = flatten_lines(&text);
         assert!(
-            lines[1].contains("tool call redacted"),
+            lines.iter().any(|line| line.contains("tool call redacted")),
             "raw protocol should be hidden from frugal live UI: {lines:?}"
         );
-        assert!(!lines[1].contains("to="), "{lines:?}");
-        assert!(!lines[1].contains("functions.bash"), "{lines:?}");
-        assert!(!lines[1].contains("cargo test"), "{lines:?}");
+        assert!(
+            lines.iter().all(|line| !line.contains("to=")
+                && !line.contains("functions.bash")
+                && !line.contains("cargo test")),
+            "{lines:?}"
+        );
     }
 
     #[test]
@@ -14954,7 +17221,8 @@ mod tests {
             "to=functions.bash\n{\n  \"command\": \"cargo test\"\n}\nDone".to_string(),
         ));
 
-        let Line_::Assistant { text, .. } = standard.pending_insert.last().expect("assistant line")
+        let Line_::AnswerPart { text, .. } =
+            standard.pending_insert.last().expect("assistant line")
         else {
             panic!("expected assistant line");
         };
@@ -14974,7 +17242,7 @@ mod tests {
             "to=functions.bash\n{\n  \"command\": \"cargo test\"\n}\nDone".to_string(),
         ));
 
-        let Line_::Assistant { text, .. } = frugal.pending_insert.last().expect("assistant line")
+        let Line_::AnswerPart { text, .. } = frugal.pending_insert.last().expect("assistant line")
         else {
             panic!("expected assistant line");
         };
@@ -15000,7 +17268,7 @@ mod tests {
             "to=functions.bash\n{\n  \"command\": \"cargo test\"\n}\nDone".to_string(),
         ));
 
-        let Line_::Assistant { text, .. } = state.pending_insert.last().expect("assistant line")
+        let Line_::AnswerPart { text, .. } = state.pending_insert.last().expect("assistant line")
         else {
             panic!("expected assistant line");
         };
@@ -15812,15 +18080,18 @@ mod tests {
                 Line_::ThinkingUnit { .. },
                 Line_::ThinkingGap { .. },
                 Line_::Tool { .. },
-                Line_::Blank,
-                Line_::Assistant { .. }
+                Line_::AnswerGap { .. },
+                Line_::AnswerPart { .. }
             ]
         ));
         assert_eq!(
             state
                 .pending_insert
                 .iter()
-                .filter(|line| matches!(line, Line_::Blank | Line_::ThinkingGap { .. }))
+                .filter(|line| matches!(
+                    line,
+                    Line_::Blank | Line_::ThinkingGap { .. } | Line_::AnswerGap { .. }
+                ))
                 .count(),
             3
         );
@@ -16119,12 +18390,12 @@ mod tests {
         assert!(matches!(
             state.pending_insert.as_slice(),
             [
-                Line_::Assistant {
+                Line_::AnswerPart {
                     dim_prefix: false,
                     ..
                 },
-                Line_::Blank,
-                Line_::Assistant {
+                Line_::AnswerGap { .. },
+                Line_::AnswerPart {
                     dim_prefix: true,
                     ..
                 }

@@ -240,6 +240,178 @@ fn tui_resize_keeps_inline_session_responsive_and_dsr_bounded() {
 }
 
 #[test]
+fn tui_streams_mermaid_and_prose_into_history_before_provider_completion() {
+    let temp = TempDir::new("dext-tui-answer-history").expect("temp dir");
+    let sandbox = temp.path().join("sandbox");
+    let dext_home = temp.path().join("dext-home");
+    let home = temp.path().join("home");
+    for path in [&sandbox, &dext_home, &home] {
+        fs::create_dir_all(path).expect("fixture directory");
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").expect("mock server");
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        for connection in listener.incoming() {
+            let mut stream = connection.expect("mock connection");
+            let request = read_mock_openai_request(&mut stream);
+            if !String::from_utf8_lossy(&request).starts_with("POST /v1/chat/completions ") {
+                stream
+                    .write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+                continue;
+            }
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n").unwrap();
+            let source = format!(
+                "history-before-complete.\n\n```mermaid\nflowchart LR\nA[Request] --> B[(\"Result\")]\n```\n\n```mermaid\nflowchart TD\nSTART[CycleStart] --> DB[(\"CycleStore\")]\nDB --> DONE[CycleDone]\nDONE -.->|retry| START\n```\n\n```mermaid\nflowchart LR\nV[\"view line 0+64\"] -->|\"zoom(0,64)\"| A[\"0+32, 32+32\"]\nA -->|\"zoom(32,32)\"| B[\"32+16, 48+16\"]\nB -->|\"3 more zooms\"| C[\"40+2, 42+2\"]\nC -->|\"zoom(40,2)\"| D[\"40+1, 41+1\"]\nD -->|\"zoom(41,1)\"| E[\"msg 41, whole\"]\n```\n\n{}",
+                "Progressive prose remains readable while the response is still being written. "
+                    .repeat(14)
+            );
+            for chunk in source.as_bytes().chunks(43) {
+                let text = std::str::from_utf8(chunk).unwrap();
+                let frame = format!(
+                    "data: {}\n\n",
+                    serde_json::json!({"choices":[{"delta":{"content":text},"finish_reason":null}]})
+                );
+                stream.write_all(frame.as_bytes()).unwrap();
+                stream.flush().unwrap();
+                std::thread::sleep(Duration::from_millis(12));
+            }
+            let live_marker = format!(
+                "data: {}\n\n",
+                serde_json::json!({"choices":[{"delta":{"content":"\n\nlive-tail-before-complete"},"finish_reason":null}]})
+            );
+            stream.write_all(live_marker.as_bytes()).unwrap();
+            stream.flush().unwrap();
+            release_rx
+                .recv_timeout(Duration::from_secs(20))
+                .expect("release delayed stream");
+            let frame = format!(
+                "data: {}\n\n",
+                serde_json::json!({"choices":[{"delta":{"content":"\n\ncompletion-after-release"},"finish_reason":null}]})
+            );
+            stream.write_all(frame.as_bytes()).unwrap();
+            stream.write_all(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n").unwrap();
+            stream.flush().unwrap();
+            break;
+        }
+    });
+    let mut pty = Pty::open(240, 40).expect("pty");
+    let mut child = spawn_dext_with_env(
+        &pty,
+        &sandbox,
+        &dext_home,
+        &home,
+        &[
+            ("DEXT_PROVIDER", "local"),
+            ("DEXT_BASE_URL", &base_url),
+            ("DEXT_MODEL", "mock-model"),
+            ("DEXT_MODEL_FORCE", "1"),
+        ],
+    )
+    .expect("spawn dext");
+    assert_visible(&mut pty, &mut child, "◆ Dext  v", Duration::from_secs(5));
+    pty.write_all_retry(b"Show the flow\r").unwrap();
+    assert_visible(
+        &mut pty,
+        &mut child,
+        "live-tail-before-complete",
+        Duration::from_secs(5),
+    );
+    pty.pump_for(&mut child, Duration::from_millis(200))
+        .unwrap();
+    let output = pty.visible_text();
+    assert!(output.contains("history-before-complete"), "{output}");
+    assert!(
+        output.contains("Request") && output.contains("Result") && output.contains('▶'),
+        "{output}"
+    );
+    assert!(
+        output.contains("CycleStore") && output.contains("CycleDone"),
+        "{output}"
+    );
+    assert!(output.contains('├') && output.contains('┆'), "{output}");
+    assert!(!output.contains("flowchart LR"), "{output}");
+    assert!(!output.contains("completion-after-release"));
+    assert_eq!(output.matches("┌─ dext").count(), 1, "{output}");
+    pty.write_all_retry(b"/compact 13").unwrap();
+    pty.pump_for(&mut child, Duration::from_millis(200))
+        .unwrap();
+    let before = pty.terminal_io_counts();
+    let narrow_start = pty.capture.len();
+    pty.resize(&child, 80, 35).unwrap();
+    assert!(
+        pty.wait_for_clear_all(&mut child, before.clear_all + 1, Duration::from_secs(3))
+            .unwrap()
+    );
+    pty.pump_for(&mut child, Duration::from_millis(250))
+        .unwrap();
+    let narrow = strip_ansi(&String::from_utf8_lossy(&pty.capture[narrow_start..]));
+    assert!(narrow.contains("vertical reflow"), "{narrow}");
+    assert!(
+        narrow.contains("view line 0+64") && narrow.contains("msg 41, whole"),
+        "{narrow}"
+    );
+    assert_eq!(narrow.matches('▼').count(), 8, "{narrow}");
+    assert!(
+        narrow.contains("CycleStore") && narrow.contains("CycleStart"),
+        "{narrow}"
+    );
+    assert!(!narrow.contains("Mermaid source"), "{narrow}");
+    release_tx.send(()).unwrap();
+    assert_visible(
+        &mut pty,
+        &mut child,
+        "completion-after-release",
+        Duration::from_secs(10),
+    );
+    pty.pump_for(&mut child, Duration::from_millis(300))
+        .unwrap();
+    pty.write_all_retry(b"%\r").unwrap();
+    assert_visible(
+        &mut pty,
+        &mut child,
+        "compact threshold set to 13%",
+        Duration::from_secs(5),
+    );
+    let before_wide = pty.terminal_io_counts();
+    let wide_start = pty.capture.len();
+    pty.resize(&child, 240, 40).unwrap();
+    assert!(
+        pty.wait_for_clear_all(
+            &mut child,
+            before_wide.clear_all + 1,
+            Duration::from_secs(3)
+        )
+        .unwrap()
+    );
+    pty.pump_for(&mut child, Duration::from_millis(300))
+        .unwrap();
+    let wide = strip_ansi(&String::from_utf8_lossy(&pty.capture[wide_start..]));
+    assert!(
+        wide.contains("view line 0+64") && wide.contains("msg 41, whole"),
+        "{wide}"
+    );
+    assert_eq!(wide.matches('▶').count(), 6, "{wide}");
+    assert_eq!(wide.matches('▼').count(), 3, "{wide}");
+    assert!(
+        wide.contains("CycleStore") && wide.contains("CycleDone"),
+        "{wide}"
+    );
+    assert!(
+        !wide.contains("vertical reflow") && !wide.contains("Mermaid source"),
+        "{wide}"
+    );
+    assert_no_crash_text(&pty.visible_text());
+    pty.write_all_retry(b"\x04").unwrap();
+    let status = wait_for_exit(&mut child, Duration::from_secs(5), &mut pty).unwrap();
+    assert!(status.success());
+    server.join().unwrap();
+}
+
+#[test]
 fn tui_smoke_shift_enter_inserts_newline() {
     let temp = TempDir::new("dext-tui-shift-enter").expect("temp dir");
     let sandbox = temp.path().join("sandbox");
