@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## v0.2.0 - 2026-10-06
+
+Second tagged release; the default `install.sh`/`install.ps1` paths now download these prebuilt archives. The changelog was not split at `v0.1.0`, so the entries below also include changes that first shipped in `v0.1.0`.
+
 ### Maintenance
 
 - Fixed thinking paragraphs splitting streamed assistant cards. A TUI-only bounded display-copy handoff presents pending thinking before answer text; genuinely late thinking waits outside the card until closure. Raw reasoning, provider/core lifecycle, tools and public events are unchanged. Native inline/PTY regressions cover actual history before resize, no completion repaint, correction, hide/show, privacy, retry, interruption and preserved input. A further fresh-eyes audit fixes empty-delta takeover, hidden/duplicated later thinking, stale continuation toggles, successive-card anchoring, same-line redaction expansion and deferred-unit loss at new-turn boundaries. Logical-line anchors and bounded tail-copy replay preserve raw decoding and avoid newline-sized temporary batches. Another event-order audit fixes whitespace-only trailers erasing earlier completed cards, early preview commits dropping deferred thinking, and stale deferred output after a privacy-mode change; committed ownership, bounded replay source and native/event-order regressions cover the correction.
