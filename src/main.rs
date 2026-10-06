@@ -1690,19 +1690,29 @@ const NDJSON_MAX_FRAME_BYTES: usize = 256 * 1024;
 const NDJSON_MAX_PENDING: usize = 32;
 
 fn reserve_ndjson_pending(pending: &AtomicUsize, slots: usize) -> bool {
-    pending
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
-            count
-                .checked_add(slots)
-                .filter(|next| *next <= NDJSON_MAX_PENDING)
-        })
-        .is_ok()
+    let mut count = pending.load(Ordering::SeqCst);
+    loop {
+        let Some(next) = count
+            .checked_add(slots)
+            .filter(|next| *next <= NDJSON_MAX_PENDING)
+        else {
+            return false;
+        };
+        match pending.compare_exchange(count, next, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return true,
+            Err(current) => count = current,
+        }
+    }
 }
 
 fn release_ndjson_pending(pending: &AtomicUsize) {
-    let _ = pending.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
-        Some(count.saturating_sub(1))
-    });
+    let mut count = pending.load(Ordering::SeqCst);
+    while count > 0 {
+        match pending.compare_exchange(count, count - 1, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return,
+            Err(current) => count = current,
+        }
+    }
 }
 
 /// Reservations precede publication and are released by the actual consumer.

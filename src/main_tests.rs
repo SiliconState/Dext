@@ -8446,6 +8446,32 @@ fn ndjson_budget_bounds_busy_batches_and_releases_on_consumption() {
 }
 
 #[test]
+fn ndjson_budget_concurrent_reservations_and_releases_stay_bounded() {
+    let pending = AtomicUsize::new(0);
+    let accepted = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..NDJSON_MAX_PENDING * 2)
+            .map(|_| scope.spawn(|| reserve_ndjson_pending(&pending, 1)))
+            .collect();
+        workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .filter(|accepted| *accepted)
+            .count()
+    });
+    assert_eq!(accepted, NDJSON_MAX_PENDING);
+    assert_eq!(pending.load(Ordering::SeqCst), NDJSON_MAX_PENDING);
+    assert!(!reserve_ndjson_pending(&pending, usize::MAX));
+    std::thread::scope(|scope| {
+        for _ in 0..NDJSON_MAX_PENDING * 2 {
+            scope.spawn(|| release_ndjson_pending(&pending));
+        }
+    });
+    assert_eq!(pending.load(Ordering::SeqCst), 0);
+    assert!(reserve_ndjson_pending(&pending, NDJSON_MAX_PENDING));
+    assert!(!reserve_ndjson_pending(&pending, 1));
+}
+
+#[test]
 fn permission_bridge_matches_ids_and_denies_on_interrupt_or_eof() {
     let interrupt = Arc::new(AtomicBool::new(false));
     let (tx, rx) = std::sync::mpsc::sync_channel::<PermissionReply>(8);
