@@ -11914,29 +11914,30 @@ fn canonical_dext_install_from_nested_directory_is_blocked() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-#[tokio::test]
-async fn bash_receives_exact_call_and_core_session_identity() -> Result<()> {
+#[test]
+fn bash_receives_exact_call_and_core_session_identity() -> Result<()> {
+    let _guard = env_lock();
     let root = temp_test_dir("bash-identity");
+    let _cleanup = RemoveDirOnDrop(root.clone());
+    let _state_env = PackEnvGuard::new(&root.join("state"));
     let mut agent = test_agent(&root);
     agent.set_approval_profile(ApprovalProfile::Always);
     agent.set_sandbox_profile(SandboxProfile::DangerFullAccess);
     let mut state = orchestrator::TurnRuntimeState::new();
-    agent
-        .execute_tool_round(ToolRoundContext {
-            tool_calls: vec![(
-                "provider-call-identity".into(),
-                "bash".into(),
-                json!({"command":"printf '%s/%s' \"$DEXT_TOOL_CALL_ID\" \"$DEXT_SESSION_ID\""}),
-            )],
-            iterations: 1,
-            turn_id: "turn-identity".into(),
-            objective_apply_fixes_allowed: false,
-            turn_state: &mut state,
-            denied_signatures: HashSet::new(),
-            hooks_approval_decided: true,
-            hooks_approved: false,
-        })
-        .await?;
+    tokio::runtime::Runtime::new()?.block_on(agent.execute_tool_round(ToolRoundContext {
+        tool_calls: vec![(
+            "provider-call-identity".into(),
+            "bash".into(),
+            json!({"command":"printf '%s/%s' \"$DEXT_TOOL_CALL_ID\" \"$DEXT_SESSION_ID\""}),
+        )],
+        iterations: 1,
+        turn_id: "turn-identity".into(),
+        objective_apply_fixes_allowed: false,
+        turn_state: &mut state,
+        denied_signatures: HashSet::new(),
+        hooks_approval_decided: true,
+        hooks_approved: false,
+    }))?;
     let (output, _) = last_tool_result(&agent.history).expect("bash result");
     assert!(
         output.contains(&format!("provider-call-identity/{}", agent.session_id)),

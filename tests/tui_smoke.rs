@@ -286,7 +286,7 @@ fn tui_streams_mermaid_and_prose_into_history_before_provider_completion() {
             stream.write_all(live_marker.as_bytes()).unwrap();
             stream.flush().unwrap();
             release_rx
-                .recv_timeout(Duration::from_secs(20))
+                .recv_timeout(Duration::from_secs(40))
                 .expect("release delayed stream");
             let frame = format!(
                 "data: {}\n\n",
@@ -314,11 +314,12 @@ fn tui_streams_mermaid_and_prose_into_history_before_provider_completion() {
     .expect("spawn dext");
     assert_visible(&mut pty, &mut child, "◆ Dext  v", Duration::from_secs(5));
     pty.write_all_retry(b"Show the flow\r").unwrap();
+    // macOS PTY redraws can backpressure the small-delta fixture under parallel CI load.
     assert_visible(
         &mut pty,
         &mut child,
         "live-tail-before-complete",
-        Duration::from_secs(5),
+        Duration::from_secs(15),
     );
     pty.pump_for(&mut child, Duration::from_millis(200))
         .unwrap();

@@ -8,6 +8,7 @@ Second tagged release; the default `install.sh`/`install.ps1` paths now download
 
 ### Maintenance
 
+- Isolated the Bash call-identity fixture behind the shared environment lock and a private state home, preventing parallel state-override tests from removing its persistence path. The Mermaid/prose PTY fixture retains its explicit pre-completion barrier with a bounded longer wait for macOS small-delta redraw backpressure.
 - Canonicalized the shared test-only state home so macOS `/tmp` symlink aliases do not trip memo ancestor-integrity checks. A canonical-path regression covers the fixture; production symlink refusal remains unchanged.
 - Replaced deprecated atomic pending-budget updates with compare-exchange loops, keeping the NDJSON queue cap, overflow rejection and saturating release semantics unchanged on both the local and current CI Rust toolchains. Added concurrent reservation/release regression coverage.
 
