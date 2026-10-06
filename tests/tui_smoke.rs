@@ -412,6 +412,151 @@ fn tui_streams_mermaid_and_prose_into_history_before_provider_completion() {
 }
 
 #[test]
+fn tui_thinking_handoff_keeps_answer_card_contiguous_without_completion_repaint() {
+    let temp = TempDir::new("dext-tui-thinking-handoff").expect("temp dir");
+    let sandbox = temp.path().join("sandbox");
+    let dext_home = temp.path().join("dext-home");
+    let home = temp.path().join("home");
+    for path in [&sandbox, &dext_home, &home] {
+        fs::create_dir_all(path).unwrap();
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        for connection in listener.incoming() {
+            let mut stream = connection.unwrap();
+            let request = read_mock_openai_request(&mut stream);
+            if !String::from_utf8_lossy(&request).starts_with("POST /v1/chat/completions ") {
+                stream
+                    .write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+                continue;
+            }
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n").unwrap();
+            let frames = [
+                serde_json::json!({"choices":[{"delta":{"reasoning_content":"Considering Git Tree Status\n\npending-thinking-before-answer"},"finish_reason":null}]}),
+                serde_json::json!({"choices":[{"delta":{"content":"Committed successfully.\n\n- Included implementation and documentation.\n- Preserved evidence.\n\nanswer-live-marker"},"finish_reason":null}]}),
+            ];
+            for frame in frames {
+                stream
+                    .write_all(format!("data: {frame}\n\n").as_bytes())
+                    .unwrap();
+            }
+            stream.flush().unwrap();
+            release_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+            let frames = [
+                serde_json::json!({"choices":[{"delta":{"reasoning_content":"\n\nlate-thinking-after-card\n"},"finish_reason":null}]}),
+                serde_json::json!({"choices":[{"delta":{"content":"\n\nanswer-completed-marker"},"finish_reason":null}]}),
+                serde_json::json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+            ];
+            for frame in frames {
+                stream
+                    .write_all(format!("data: {frame}\n\n").as_bytes())
+                    .unwrap();
+            }
+            stream.write_all(b"data: [DONE]\n\n").unwrap();
+            stream.flush().unwrap();
+            break;
+        }
+    });
+    let mut pty = Pty::open(100, 35).unwrap();
+    let mut child = spawn_dext_with_env(
+        &pty,
+        &sandbox,
+        &dext_home,
+        &home,
+        &[
+            ("DEXT_PROVIDER", "local"),
+            ("DEXT_BASE_URL", &base_url),
+            ("DEXT_MODEL", "mock-model"),
+            ("DEXT_MODEL_FORCE", "1"),
+        ],
+    )
+    .unwrap();
+    assert_visible(&mut pty, &mut child, "◆ Dext  v", Duration::from_secs(5));
+    pty.write_all_retry(b"Show the status\r").unwrap();
+    assert_visible(
+        &mut pty,
+        &mut child,
+        "answer-live-marker",
+        Duration::from_secs(5),
+    );
+    pty.pump_for(&mut child, Duration::from_millis(200))
+        .unwrap();
+    let live = pty.visible_text();
+    assert!(
+        live.rfind("pending-thinking-before-answer").unwrap() < live.find("┌─ dext").unwrap(),
+        "{live}"
+    );
+    pty.write_all_retry(b"/compact 17").unwrap();
+    pty.pump_for(&mut child, Duration::from_millis(150))
+        .unwrap();
+    let before = pty.terminal_io_counts();
+    let completion_start = pty.capture.len();
+    release_tx.send(()).unwrap();
+    assert_visible(
+        &mut pty,
+        &mut child,
+        "late-thinking-after-card",
+        Duration::from_secs(5),
+    );
+    pty.pump_for(&mut child, Duration::from_millis(200))
+        .unwrap();
+    let completed = strip_ansi(&String::from_utf8_lossy(&pty.capture[completion_start..]));
+    assert!(completed.contains("answer-completed-marker"), "{completed}");
+    assert!(
+        !completed.contains("pending-thinking-before-answer"),
+        "{completed}"
+    );
+    assert!(!completed.contains("┌─ dext"), "{completed}");
+    assert!(
+        completed.find('└').unwrap() < completed.find("late-thinking-after-card").unwrap(),
+        "{completed}"
+    );
+    let after = pty.terminal_io_counts();
+    assert_eq!(after.clear_all, before.clear_all);
+    assert_eq!(after.purge_scrollback, before.purge_scrollback);
+    pty.write_all_retry(b"%\r").unwrap();
+    assert_visible(
+        &mut pty,
+        &mut child,
+        "compact threshold set to 17%",
+        Duration::from_secs(5),
+    );
+    let replay_start = pty.capture.len();
+    pty.resize(&child, 80, 35).unwrap();
+    assert!(
+        pty.wait_for_clear_all(&mut child, after.clear_all + 1, Duration::from_secs(3))
+            .unwrap()
+    );
+    pty.pump_for(&mut child, Duration::from_millis(200))
+        .unwrap();
+    let replay = strip_ansi(&String::from_utf8_lossy(&pty.capture[replay_start..]));
+    let opening = replay.find("┌─ dext").unwrap();
+    let closing = opening + replay[opening..].find('└').unwrap();
+    assert!(
+        replay.find("pending-thinking-before-answer").unwrap() < opening,
+        "{replay}"
+    );
+    assert!(
+        replay.find("late-thinking-after-card").unwrap() > closing,
+        "{replay}"
+    );
+    assert_eq!(replay.matches("┌─ dext").count(), 1);
+    assert_no_crash_text(&pty.visible_text());
+    pty.write_all_retry(b"\x04").unwrap();
+    assert!(
+        wait_for_exit(&mut child, Duration::from_secs(5), &mut pty)
+            .unwrap()
+            .success()
+    );
+    server.join().unwrap();
+}
+
+#[test]
 fn tui_smoke_shift_enter_inserts_newline() {
     let temp = TempDir::new("dext-tui-shift-enter").expect("temp dir");
     let sandbox = temp.path().join("sandbox");

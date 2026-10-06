@@ -60,6 +60,8 @@ const TRUST_INPUT_BORDER: Color = Color::Indexed(66);
 const THINKING_DETAIL_MAX_ROWS: usize = 4;
 const THINKING_LINE_DISPLAY_BYTES: usize = 8 * 1024;
 const THINKING_UNIT_DISPLAY_CAP: usize = 4096;
+const DEFERRED_THINKING_SOURCE_CAP: usize = 4 * 1024 * 1024;
+const DEFERRED_THINKING_OMITTED: &str = "[deferred thinking omitted: display source limit]";
 const THINKING_UNITS_OMITTED: &str = "[additional thinking lines omitted from display]";
 
 #[derive(Clone, Copy)]
@@ -1151,7 +1153,7 @@ struct TranscriptLayoutState {
     live_indicator_text: Option<Text<'static>>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct BoundedThinkingLine {
     visible: String,
     bytes: usize,
@@ -1218,7 +1220,7 @@ impl BoundedThinkingLine {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct ThinkingLineDecoder {
     line: BoundedThinkingLine,
     pending_cr: bool,
@@ -1367,10 +1369,45 @@ impl StreamingPseudoToolFilter {
     }
 }
 
+fn thinking_line_boundaries(raw: &str) -> impl Iterator<Item = usize> + '_ {
+    let mut chars = raw.char_indices().peekable();
+    let mut last = 0;
+    std::iter::from_fn(move || {
+        while let Some((offset, ch)) = chars.next() {
+            if matches!(ch, '\r' | '\n' | '\u{2028}' | '\u{2029}') {
+                last = offset + ch.len_utf8();
+                if ch == '\r' && chars.peek().is_some_and(|(_, next)| *next == '\n') {
+                    last = chars.next().unwrap().0 + 1;
+                }
+                return Some(last);
+            }
+        }
+        if last < raw.len() {
+            last = raw.len();
+            Some(last)
+        } else {
+            None
+        }
+    })
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ThinkingDisplayUnit {
     text: String,
     section_start: bool,
+}
+
+#[derive(Clone)]
+struct ThinkingBoundary {
+    answer_id: u64,
+    raw_bytes: usize,
+    lines: usize,
+    end: usize,
+}
+
+struct ThinkingHandoff {
+    units: Vec<ThinkingDisplayUnit>,
+    boundaries: Vec<ThinkingBoundary>,
 }
 
 struct ActiveThinking {
@@ -1379,9 +1416,13 @@ struct ActiveThinking {
     decoder: ThinkingLineDecoder,
     filter: StreamingPseudoToolFilter,
     section_has_content: bool,
+    completed_lines: usize,
     units: Vec<ThinkingDisplayUnit>,
     queued_units: usize,
     display_exhausted: bool,
+    committed: bool,
+    deferred_source: Option<String>,
+    handoff: Option<ThinkingHandoff>,
 }
 
 impl ActiveThinking {
@@ -1392,9 +1433,13 @@ impl ActiveThinking {
             decoder: ThinkingLineDecoder::default(),
             filter: StreamingPseudoToolFilter::default(),
             section_has_content: false,
+            completed_lines: 0,
             units: Vec::new(),
             queued_units: 0,
             display_exhausted: false,
+            committed: false,
+            deferred_source: None,
+            handoff: None,
         }
     }
 
@@ -1417,6 +1462,7 @@ impl ActiveThinking {
     }
 
     fn process_completed_line(&mut self, line: BoundedThinkingLine) {
+        self.completed_lines = self.completed_lines.saturating_add(1);
         if !line.has_non_whitespace {
             let _ = self.filter.process_line("", self.context_mode);
             if !self.filter.redacting_xml {
@@ -1456,6 +1502,23 @@ impl ActiveThinking {
         for line in self.decoder.finish() {
             self.process_completed_line(line);
         }
+    }
+
+    fn finished_tail(&self) -> Vec<ThinkingDisplayUnit> {
+        if self.display_exhausted {
+            return Vec::new();
+        }
+        let mut tail = Self::new(self.block_id, self.context_mode);
+        tail.decoder = self.decoder.clone();
+        tail.filter = self.filter.clone();
+        tail.section_has_content = self.section_has_content;
+        tail.finish();
+        let remaining = THINKING_UNIT_DISPLAY_CAP.saturating_sub(self.units.len());
+        tail.units.truncate(remaining + 1);
+        if tail.units.len() > remaining {
+            tail.units[remaining].text = THINKING_UNITS_OMITTED.to_string();
+        }
+        tail.units
     }
 
     fn open_units(&self) -> Vec<ThinkingDisplayUnit> {
@@ -2361,6 +2424,7 @@ impl TuiState {
         self.rollback_answer_blocks(&discarded);
         self.streaming_text.clear();
         self.stream_started_at = None;
+        self.flush_deferred_thinking();
     }
 
     fn sync_answer_visibility(&mut self) {
@@ -2409,10 +2473,17 @@ impl TuiState {
     }
 
     fn push_answer_delta(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let new_answer = self.active_answer.is_none();
         let mut active = self
             .active_answer
             .take()
             .unwrap_or_else(|| self.start_answer());
+        if new_answer {
+            self.handoff_thinking_before_answer(active.block_id);
+        }
         active.live_cache.get_mut().take();
         if !active.exhausted {
             let remaining = ANSWER_DISPLAY_CAP.saturating_sub(self.streaming_text.len());
@@ -2706,6 +2777,19 @@ impl TuiState {
     }
 
     fn answer_matches_canonical(&self, active: &ActiveAnswer, rendered: &str) -> bool {
+        let mut started = false;
+        for line in self
+            .transcript
+            .iter()
+            .chain(&self.prepared_insert_retry)
+            .chain(&self.pending_insert)
+        {
+            if matches!(line, Line_::AnswerPart { block_id, .. } if *block_id == active.block_id) {
+                started = true;
+            } else if started && Self::answer_block_id(line) != Some(active.block_id) {
+                return false;
+            }
+        }
         let Some(tail) = rendered.get(active.sealed_bytes..) else {
             return false;
         };
@@ -2742,10 +2826,14 @@ impl TuiState {
     }
 
     fn complete_answer_display(&mut self, rendered: String) {
+        let new_answer = self.active_answer.is_none();
         let mut active = self
             .active_answer
             .take()
             .unwrap_or_else(|| self.start_answer());
+        if new_answer && !rendered.is_empty() {
+            self.handoff_thinking_before_answer(active.block_id);
+        }
         {
             let previous = &mut active;
             let mismatch = rendered.is_empty()
@@ -2795,6 +2883,7 @@ impl TuiState {
         self.streaming_text.clear();
         self.stream_started_at = None;
         self.stream_chars = 0;
+        self.flush_deferred_thinking();
     }
 
     fn end_answer_turn(&mut self) {
@@ -2810,7 +2899,7 @@ impl TuiState {
             partial.push_str("\n\n[stream ended early; preserved partial response]");
             self.complete_answer_display(partial);
         } else if self.active_answer.is_some() {
-            self.discard_answer_preview();
+            self.complete_answer_display(String::new());
         }
         self.active_answer = None;
         self.provisional_answers.clear();
@@ -2818,8 +2907,243 @@ impl TuiState {
         self.streaming_text.clear();
     }
 
+    fn handoff_thinking_before_answer(&mut self, answer_id: u64) {
+        let Some(mut active) = self.active_thinking.take() else {
+            return;
+        };
+        // Finish only a display copy: later provider deltas keep the original decoder/filter.
+        let mut preview = ActiveThinking::new(active.block_id, self.context_mode);
+        preview.units = active.units.clone();
+        preview.units.extend(active.finished_tail());
+        preview.queued_units = active.queued_units;
+        if let Some(handoff) = active.handoff.as_mut() {
+            for boundary in &mut handoff.boundaries {
+                let anchored = self.transcript.iter().chain(&self.prepared_insert_retry).chain(&self.pending_insert)
+                    .any(|line| matches!(line, Line_::AnswerPart { block_id, .. } if *block_id == boundary.answer_id));
+                if !anchored {
+                    boundary.answer_id = answer_id;
+                }
+            }
+        }
+        preview.handoff = active.handoff.take();
+        let raw = std::mem::take(&mut self.streaming_thinking);
+        self.reconcile_thinking_handoff(&mut preview, false, &raw, true);
+        self.streaming_thinking = raw;
+        let previous_end = preview
+            .handoff
+            .as_ref()
+            .map_or(0, |handoff| handoff.units.len());
+        let mut boundaries = preview
+            .handoff
+            .take()
+            .map_or_else(Vec::new, |handoff| handoff.boundaries);
+        self.queue_active_thinking_units(&mut preview);
+        if preview.units.len() > previous_end || boundaries.is_empty() {
+            boundaries.push(ThinkingBoundary {
+                answer_id,
+                raw_bytes: self.streaming_thinking.len(),
+                lines: active.completed_lines.saturating_add(usize::from(
+                    active.decoder.pending_cr || !active.decoder.line.is_empty(),
+                )),
+                end: preview.units.len(),
+            });
+        }
+        active.queued_units = preview.queued_units;
+        active.handoff = Some(ThinkingHandoff {
+            units: preview.units,
+            boundaries,
+        });
+        self.active_thinking = Some(active);
+    }
+
+    fn queue_thinking_before_answer(&mut self, active: &mut ActiveThinking) {
+        if !self.verbose {
+            return;
+        }
+        let Some(handoff) = active.handoff.as_ref() else {
+            return;
+        };
+        let mut start = 0;
+        let mut queued = 0;
+        for boundary in &handoff.boundaries {
+            let end = boundary.end.min(handoff.units.len()).max(start);
+            if start == end {
+                continue;
+            }
+            let units = handoff.units[start..end]
+                .iter()
+                .map(|unit| Line_::ThinkingUnit {
+                    block_id: active.block_id,
+                    text: unit.text.clone(),
+                    section_start: unit.section_start,
+                })
+                .collect::<Vec<_>>();
+            let mut units = Some(units);
+            let mut inserted_at = None;
+            for (list_index, items) in [
+                &mut self.transcript,
+                &mut self.prepared_insert_retry,
+                &mut self.pending_insert,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                if let Some(index) = items.iter().position(|line| matches!(line, Line_::AnswerPart { block_id, .. } if *block_id == boundary.answer_id)) {
+                    let has_gap = index > 0 && matches!(&items[index - 1], Line_::AnswerGap { block_id } if *block_id == boundary.answer_id);
+                    let mut inserted = units.take().unwrap();
+                    if !has_gap { inserted.push(Line_::ThinkingGap { block_id: active.block_id }); }
+                    let index = index - usize::from(has_gap);
+                    items.splice(index..index, inserted);
+                    inserted_at = Some(list_index);
+                    break;
+                }
+            }
+            if let Some(list_index) = inserted_at {
+                self.repair_history_spacing();
+                self.transcript_needs_rebuild |= list_index < 2;
+            } else if self
+                .active_answer
+                .as_ref()
+                .is_none_or(|answer| answer.block_id == boundary.answer_id && !answer.started)
+            {
+                for unit in units.unwrap() {
+                    self.queue(unit);
+                }
+            } else {
+                break;
+            }
+            queued = end;
+            start = end;
+        }
+        active.queued_units = queued;
+        self.visual_transaction_pending |= queued > 0;
+    }
+
+    fn reconcile_thinking_handoff(
+        &mut self,
+        active: &mut ActiveThinking,
+        revised: bool,
+        raw: &str,
+        allow_open: bool,
+    ) {
+        let Some(handoff) = active.handoff.as_ref() else {
+            return;
+        };
+        if !revised
+            && handoff.boundaries.last().is_some_and(|boundary| {
+                raw.get(..boundary.raw_bytes)
+                    .is_some_and(|prefix| prefix.ends_with(['\r', '\n', '\u{2028}', '\u{2029}']))
+            })
+        {
+            return;
+        }
+        // Logical lines, not display-unit counts: one privacy-filtered line may expand into several units.
+        let mut line_ends = thinking_line_boundaries(raw).filter(|&end| {
+            allow_open || raw[..end].ends_with(['\r', '\n', '\u{2028}', '\u{2029}'])
+        });
+        let mut replay = ActiveThinking::new(active.block_id, self.context_mode);
+        let mut start = 0;
+        let mut lines = 0;
+        let mut boundaries = handoff.boundaries.clone();
+        let mut tail = Vec::new();
+        for boundary in &mut boundaries {
+            let mut end = start;
+            while lines < boundary.lines {
+                let Some(next) = line_ends.next() else {
+                    if !allow_open {
+                        return;
+                    }
+                    break;
+                };
+                lines += 1;
+                end = next;
+            }
+            boundary.lines = lines;
+            replay.push(&raw[start..end]);
+            start = end;
+            tail = replay.finished_tail();
+            boundary.raw_bytes = end;
+            boundary.end = replay.units.len() + tail.len();
+        }
+        let mut units = replay.units;
+        units.extend(tail);
+        let changed = revised || units != handoff.units;
+        if changed {
+            self.rollback_active_thinking_display(active);
+        }
+        active.handoff = Some(ThinkingHandoff { units, boundaries });
+        if changed {
+            self.queue_thinking_before_answer(active);
+        }
+    }
+
+    fn refresh_deferred_thinking_privacy(&mut self) {
+        let mut completed = std::mem::take(&mut self.provisional_thinking);
+        for active in &mut completed {
+            if active.context_mode == self.context_mode || active.queued_units >= active.units.len()
+            {
+                continue;
+            }
+            let Some(raw) = active.deferred_source.take() else {
+                active.units.truncate(active.queued_units);
+                active.units.push(ThinkingDisplayUnit {
+                    text: DEFERRED_THINKING_OMITTED.into(),
+                    section_start: true,
+                });
+                active.context_mode = self.context_mode;
+                continue;
+            };
+            self.rollback_active_thinking_display(active);
+            let mut replay = ActiveThinking::new(active.block_id, self.context_mode);
+            replay.committed = active.committed;
+            replay.handoff = active.handoff.take();
+            replay.push(&raw);
+            replay.finish();
+            self.reconcile_thinking_handoff(&mut replay, true, &raw, true);
+            replay.deferred_source = Some(raw);
+            *active = replay;
+        }
+        self.provisional_thinking = completed;
+    }
+
+    fn flush_deferred_thinking(&mut self) {
+        if self.active_answer.is_some() {
+            return;
+        }
+        self.refresh_deferred_thinking_privacy();
+        let mut completed = std::mem::take(&mut self.provisional_thinking);
+        for active in &mut completed {
+            if self.verbose {
+                self.queue_active_thinking_units(active);
+            } else {
+                active.queued_units = active.units.len();
+            }
+        }
+        for active in &mut completed {
+            if active.queued_units == active.units.len() {
+                active.deferred_source = None;
+            }
+        }
+        completed.retain(|active| !active.committed || active.queued_units < active.units.len());
+        self.provisional_thinking = completed;
+        if let Some(mut active) = self.active_thinking.take() {
+            let raw = std::mem::take(&mut self.streaming_thinking);
+            self.reconcile_thinking_handoff(&mut active, false, &raw, false);
+            self.streaming_thinking = raw;
+            self.queue_active_thinking_units(&mut active);
+            self.active_thinking = Some(active);
+        }
+    }
+
     fn queue_active_thinking_units(&mut self, active: &mut ActiveThinking) {
-        if !self.verbose || active.queued_units >= active.units.len() {
+        if !self.verbose
+            || self.active_answer.is_some()
+            || active
+                .handoff
+                .as_ref()
+                .is_some_and(|handoff| !active.units.starts_with(&handoff.units))
+            || active.queued_units >= active.units.len()
+        {
             return;
         }
         for unit in &active.units[active.queued_units..] {
@@ -2846,6 +3170,11 @@ impl TuiState {
             .unwrap_or_else(|| self.start_active_thinking());
         self.streaming_thinking.push_str(&text);
         active.push(&text);
+        if self.active_answer.is_none() && active.handoff.is_some() {
+            let raw = std::mem::take(&mut self.streaming_thinking);
+            self.reconcile_thinking_handoff(&mut active, false, &raw, false);
+            self.streaming_thinking = raw;
+        }
         self.queue_active_thinking_units(&mut active);
         self.active_thinking = Some(active);
     }
@@ -2898,6 +3227,7 @@ impl TuiState {
     ) -> ActiveThinking {
         self.rollback_active_thinking_display(&mut previous);
         let mut active = ActiveThinking::new(previous.block_id, self.context_mode);
+        active.handoff = previous.handoff;
         active.push(raw);
         active
     }
@@ -2910,34 +3240,61 @@ impl TuiState {
     }
 
     fn discard_uncommitted_thinking(&mut self) {
-        let discarded = self
-            .provisional_thinking
-            .drain(..)
-            .chain(self.active_thinking.take())
-            .map(|thinking| thinking.block_id)
-            .collect::<HashSet<_>>();
+        let mut discarded = HashSet::new();
+        self.provisional_thinking.retain(|thinking| {
+            if thinking.committed {
+                true
+            } else {
+                discarded.insert(thinking.block_id);
+                false
+            }
+        });
+        if let Some(thinking) = self.active_thinking.take() {
+            discarded.insert(thinking.block_id);
+        }
         self.streaming_thinking.clear();
         self.rollback_thinking_blocks(&discarded);
     }
 
     fn commit_thinking_preview(&mut self) {
-        self.provisional_thinking.clear();
+        for thinking in &mut self.provisional_thinking {
+            thinking.committed = true;
+        }
+        self.provisional_thinking
+            .retain(|thinking| thinking.queued_units < thinking.units.len());
+        self.flush_deferred_thinking();
     }
 
     // Nothing re-streams after a turn boundary, so sealed thinking history stays
     // put even when the turn failed; only the never-sealed open tail is dropped.
     fn commit_turn_thinking(&mut self) {
+        self.flush_deferred_thinking();
         self.provisional_thinking.clear();
         self.active_thinking = None;
         self.streaming_thinking.clear();
     }
 
     fn sync_active_thinking_visibility(&mut self) {
+        self.refresh_deferred_thinking_privacy();
         let Some(previous) = self.active_thinking.take() else {
             return;
         };
         let raw = std::mem::take(&mut self.streaming_thinking);
         let mut active = self.replay_active_thinking(previous, &raw);
+        if let Some(handoff) = active.handoff.as_mut() {
+            let mut replay = ActiveThinking::new(active.block_id, self.context_mode);
+            let mut start = 0;
+            let mut tail = Vec::new();
+            for boundary in &mut handoff.boundaries {
+                replay.push(&raw[start..boundary.raw_bytes]);
+                start = boundary.raw_bytes;
+                tail = replay.finished_tail();
+                boundary.end = replay.units.len() + tail.len();
+            }
+            handoff.units = replay.units;
+            handoff.units.extend(tail);
+            self.queue_thinking_before_answer(&mut active);
+        }
         self.streaming_thinking = raw;
         self.queue_active_thinking_units(&mut active);
         self.active_thinking = Some(active);
@@ -2954,6 +3311,7 @@ impl TuiState {
             .active_thinking
             .take()
             .unwrap_or_else(|| self.start_active_thinking());
+        let revised = !full.starts_with(&streamed);
         if let Some(extra) = full.strip_prefix(streamed.as_str()) {
             active.push(extra);
         } else {
@@ -2966,7 +3324,28 @@ impl TuiState {
             ));
         }
         active.finish();
+        self.reconcile_thinking_handoff(&mut active, revised, &full, true);
         self.queue_active_thinking_units(&mut active);
+        if !self.verbose {
+            active.queued_units = active.units.len();
+        }
+        if active.queued_units < active.units.len() {
+            let retained = self
+                .provisional_thinking
+                .iter()
+                .filter_map(|thinking| thinking.deferred_source.as_ref())
+                .map(String::len)
+                .sum::<usize>();
+            if full.len() <= DEFERRED_THINKING_SOURCE_CAP.saturating_sub(retained) {
+                active.deferred_source = Some(full);
+            } else {
+                active.units.truncate(active.queued_units);
+                active.units.push(ThinkingDisplayUnit {
+                    text: DEFERRED_THINKING_OMITTED.into(),
+                    section_start: true,
+                });
+            }
+        }
         self.provisional_thinking.push(active);
     }
 
@@ -3357,8 +3736,8 @@ impl TuiState {
     fn apply_event(&mut self, ev: AgentEvent) {
         match ev {
             AgentEvent::TurnStart => {
-                self.commit_turn_thinking();
                 self.end_answer_turn();
+                self.commit_turn_thinking();
                 self.push_debug_event("turn start");
                 self.compacting = false;
                 self.compacting_resume_busy = false;
@@ -3378,6 +3757,9 @@ impl TuiState {
                     tokens.unwrap_or_else(|| ((self.history_chars.saturating_add(3)) / 4).max(1));
             }
             AgentEvent::TextDelta(t) => {
+                if t.is_empty() {
+                    return;
+                }
                 self.push_debug_event(format!("text delta · {} chars", t.chars().count()));
                 self.retry_status = None;
                 if self.stream_started_at.is_none() {
@@ -4404,6 +4786,12 @@ fn live_indicator_detail(state: &TuiState, width: u16) -> Vec<Line<'static>> {
     }
     if state.verbose
         && let Some(active) = state.active_thinking.as_ref()
+        && active.handoff.as_ref().is_none_or(|handoff| {
+            handoff
+                .boundaries
+                .last()
+                .is_none_or(|boundary| active.completed_lines >= boundary.lines)
+        })
     {
         let units = active.open_units();
         if !units.is_empty() {
@@ -13927,6 +14315,1895 @@ mod tests {
                 .visible
                 .ends_with(ANSWER_DISPLAY_OMITTED)
         );
+    }
+
+    fn assert_answer_card_uninterrupted(rows: &[String]) {
+        let start = rows
+            .iter()
+            .position(|row| row.contains("┌─ dext"))
+            .expect("answer opening");
+        let end = rows
+            .iter()
+            .enumerate()
+            .skip(start + 1)
+            .find(|(_, row)| row.trim() == "└")
+            .map(|(index, _)| index)
+            .expect("answer closing");
+        assert!(
+            rows[start + 1..end]
+                .iter()
+                .all(|row| row.trim().is_empty() || row == "│" || row.starts_with("│ ")),
+            "split answer card: {rows:?}"
+        );
+        assert_eq!(rows.iter().filter(|row| row.contains("┌─ dext")).count(), 1);
+    }
+
+    #[test]
+    fn answer_handoff_late_thinking_completion_keeps_real_scrollback_contiguous() {
+        use ratatui::backend::TestBackend;
+        for width in [60, 100, 160] {
+            let mut terminal = Terminal::with_options(
+                TestBackend::new(width, 28),
+                TerminalOptions {
+                    viewport: Viewport::Inline(VIEWPORT_HEIGHT),
+                },
+            )
+            .unwrap();
+            let mut state = answer_test_state();
+            state.verbose = true;
+            let thinking = "Considering Git Tree Status\n\nA pending paragraph without a newline.";
+            let source = "Committed as 316d37e6.\n\n- Included implementation and documentation.\n- Kept evidence ignored.\n\nGit working tree is clean. Nothing pushed.";
+            state.apply_event(AgentEvent::ThinkingDelta(thinking.into()));
+            flush_pending_insert(&mut terminal, &mut state, width).unwrap();
+            let split = source.find("Git working").unwrap();
+            state.apply_event(AgentEvent::TextDelta(source[..split].into()));
+            state.set_answer_width(width);
+            flush_pending_insert(&mut terminal, &mut state, width).unwrap();
+            assert!(state.transcript.iter().any(|line| matches!(line, Line_::ThinkingUnit { text, .. } if text.contains("pending paragraph"))), "thinking tail did not precede answer");
+            state.apply_event(AgentEvent::TextDelta(source[split..].into()));
+            state.set_answer_width(width);
+            flush_pending_insert(&mut terminal, &mut state, width).unwrap();
+            state.apply_event(AgentEvent::ThinkingBlockComplete(thinking.into()));
+            flush_pending_insert(&mut terminal, &mut state, width).unwrap();
+            state.apply_event(AgentEvent::TextBlockComplete(source.into()));
+            flush_pending_insert(&mut terminal, &mut state, width).unwrap();
+            let mut rows = [terminal.backend().scrollback(), terminal.backend().buffer()]
+                .into_iter()
+                .flat_map(|buffer| buffer_to_lines(buffer, buffer.area))
+                .map(|row| rendered_line_text(&row).trim_end().to_string())
+                .collect::<Vec<_>>();
+            while rows.last().is_some_and(|row| row.is_empty()) {
+                rows.pop();
+            }
+            assert_answer_card_uninterrupted(&rows);
+            assert_eq!(
+                rows.iter()
+                    .filter(|row| row.contains("pending paragraph"))
+                    .count(),
+                1
+            );
+            assert!(
+                !state.transcript_needs_rebuild,
+                "normal completion repainted history"
+            );
+            let expected = state
+                .transcript
+                .iter()
+                .flat_map(|line| line_to_text(line, width - 1).lines)
+                .map(|row| rendered_line_text(&row).trim_end().to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                rows, expected,
+                "native scrollback differs from replay source"
+            );
+        }
+    }
+
+    #[test]
+    fn answer_handoff_genuinely_late_thinking_waits_until_card_closes() {
+        let mut state = answer_test_state();
+        state.verbose = true;
+        state.transcript_rendered_width = 80;
+        let source = "First answer paragraph.\n\nSecond answer paragraph.";
+        state.apply_event(AgentEvent::TextDelta(source.into()));
+        state.set_answer_width(80);
+        state.transcript.append(&mut state.pending_insert);
+        state.apply_event(AgentEvent::ThinkingDelta("Late reasoning.\n".into()));
+        state.apply_event(AgentEvent::ThinkingBlockComplete(
+            "Late reasoning.\n".into(),
+        ));
+        assert!(
+            !state
+                .pending_insert
+                .iter()
+                .any(|line| matches!(line, Line_::ThinkingUnit { .. })),
+            "thinking entered an open card"
+        );
+        state.apply_event(AgentEvent::TextBlockComplete(source.into()));
+        let rows = state
+            .transcript
+            .iter()
+            .chain(&state.pending_insert)
+            .flat_map(|line| flatten_lines(&line_to_text(line, 79)))
+            .collect::<Vec<_>>();
+        assert_answer_card_uninterrupted(&rows);
+        let close = rows.iter().position(|row| row == "└").unwrap();
+        let late = rows
+            .iter()
+            .position(|row| row.contains("Late reasoning"))
+            .unwrap();
+        assert!(late > close);
+    }
+
+    #[test]
+    fn answer_handoff_toggle_and_correction_stay_before_pending_retry_and_history() {
+        for location in 0..3 {
+            let mut state = answer_test_state();
+            state.verbose = true;
+            state.transcript_rendered_width = 80;
+            let raw = "Title\n\nOriginal paragraph.";
+            let source = "First answer.\n\nLast answer.";
+            state.apply_event(AgentEvent::ThinkingDelta(raw.into()));
+            state.apply_event(AgentEvent::TextDelta(source.into()));
+            match location {
+                0 => {}
+                1 => state
+                    .prepared_insert_retry
+                    .append(&mut state.pending_insert),
+                _ => state.transcript.append(&mut state.pending_insert),
+            }
+            state.verbose = false;
+            state.sync_active_thinking_visibility();
+            assert!(
+                !state
+                    .transcript
+                    .iter()
+                    .chain(&state.prepared_insert_retry)
+                    .chain(&state.pending_insert)
+                    .any(|line| matches!(line, Line_::ThinkingUnit { .. }))
+            );
+            state.verbose = true;
+            state.sync_active_thinking_visibility();
+            assert_eq!(state.streaming_thinking, raw);
+            state.apply_event(AgentEvent::ThinkingBlockComplete(
+                "Title\n\nCorrected paragraph.".into(),
+            ));
+            state.apply_event(AgentEvent::TextBlockComplete(source.into()));
+            let rows = state
+                .transcript
+                .iter()
+                .chain(&state.prepared_insert_retry)
+                .chain(&state.pending_insert)
+                .flat_map(|line| flatten_lines(&line_to_text(line, 79)))
+                .collect::<Vec<_>>();
+            assert_answer_card_uninterrupted(&rows);
+            let answer = rows.iter().position(|row| row.contains("┌─ dext")).unwrap();
+            let corrected = rows
+                .iter()
+                .position(|row| row.contains("Corrected paragraph"))
+                .unwrap();
+            assert!(corrected < answer);
+            assert!(!rows.iter().any(|row| row.contains("Original paragraph")));
+            assert_eq!(rows.iter().filter(|row| row.contains("Title")).count(), 1);
+            assert_eq!(
+                rows.iter().filter(|row| row.trim().is_empty()).count(),
+                1,
+                "extra seam gaps: {rows:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn answer_handoff_keeps_raw_decoder_and_frugal_privacy_across_late_xml_close() {
+        let mut state = answer_test_state();
+        state.verbose = true;
+        state.context_mode = ContextMode::Frugal;
+        state.transcript_rendered_width = 80;
+        let raw = "Safe thought.\n\n<tool_call>secret payload";
+        state.apply_event(AgentEvent::ThinkingDelta(raw.into()));
+        let source = "Visible answer.\n\nEnding.";
+        state.apply_event(AgentEvent::TextDelta(source.into()));
+        assert_eq!(state.streaming_thinking, raw);
+        assert_eq!(
+            state
+                .active_thinking
+                .as_ref()
+                .unwrap()
+                .decoder
+                .open_display_text()
+                .as_deref(),
+            Some("<tool_call>secret payload")
+        );
+        let late = " more secret</tool_call>\n\nSafe late thought.\n";
+        state.apply_event(AgentEvent::ThinkingDelta(late.into()));
+        state.apply_event(AgentEvent::ThinkingBlockComplete(format!("{raw}{late}")));
+        state.apply_event(AgentEvent::TextBlockComplete(source.into()));
+        let rows = state
+            .pending_insert
+            .iter()
+            .flat_map(|line| flatten_lines(&line_to_text(line, 79)))
+            .collect::<Vec<_>>();
+        assert_answer_card_uninterrupted(&rows);
+        assert!(!rows.iter().any(|row| row.contains("secret")), "{rows:?}");
+        let close = rows.iter().position(|row| row == "└").unwrap();
+        let late = rows
+            .iter()
+            .position(|row| row.contains("Safe late thought"))
+            .unwrap();
+        assert!(late > close);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.contains("tool call redacted"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn answer_handoff_retry_empty_and_abort_remove_provisional_presentations() {
+        for event in [
+            AgentEvent::HttpRetry {
+                attempt: 1,
+                wait_secs: 1,
+                reason: "test".into(),
+            },
+            AgentEvent::RuntimeControlApplied {
+                commands: 1,
+                model_changed: true,
+                effort_changed: false,
+                mode_changed: false,
+                stream_aborted: true,
+            },
+        ] {
+            let mut state = answer_test_state();
+            state.verbose = true;
+            state.apply_event(AgentEvent::ThinkingDelta("Title\n\nPending tail.".into()));
+            state.apply_event(AgentEvent::TextDelta("Provisional answer.\n\nTail.".into()));
+            state.transcript.append(&mut state.pending_insert);
+            state.apply_event(AgentEvent::ThinkingDelta("\nLate unit.\n".into()));
+            state.apply_event(AgentEvent::ThinkingBlockComplete(
+                "Title\n\nPending tail.\nLate unit.\n".into(),
+            ));
+            state.apply_event(event);
+            assert!(
+                !state
+                    .transcript
+                    .iter()
+                    .chain(&state.pending_insert)
+                    .chain(&state.prepared_insert_retry)
+                    .any(|line| matches!(
+                        line,
+                        Line_::ThinkingUnit { .. } | Line_::AnswerPart { .. }
+                    ))
+            );
+            assert!(state.provisional_thinking.is_empty());
+            assert!(state.active_answer.is_none());
+        }
+        let mut state = answer_test_state();
+        state.verbose = true;
+        state.apply_event(AgentEvent::ThinkingDelta("Removed thinking.".into()));
+        state.apply_event(AgentEvent::TextDelta("Kept answer.\n\nEnding.".into()));
+        state.apply_event(AgentEvent::ThinkingBlockComplete(String::new()));
+        state.apply_event(AgentEvent::TextBlockComplete(
+            "Kept answer.\n\nEnding.".into(),
+        ));
+        let rows = state
+            .pending_insert
+            .iter()
+            .flat_map(|line| flatten_lines(&line_to_text(line, 79)))
+            .collect::<Vec<_>>();
+        assert_answer_card_uninterrupted(&rows);
+        assert!(!rows.iter().any(|row| row.contains("Removed thinking")));
+    }
+
+    #[test]
+    fn answer_handoff_failed_turn_keeps_sealed_late_units_outside_partial_card() {
+        let mut state = answer_test_state();
+        state.verbose = true;
+        state.apply_event(AgentEvent::ThinkingDelta("Initial tail.".into()));
+        state.apply_event(AgentEvent::TextDelta("Partial answer.\n\nTail.".into()));
+        state.apply_event(AgentEvent::ThinkingDelta(
+            "\nLate sealed line.\nUnsealed line".into(),
+        ));
+        state.apply_event(AgentEvent::TurnEnd {
+            usage: Usage::default(),
+            failed: true,
+        });
+        let rows = state
+            .pending_insert
+            .iter()
+            .flat_map(|line| flatten_lines(&line_to_text(line, 79)))
+            .collect::<Vec<_>>();
+        assert_answer_card_uninterrupted(&rows);
+        let close = rows.iter().position(|row| row == "└").unwrap();
+        assert!(
+            rows.iter()
+                .position(|row| row.contains("Late sealed line"))
+                .unwrap()
+                > close
+        );
+        assert!(!rows.iter().any(|row| row.contains("Unsealed line")));
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.contains("Initial tail"))
+                .count(),
+            1
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("preserved partial response"))
+        );
+    }
+
+    #[test]
+    fn answer_handoff_contiguity_check_catches_unrelated_rows() {
+        let mut state = answer_test_state();
+        state.transcript_rendered_width = 80;
+        let source = "First paragraph.\n\nLast paragraph.";
+        state.apply_event(AgentEvent::TextDelta(source.into()));
+        state.transcript.append(&mut state.pending_insert);
+        state.queue(Line_::Warn("intervening warning".into()));
+        assert!(!state.answer_matches_canonical(state.active_answer.as_ref().unwrap(), source));
+        state.apply_event(AgentEvent::TextBlockComplete(source.into()));
+        let rows = state
+            .transcript
+            .iter()
+            .chain(&state.pending_insert)
+            .flat_map(|line| flatten_lines(&line_to_text(line, 79)))
+            .collect::<Vec<_>>();
+        assert_answer_card_uninterrupted(&rows);
+    }
+
+    #[test]
+    fn answer_handoff_continued_line_reconciles_once_and_stays_bounded() {
+        for raw in [
+            "研究 line".into(),
+            "x".repeat(THINKING_LINE_DISPLAY_BYTES + 1),
+        ] {
+            let mut state = answer_test_state();
+            state.verbose = true;
+            state.apply_event(AgentEvent::ThinkingDelta(raw.clone()));
+            state.apply_event(AgentEvent::TextDelta(
+                "First answer.\n\nLast answer.".into(),
+            ));
+            state.transcript.append(&mut state.pending_insert);
+            state.apply_event(AgentEvent::ThinkingDelta(" continuation".into()));
+            state.apply_event(AgentEvent::ThinkingBlockComplete(format!(
+                "{raw} continuation"
+            )));
+            state.apply_event(AgentEvent::TextBlockComplete(
+                "First answer.\n\nLast answer.".into(),
+            ));
+            let rows = state
+                .transcript
+                .iter()
+                .chain(&state.pending_insert)
+                .flat_map(|line| flatten_lines(&line_to_text(line, 79)))
+                .collect::<Vec<_>>();
+            assert_answer_card_uninterrupted(&rows);
+            assert_eq!(state.provisional_thinking[0].units.len(), 1);
+            assert!(
+                state.provisional_thinking[0].units[0].text.len() <= THINKING_LINE_DISPLAY_BYTES
+            );
+            if raw.starts_with('x') {
+                assert_eq!(
+                    rows.iter()
+                        .filter(|row| row.contains("long thinking line omitted"))
+                        .count(),
+                    1
+                );
+            } else {
+                assert_eq!(
+                    rows.iter()
+                        .filter(|row| row.contains("研究 line continuation"))
+                        .count(),
+                    1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn answer_handoff_hidden_completion_does_not_reveal_old_thinking_on_next_answer() {
+        let mut state = answer_test_state();
+        state.verbose = false;
+        state.apply_event(AgentEvent::ThinkingDelta("Hidden first thought.".into()));
+        state.apply_event(AgentEvent::TextDelta("First answer.".into()));
+        state.apply_event(AgentEvent::ThinkingBlockComplete(
+            "Hidden first thought.".into(),
+        ));
+        state.apply_event(AgentEvent::TextBlockComplete("First answer.".into()));
+        state.verbose = true;
+        state.apply_event(AgentEvent::ThinkingDelta("Visible second thought.".into()));
+        state.apply_event(AgentEvent::TextBlockComplete("Second answer.".into()));
+        let rows = state
+            .pending_insert
+            .iter()
+            .flat_map(|line| flatten_lines(&line_to_text(line, 79)))
+            .collect::<Vec<_>>();
+        assert!(
+            !rows.iter().any(|row| row.contains("Hidden first thought")),
+            "{rows:?}"
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.contains("Visible second thought"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn answer_handoff_active_resize_and_correction_replay_remain_contiguous() {
+        use ratatui::backend::TestBackend;
+        let mut terminal = Terminal::with_options(
+            ReplayBackend::new(TestBackend::new(100, 28)),
+            TerminalOptions {
+                viewport: Viewport::Inline(VIEWPORT_HEIGHT),
+            },
+        )
+        .unwrap();
+        let mut state = answer_test_state();
+        state.verbose = true;
+        let raw = "Title\n\nPending paragraph.";
+        let source = "First answer paragraph.\n\nLast answer paragraph.";
+        state.apply_event(AgentEvent::ThinkingDelta(raw.into()));
+        state.apply_event(AgentEvent::TextDelta(source.into()));
+        state.set_answer_width(100);
+        flush_pending_insert(&mut terminal, &mut state, 100).unwrap();
+        for width in [60, 160, 100] {
+            terminal.backend_mut().inner.resize(width, 28);
+            state.set_answer_width(width);
+            rebuild_transcript_from_origin(&mut terminal, &mut state, width).unwrap();
+            flush_pending_insert(&mut terminal, &mut state, width).unwrap();
+            assert!(!state.transcript_needs_rebuild);
+        }
+        state.apply_event(AgentEvent::ThinkingBlockComplete(
+            "Corrected title\n\nCorrected paragraph.".into(),
+        ));
+        state.apply_event(AgentEvent::TextBlockComplete(source.into()));
+        state.set_answer_width(100);
+        rebuild_transcript_from_origin(&mut terminal, &mut state, 100).unwrap();
+        flush_pending_insert(&mut terminal, &mut state, 100).unwrap();
+        let mut rows = [
+            &terminal.backend().inner.scrollback(),
+            &terminal.backend().inner.buffer(),
+        ]
+        .into_iter()
+        .flat_map(|buffer| buffer_to_lines(buffer, buffer.area))
+        .map(|row| rendered_line_text(&row).trim_end().to_string())
+        .collect::<Vec<_>>();
+        while rows.last().is_some_and(|row| row.is_empty()) {
+            rows.pop();
+        }
+        assert_answer_card_uninterrupted(&rows);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.contains("Corrected paragraph"))
+                .count(),
+            1
+        );
+        assert!(!rows.iter().any(|row| row.contains("Pending paragraph")));
+        let expected = state
+            .transcript
+            .iter()
+            .flat_map(|line| line_to_text(line, 99).lines)
+            .map(|row| rendered_line_text(&row).trim_end().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(rows, expected);
+    }
+
+    #[test]
+    fn answer_handoff_sealed_line_continuation_survives_turn_boundary() {
+        let mut state = answer_test_state();
+        state.verbose = true;
+        state.apply_event(AgentEvent::ThinkingDelta("Initial tail".into()));
+        state.apply_event(AgentEvent::TextDelta("Partial answer.\n\nTail.".into()));
+        state.apply_event(AgentEvent::ThinkingDelta(
+            " continuation\nLate sealed line.\n".into(),
+        ));
+        state.apply_event(AgentEvent::TurnEnd {
+            usage: Usage::default(),
+            failed: true,
+        });
+        let rows = state
+            .pending_insert
+            .iter()
+            .flat_map(|line| flatten_lines(&line_to_text(line, 79)))
+            .collect::<Vec<_>>();
+        assert_answer_card_uninterrupted(&rows);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.contains("Initial tail continuation"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.contains("Late sealed line"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn answer_handoff_interruption_discards_thinking_without_splitting_partial_answer() {
+        let mut state = answer_test_state();
+        state.verbose = true;
+        state.apply_event(AgentEvent::ThinkingDelta("Discarded initial tail.".into()));
+        state.apply_event(AgentEvent::TextDelta("Partial answer.\n\nTail.".into()));
+        state.transcript.append(&mut state.pending_insert);
+        state.apply_event(AgentEvent::ThinkingDelta("\nDiscarded late line.\n".into()));
+        state.apply_event(AgentEvent::Interrupted);
+        let rows = state
+            .transcript
+            .iter()
+            .chain(&state.pending_insert)
+            .flat_map(|line| flatten_lines(&line_to_text(line, 79)))
+            .collect::<Vec<_>>();
+        assert_answer_card_uninterrupted(&rows);
+        assert!(!rows.iter().any(|row| row.contains("Discarded")));
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("preserved partial response"))
+        );
+        assert!(state.provisional_thinking.is_empty() && state.active_thinking.is_none());
+    }
+
+    #[test]
+    fn answer_handoff_review_empty_delta_does_not_take_over_thinking() {
+        let mut state = answer_test_state();
+        state.verbose = true;
+        state.apply_event(AgentEvent::ThinkingDelta("Still thinking".into()));
+        state.apply_event(AgentEvent::TextDelta(String::new()));
+        assert!(
+            state.active_answer.is_none(),
+            "an empty delta opened an answer"
+        );
+        assert!(state.active_thinking.as_ref().unwrap().handoff.is_none());
+        let live = live_indicator_detail(&state, 80)
+            .iter()
+            .map(rendered_line_text)
+            .collect::<String>();
+        assert!(live.contains("Still thinking"), "{live}");
+    }
+
+    #[test]
+    fn answer_handoff_review_late_open_thinking_is_visible_after_card_closes() {
+        let mut state = answer_test_state();
+        state.verbose = true;
+        state.apply_event(AgentEvent::ThinkingDelta("Initial thought".into()));
+        state.apply_event(AgentEvent::TextDelta("Answer".into()));
+        state.apply_event(AgentEvent::ThinkingDelta("\n\nLater open thought".into()));
+        state.apply_event(AgentEvent::TextBlockComplete("Answer".into()));
+        let live = live_indicator_detail(&state, 80)
+            .iter()
+            .map(rendered_line_text)
+            .collect::<String>();
+        assert!(
+            live.contains("Later open thought"),
+            "late open thought vanished: {live}"
+        );
+        assert!(
+            !live.contains("Initial thought"),
+            "handed-off thought duplicated: {live}"
+        );
+    }
+
+    #[test]
+    fn answer_handoff_review_reconciled_boundary_survives_hide_show() {
+        let mut state = answer_test_state();
+        state.verbose = true;
+        state.apply_event(AgentEvent::ThinkingDelta("Initial thought".into()));
+        state.apply_event(AgentEvent::TextDelta("Answer".into()));
+        state.apply_event(AgentEvent::ThinkingDelta(
+            " extended\nLate sealed thought\n".into(),
+        ));
+        state.apply_event(AgentEvent::TextBlockComplete("Answer".into()));
+        for visible in [false, true] {
+            state.verbose = visible;
+            state.sync_active_thinking_visibility();
+        }
+        let shown = state
+            .pending_insert
+            .iter()
+            .filter_map(|line| match line {
+                Line_::ThinkingUnit { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(shown, ["Initial thought extended", "Late sealed thought"]);
+    }
+
+    #[test]
+    fn answer_handoff_review_replacement_card_never_receives_unanchored_correction() {
+        let mut state = answer_test_state();
+        state.verbose = true;
+        state.transcript_rendered_width = 80;
+        state.apply_event(AgentEvent::ThinkingDelta("Thought".into()));
+        state.apply_event(AgentEvent::TextDelta("Discarded answer.\n\nTail.".into()));
+        state.apply_event(AgentEvent::TextBlockComplete(String::new()));
+        state.apply_event(AgentEvent::TextDelta("Replacement answer.\n\nTail.".into()));
+        state.apply_event(AgentEvent::ThinkingBlockComplete(
+            "Corrected thought".into(),
+        ));
+        state.apply_event(AgentEvent::TextBlockComplete(
+            "Replacement answer.\n\nTail.".into(),
+        ));
+        let rows = state
+            .pending_insert
+            .iter()
+            .flat_map(|line| flatten_lines(&line_to_text(line, 79)))
+            .collect::<Vec<_>>();
+        assert_answer_card_uninterrupted(&rows);
+        let correction = rows
+            .iter()
+            .position(|row| row.contains("Corrected thought"))
+            .unwrap();
+        let opening = rows.iter().position(|row| row.contains("┌─ dext")).unwrap();
+        assert!(
+            correction < opening,
+            "correction lost its new boundary: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn answer_handoff_review_turn_start_settles_previous_deferred_units() {
+        let mut state = answer_test_state();
+        state.verbose = true;
+        state.apply_event(AgentEvent::TextDelta("Partial answer.\n\nTail.".into()));
+        state.apply_event(AgentEvent::ThinkingDelta(
+            "Deferred sealed thought\n".into(),
+        ));
+        state.apply_event(AgentEvent::ThinkingBlockComplete(
+            "Deferred sealed thought\n".into(),
+        ));
+        state.apply_event(AgentEvent::TurnStart);
+        let rows = state
+            .pending_insert
+            .iter()
+            .flat_map(|line| flatten_lines(&line_to_text(line, 79)))
+            .collect::<Vec<_>>();
+        assert_answer_card_uninterrupted(&rows);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.contains("Deferred sealed thought"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn answer_handoff_review_each_card_gets_its_own_pending_tail() {
+        let mut state = answer_test_state();
+        state.verbose = true;
+        state.apply_event(AgentEvent::ThinkingDelta("First thought".into()));
+        state.apply_event(AgentEvent::TextBlockComplete("First answer".into()));
+        state.apply_event(AgentEvent::ThinkingDelta("\n\nSecond thought".into()));
+        state.apply_event(AgentEvent::TextDelta("Second answer\n\nTail".into()));
+        state.apply_event(AgentEvent::ThinkingBlockComplete(
+            "First thought\n\nSecond thought".into(),
+        ));
+        state.apply_event(AgentEvent::TextBlockComplete(
+            "Second answer\n\nTail".into(),
+        ));
+        state.verbose = false;
+        // Completed blocks are unchanged by the active-only toggle.
+        state.sync_active_thinking_visibility();
+        let rows = state
+            .pending_insert
+            .iter()
+            .flat_map(|line| flatten_lines(&line_to_text(line, 79)))
+            .collect::<Vec<_>>();
+        let openings = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.contains("┌─ dext"))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        assert_eq!(openings.len(), 2);
+        let second = rows
+            .iter()
+            .position(|row| row.contains("Second thought"))
+            .unwrap();
+        assert!(openings[0] < second && second < openings[1], "{rows:?}");
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.contains("First thought"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn answer_handoff_review_multiple_boundaries_hide_show_preserves_grouping() {
+        let mut state = answer_test_state();
+        state.verbose = true;
+        state.apply_event(AgentEvent::ThinkingDelta("First thought".into()));
+        state.apply_event(AgentEvent::TextBlockComplete("First answer".into()));
+        state.apply_event(AgentEvent::ThinkingDelta("\n\nSecond thought".into()));
+        state.apply_event(AgentEvent::TextDelta("Second answer\n\nTail".into()));
+        state.apply_event(AgentEvent::ThinkingDelta(
+            " extended\n\nLate thought\n".into(),
+        ));
+        state.apply_event(AgentEvent::TextBlockComplete(
+            "Second answer\n\nTail".into(),
+        ));
+        for visible in [false, true] {
+            state.verbose = visible;
+            state.sync_active_thinking_visibility();
+        }
+        let rows = state
+            .pending_insert
+            .iter()
+            .flat_map(|line| flatten_lines(&line_to_text(line, 79)))
+            .collect::<Vec<_>>();
+        let openings = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.contains("┌─ dext"))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let first = rows
+            .iter()
+            .position(|row| row.contains("First thought"))
+            .unwrap();
+        let second = rows
+            .iter()
+            .position(|row| row.contains("Second thought extended"))
+            .unwrap();
+        let late = rows
+            .iter()
+            .position(|row| row.contains("Late thought"))
+            .unwrap();
+        assert!(
+            first < openings[0]
+                && openings[0] < second
+                && second < openings[1]
+                && openings[1] < late,
+            "{rows:?}"
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.contains("First thought"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.contains("Late thought"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn answer_handoff_review_mode_change_rebuilds_entire_handed_prefix_before_answer() {
+        let mut state = answer_test_state();
+        state.verbose = true;
+        let raw = "Before <tool_call>secret</tool_call> After";
+        state.apply_event(AgentEvent::ThinkingDelta(raw.into()));
+        state.apply_event(AgentEvent::TextDelta("Answer\n\nTail".into()));
+        state.context_mode = ContextMode::Frugal;
+        state.sync_active_thinking_visibility();
+        state.apply_event(AgentEvent::ThinkingBlockComplete(raw.into()));
+        state.apply_event(AgentEvent::TextBlockComplete("Answer\n\nTail".into()));
+        let rows = state
+            .pending_insert
+            .iter()
+            .flat_map(|line| flatten_lines(&line_to_text(line, 79)))
+            .collect::<Vec<_>>();
+        assert_answer_card_uninterrupted(&rows);
+        let opening = rows.iter().position(|row| row.contains("┌─ dext")).unwrap();
+        assert!(
+            rows.iter().position(|row| row.contains("After")).unwrap() < opening,
+            "{rows:?}"
+        );
+        assert!(!rows.iter().any(|row| row.contains("secret")), "{rows:?}");
+    }
+
+    #[test]
+    fn answer_handoff_review_shortened_unicode_correction_resets_valid_offsets() {
+        let mut state = answer_test_state();
+        state.verbose = true;
+        state.apply_event(AgentEvent::ThinkingDelta("Long first thought".into()));
+        state.apply_event(AgentEvent::TextDelta("Answer".into()));
+        state.apply_event(AgentEvent::ThinkingDelta("\nLate thought\n".into()));
+        state.apply_event(AgentEvent::ThinkingBlockComplete("短".into()));
+        state.apply_event(AgentEvent::TextBlockComplete("Answer".into()));
+        let rows = state
+            .pending_insert
+            .iter()
+            .flat_map(|line| flatten_lines(&line_to_text(line, 79)))
+            .collect::<Vec<_>>();
+        assert_answer_card_uninterrupted(&rows);
+        assert_eq!(rows.iter().filter(|row| row.contains('短')).count(), 1);
+        assert!(!rows.iter().any(|row| row.contains("thought")));
+    }
+
+    #[test]
+    fn answer_handoff_review_same_line_expansion_is_not_split_at_old_unit_count() {
+        let mut state = answer_test_state();
+        state.verbose = true;
+        state.context_mode = ContextMode::Frugal;
+        state.apply_event(AgentEvent::ThinkingDelta("<tool_call>hidden".into()));
+        state.apply_event(AgentEvent::TextDelta("Answer\n\nTail".into()));
+        state.apply_event(AgentEvent::ThinkingDelta(
+            "</tool_call> Safe continuation\nLate thought\n".into(),
+        ));
+        state.apply_event(AgentEvent::ThinkingBlockComplete(
+            "<tool_call>hidden</tool_call> Safe continuation\nLate thought\n".into(),
+        ));
+        state.apply_event(AgentEvent::TextBlockComplete("Answer\n\nTail".into()));
+        let rows = state
+            .pending_insert
+            .iter()
+            .flat_map(|line| flatten_lines(&line_to_text(line, 79)))
+            .collect::<Vec<_>>();
+        assert_answer_card_uninterrupted(&rows);
+        let opening = rows.iter().position(|row| row.contains("┌─ dext")).unwrap();
+        assert!(
+            rows.iter()
+                .position(|row| row.contains("Safe continuation"))
+                .unwrap()
+                < opening,
+            "same logical line split: {rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .position(|row| row.contains("Late thought"))
+                .unwrap()
+                > opening
+        );
+        assert!(!rows.iter().any(|row| row.contains("hidden")));
+    }
+
+    #[test]
+    fn answer_handoff_review_unsealed_continuation_does_not_duplicate_handed_line_live() {
+        let mut state = answer_test_state();
+        state.verbose = true;
+        state.apply_event(AgentEvent::ThinkingDelta("Original thought".into()));
+        state.apply_event(AgentEvent::TextDelta("Answer".into()));
+        state.apply_event(AgentEvent::ThinkingDelta(" continued".into()));
+        state.apply_event(AgentEvent::TextBlockComplete("Answer".into()));
+        let live = live_indicator_detail(&state, 80)
+            .iter()
+            .map(rendered_line_text)
+            .collect::<String>();
+        assert!(
+            !live.contains("Original thought"),
+            "continued handoff duplicated live: {live}"
+        );
+        state.apply_event(AgentEvent::ThinkingDelta("\nNew open thought".into()));
+        let live = live_indicator_detail(&state, 80)
+            .iter()
+            .map(rendered_line_text)
+            .collect::<String>();
+        assert!(live.contains("New open thought"), "{live}");
+    }
+
+    #[test]
+    fn answer_handoff_review_blank_and_redacted_boundaries_remain_resource_bounded() {
+        let mut state = answer_test_state();
+        state.verbose = false;
+        state.context_mode = ContextMode::Frugal;
+        state.apply_event(AgentEvent::ThinkingDelta("<tool_call>\n".into()));
+        for _ in 0..100 {
+            state.apply_event(AgentEvent::ThinkingDelta("private\n".into()));
+            state.apply_event(AgentEvent::TextBlockComplete("Answer".into()));
+        }
+        let active = state.active_thinking.as_ref().unwrap();
+        let handoff = active.handoff.as_ref().unwrap();
+        assert!(handoff.units.len() <= THINKING_UNIT_DISPLAY_CAP + 1);
+        assert_eq!(
+            handoff.boundaries.len(),
+            1,
+            "redacted lines allocated boundaries"
+        );
+        assert_eq!(
+            state.streaming_thinking,
+            format!("<tool_call>\n{}", "private\n".repeat(100))
+        );
+    }
+
+    #[test]
+    fn answer_handoff_review_line_boundaries_match_decoder_and_tail_caps() {
+        for raw in ["", "a", "a\r", "a\r\nb\nc\u{2028}d\u{2029}e", "a\n\n"] {
+            let mut decoded = 0;
+            let mut decoder = ThinkingLineDecoder::default();
+            decoder.push(raw, |_| decoded += 1);
+            decoded += decoder.finish().len();
+            assert_eq!(thinking_line_boundaries(raw).count(), decoded, "{raw:?}");
+            assert!(thinking_line_boundaries(raw).all(|end| raw.is_char_boundary(end)));
+        }
+        let mut active = ActiveThinking::new(1, ContextMode::Frugal);
+        active.push(&"line\n".repeat(THINKING_UNIT_DISPLAY_CAP));
+        active.push("Before <tool_call>hidden</tool_call> After");
+        let tail = active.finished_tail();
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].text, THINKING_UNITS_OMITTED);
+        assert!(
+            active
+                .decoder
+                .open_display_text()
+                .unwrap()
+                .contains("Before")
+        );
+        active.finish();
+        assert!(active.finished_tail().is_empty());
+    }
+
+    #[test]
+    fn answer_handoff_review_repeated_cards_toggle_mode_and_correction_preserve_all_units() {
+        let mut state = answer_test_state();
+        state.verbose = true;
+        state.context_mode = ContextMode::Frugal;
+        let mut raw = String::new();
+        for index in 0..8 {
+            let thought =
+                format!("Thought{index:02} <tool_call>hidden</tool_call> Safe{index:02}\n\n");
+            raw.push_str(&thought);
+            state.apply_event(AgentEvent::ThinkingDelta(thought));
+            state.apply_event(AgentEvent::TextBlockComplete(format!("Answer{index:02}")));
+            state.verbose = false;
+            state.sync_active_thinking_visibility();
+            state.verbose = true;
+            state.sync_active_thinking_visibility();
+        }
+        raw.push_str("Later final thought");
+        state.apply_event(AgentEvent::ThinkingDelta("Later final thought".into()));
+        state.apply_event(AgentEvent::ThinkingBlockComplete(raw));
+        let rows = state
+            .pending_insert
+            .iter()
+            .flat_map(|line| flatten_lines(&line_to_text(line, 79)))
+            .collect::<Vec<_>>();
+        for index in 0..8 {
+            let thought = rows
+                .iter()
+                .position(|row| row.contains(&format!("Thought{index:02}")))
+                .unwrap();
+            let safe = rows
+                .iter()
+                .position(|row| row.contains(&format!("Safe{index:02}")))
+                .unwrap();
+            let answer = rows
+                .iter()
+                .position(|row| row.contains(&format!("Answer{index:02}")))
+                .unwrap();
+            assert!(thought < safe && safe < answer, "{rows:?}");
+            assert_eq!(
+                rows.iter()
+                    .filter(|row| row.contains(&format!("Thought{index:02}")))
+                    .count(),
+                1
+            );
+        }
+        assert!(!rows.iter().any(|row| row.contains("hidden")));
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.contains("Later final thought"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn answer_handoff_review_hidden_completed_block_is_not_resurrected_after_toggle() {
+        let mut state = answer_test_state();
+        state.verbose = true;
+        state.apply_event(AgentEvent::TextDelta("First answer\n\nTail".into()));
+        state.apply_event(AgentEvent::ThinkingDelta(
+            "Hidden completed thinking\n".into(),
+        ));
+        state.verbose = false;
+        state.sync_active_thinking_visibility();
+        state.apply_event(AgentEvent::ThinkingBlockComplete(
+            "Hidden completed thinking\n".into(),
+        ));
+        state.verbose = true;
+        state.apply_event(AgentEvent::TextBlockComplete("First answer\n\nTail".into()));
+        let rows = state
+            .pending_insert
+            .iter()
+            .flat_map(|line| flatten_lines(&line_to_text(line, 79)))
+            .collect::<Vec<_>>();
+        assert_answer_card_uninterrupted(&rows);
+        assert!(!rows.iter().any(|row| row.contains("Hidden completed")));
+    }
+
+    #[test]
+    fn answer_handoff_review_crlf_and_unicode_boundaries_survive_late_completion_and_toggle() {
+        for newline in ["\n", "\r", "\r\n", "\u{2028}", "\u{2029}"] {
+            let mut state = answer_test_state();
+            state.verbose = true;
+            let initial = format!("Title{newline}{newline}研究 thought");
+            state.apply_event(AgentEvent::ThinkingDelta(initial.clone()));
+            state.apply_event(AgentEvent::TextDelta("Answer\n\nTail".into()));
+            state.apply_event(AgentEvent::ThinkingDelta(format!(
+                " continuation{newline}Later thought{newline}"
+            )));
+            state.apply_event(AgentEvent::TextBlockComplete("Answer\n\nTail".into()));
+            for visible in [false, true] {
+                state.verbose = visible;
+                state.sync_active_thinking_visibility();
+            }
+            state.apply_event(AgentEvent::ThinkingBlockComplete(format!(
+                "{initial} continuation{newline}Later thought{newline}"
+            )));
+            let rows = state
+                .pending_insert
+                .iter()
+                .flat_map(|line| flatten_lines(&line_to_text(line, 79)))
+                .collect::<Vec<_>>();
+            assert_answer_card_uninterrupted(&rows);
+            assert_eq!(
+                rows.iter()
+                    .filter(|row| row.contains("研究 thought continuation"))
+                    .count(),
+                1,
+                "{rows:?}"
+            );
+            assert_eq!(
+                rows.iter()
+                    .filter(|row| row.contains("Later thought"))
+                    .count(),
+                1,
+                "{rows:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn answer_handoff_review_mode_change_preserves_two_card_boundaries_and_privacy() {
+        let mut state = answer_test_state();
+        state.verbose = true;
+        let first = "One <tool_call>secret1</tool_call> Safe1";
+        let second = "Two <tool_call>secret2</tool_call> Safe2";
+        state.apply_event(AgentEvent::ThinkingDelta(first.into()));
+        state.apply_event(AgentEvent::TextBlockComplete("First answer".into()));
+        state.apply_event(AgentEvent::ThinkingDelta(format!("\n\n{second}")));
+        state.apply_event(AgentEvent::TextDelta("Second answer\n\nTail".into()));
+        state.context_mode = ContextMode::Frugal;
+        state.sync_active_thinking_visibility();
+        state.apply_event(AgentEvent::ThinkingBlockComplete(format!(
+            "{first}\n\n{second}"
+        )));
+        state.apply_event(AgentEvent::TextBlockComplete(
+            "Second answer\n\nTail".into(),
+        ));
+        let rows = state
+            .pending_insert
+            .iter()
+            .flat_map(|line| flatten_lines(&line_to_text(line, 79)))
+            .collect::<Vec<_>>();
+        let openings = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.contains("┌─ dext"))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        assert_eq!(openings.len(), 2);
+        let safe1 = rows.iter().position(|row| row.contains("Safe1")).unwrap();
+        let safe2 = rows.iter().position(|row| row.contains("Safe2")).unwrap();
+        assert!(
+            safe1 < openings[0] && openings[0] < safe2 && safe2 < openings[1],
+            "{rows:?}"
+        );
+        assert!(!rows.iter().any(|row| row.contains("secret")), "{rows:?}");
+    }
+
+    #[test]
+    fn answer_handoff_review_post_answer_thinking_deltas_reconcile_without_waiting_for_completion()
+    {
+        let mut state = answer_test_state();
+        state.verbose = true;
+        state.apply_event(AgentEvent::ThinkingDelta("Original thought".into()));
+        state.apply_event(AgentEvent::TextBlockComplete("Answer".into()));
+        state.apply_event(AgentEvent::ThinkingDelta(
+            " continued\nLater sealed thought\n".into(),
+        ));
+        let shown = state
+            .pending_insert
+            .iter()
+            .filter_map(|line| match line {
+                Line_::ThinkingUnit { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            shown,
+            ["Original thought continued", "Later sealed thought"]
+        );
+    }
+
+    #[test]
+    fn answer_handoff_review_split_crlf_keeps_one_boundary_and_open_tail() {
+        let mut state = answer_test_state();
+        state.verbose = true;
+        state.apply_event(AgentEvent::ThinkingDelta("Thought\r".into()));
+        state.apply_event(AgentEvent::TextDelta("Answer".into()));
+        state.apply_event(AgentEvent::ThinkingDelta("\nLater open thought".into()));
+        state.apply_event(AgentEvent::TextBlockComplete("Answer".into()));
+        for visible in [false, true] {
+            state.verbose = visible;
+            state.sync_active_thinking_visibility();
+        }
+        let live = live_indicator_detail(&state, 80)
+            .iter()
+            .map(rendered_line_text)
+            .collect::<String>();
+        assert!(live.contains("Later open thought"), "{live}");
+        state.apply_event(AgentEvent::ThinkingBlockComplete(
+            "Thought\r\nLater open thought".into(),
+        ));
+        let rows = state
+            .pending_insert
+            .iter()
+            .flat_map(|line| flatten_lines(&line_to_text(line, 79)))
+            .collect::<Vec<_>>();
+        assert_answer_card_uninterrupted(&rows);
+        assert_eq!(
+            rows.iter().filter(|row| row.contains("• Thought")).count(),
+            1
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.contains("Later open thought"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn answer_handoff_review_multiple_cards_match_native_history_after_active_toggle() {
+        use ratatui::backend::TestBackend;
+        for width in [60, 100, 160] {
+            let mut terminal = Terminal::with_options(
+                ReplayBackend::new(TestBackend::new(width, 28)),
+                TerminalOptions {
+                    viewport: Viewport::Inline(VIEWPORT_HEIGHT),
+                },
+            )
+            .unwrap();
+            let mut state = answer_test_state();
+            state.verbose = true;
+            state.apply_event(AgentEvent::ThinkingDelta("First thought".into()));
+            state.apply_event(AgentEvent::TextBlockComplete("First answer".into()));
+            flush_pending_insert(&mut terminal, &mut state, width).unwrap();
+            state.apply_event(AgentEvent::ThinkingDelta("\n\nSecond thought".into()));
+            let second = "Second answer.\n\nFinal paragraph.";
+            state.apply_event(AgentEvent::TextDelta(second.into()));
+            state.set_answer_width(width);
+            flush_pending_insert(&mut terminal, &mut state, width).unwrap();
+            state.apply_event(AgentEvent::ThinkingDelta(
+                " extended\n\nLater thought\n".into(),
+            ));
+            state.apply_event(AgentEvent::TextBlockComplete(second.into()));
+            state.set_answer_width(width);
+            rebuild_transcript_from_origin(&mut terminal, &mut state, width).unwrap();
+            flush_pending_insert(&mut terminal, &mut state, width).unwrap();
+            for visible in [false, true] {
+                state.verbose = visible;
+                state.sync_active_thinking_visibility();
+                state.set_answer_width(width);
+                rebuild_transcript_from_origin(&mut terminal, &mut state, width).unwrap();
+                flush_pending_insert(&mut terminal, &mut state, width).unwrap();
+            }
+            state.apply_event(AgentEvent::ThinkingBlockComplete(
+                "First thought\n\nSecond thought extended\n\nLater thought\n".into(),
+            ));
+            flush_pending_insert(&mut terminal, &mut state, width).unwrap();
+            let mut rows = [
+                terminal.backend().inner.scrollback(),
+                terminal.backend().inner.buffer(),
+            ]
+            .into_iter()
+            .flat_map(|buffer| buffer_to_lines(buffer, buffer.area))
+            .map(|row| rendered_line_text(&row).trim_end().to_string())
+            .collect::<Vec<_>>();
+            while rows.last().is_some_and(|row| row.is_empty()) {
+                rows.pop();
+            }
+            let expected = state
+                .transcript
+                .iter()
+                .flat_map(|line| line_to_text(line, width - 1).lines)
+                .map(|row| rendered_line_text(&row).trim_end().to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(rows, expected, "native/replay mismatch at {width}");
+            let openings = rows
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| row.contains("┌─ dext"))
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            let second_thought = rows
+                .iter()
+                .position(|row| row.contains("Second thought extended"))
+                .unwrap();
+            assert!(openings[0] < second_thought && second_thought < openings[1]);
+            assert_eq!(
+                rows.iter()
+                    .filter(|row| row.contains("Later thought"))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn answer_handoff_audit_empty_preview_commit_does_not_drop_deferred_thinking() {
+        let mut state = answer_test_state();
+        state.verbose = true;
+        state.apply_event(AgentEvent::TextDelta("Answer\n\nTail".into()));
+        state.apply_event(AgentEvent::ThinkingDelta("Deferred thought\n".into()));
+        state.apply_event(AgentEvent::ThinkingBlockComplete(
+            "Deferred thought\n".into(),
+        ));
+        state.apply_event(AgentEvent::ThinkingPreviewCommitted);
+        state.apply_event(AgentEvent::TextBlockComplete("Answer\n\nTail".into()));
+        let rows = state
+            .pending_insert
+            .iter()
+            .flat_map(|line| flatten_lines(&line_to_text(line, 79)))
+            .collect::<Vec<_>>();
+        assert_answer_card_uninterrupted(&rows);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.contains("Deferred thought"))
+                .count(),
+            1,
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn answer_handoff_audit_whitespace_answer_does_not_discard_earlier_provisional_card() {
+        let mut state = answer_test_state();
+        state.verbose = true;
+        state.apply_event(AgentEvent::TextBlockComplete(
+            "Earlier complete answer".into(),
+        ));
+        state.apply_event(AgentEvent::TextDelta(" \n\n".into()));
+        state.apply_event(AgentEvent::TurnEnd {
+            failed: false,
+            usage: Usage::default(),
+        });
+        let rows = state
+            .pending_insert
+            .iter()
+            .flat_map(|line| flatten_lines(&line_to_text(line, 79)))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.contains("Earlier complete answer"))
+                .count(),
+            1,
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn answer_handoff_audit_hidden_completed_handoff_not_restored_by_later_answer() {
+        let mut state = answer_test_state();
+        state.verbose = false;
+        state.apply_event(AgentEvent::ThinkingDelta("Hidden thought".into()));
+        state.apply_event(AgentEvent::TextBlockComplete("Answer1".into()));
+        state.verbose = true;
+        state.apply_event(AgentEvent::ThinkingDelta(
+            " continuation\nLater thought\n".into(),
+        ));
+        state.apply_event(AgentEvent::TextBlockComplete("Answer2".into()));
+        state.apply_event(AgentEvent::ThinkingBlockComplete(
+            "Hidden thought continuation\nLater thought\n".into(),
+        ));
+        let rows = state
+            .pending_insert
+            .iter()
+            .flat_map(|line| flatten_lines(&line_to_text(line, 79)))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.contains("Hidden thought continuation"))
+                .count(),
+            1,
+            "{rows:?}"
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.contains("Later thought"))
+                .count(),
+            1,
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn answer_handoff_audit_committed_deferred_thinking_survives_retry_and_abort() {
+        for event in [
+            AgentEvent::HttpRetry {
+                attempt: 1,
+                wait_secs: 1,
+                reason: "test".into(),
+            },
+            AgentEvent::RuntimeControlApplied {
+                commands: 1,
+                model_changed: true,
+                effort_changed: false,
+                mode_changed: false,
+                stream_aborted: true,
+            },
+        ] {
+            let mut state = answer_test_state();
+            state.verbose = true;
+            state.apply_event(AgentEvent::TextDelta("Discarded answer\n\nTail".into()));
+            state.apply_event(AgentEvent::ThinkingDelta("Committed thought\n".into()));
+            state.apply_event(AgentEvent::ThinkingBlockComplete(
+                "Committed thought\n".into(),
+            ));
+            state.apply_event(AgentEvent::ThinkingPreviewCommitted);
+            state.apply_event(event);
+            let rows = state
+                .pending_insert
+                .iter()
+                .flat_map(|line| flatten_lines(&line_to_text(line, 79)))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                rows.iter()
+                    .filter(|row| row.contains("Committed thought"))
+                    .count(),
+                1,
+                "{rows:?}"
+            );
+            assert!(
+                !rows.iter().any(|row| row.contains("Discarded answer")),
+                "{rows:?}"
+            );
+            assert!(state.provisional_thinking.is_empty());
+        }
+    }
+
+    #[test]
+    fn answer_handoff_audit_committed_deferred_completion_respects_hidden_state() {
+        let mut state = answer_test_state();
+        state.verbose = true;
+        state.apply_event(AgentEvent::TextDelta("Answer\n\nTail".into()));
+        state.apply_event(AgentEvent::ThinkingDelta("Deferred thought\n".into()));
+        state.apply_event(AgentEvent::ThinkingBlockComplete(
+            "Deferred thought\n".into(),
+        ));
+        state.apply_event(AgentEvent::ThinkingPreviewCommitted);
+        state.verbose = false;
+        state.apply_event(AgentEvent::TextBlockComplete("Answer\n\nTail".into()));
+        state.verbose = true;
+        state.apply_event(AgentEvent::TextBlockComplete("Later answer".into()));
+        let rows = state
+            .pending_insert
+            .iter()
+            .flat_map(|line| flatten_lines(&line_to_text(line, 79)))
+            .collect::<Vec<_>>();
+        assert!(
+            !rows.iter().any(|row| row.contains("Deferred thought")),
+            "{rows:?}"
+        );
+        assert!(state.provisional_thinking.is_empty());
+    }
+
+    #[test]
+    fn answer_handoff_audit_same_logical_line_across_many_cards_stays_once_before_first() {
+        let mut state = answer_test_state();
+        state.verbose = true;
+        let mut raw = String::new();
+        for index in 0..6 {
+            let delta = format!("segment{index} ");
+            raw.push_str(&delta);
+            state.apply_event(AgentEvent::ThinkingDelta(delta));
+            state.apply_event(AgentEvent::TextBlockComplete(format!("Answer{index}")));
+            for visible in [false, true] {
+                state.verbose = visible;
+                state.sync_active_thinking_visibility();
+            }
+        }
+        state.apply_event(AgentEvent::ThinkingBlockComplete(raw.clone()));
+        let rows = state
+            .pending_insert
+            .iter()
+            .flat_map(|line| flatten_lines(&line_to_text(line, 79)))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows.iter().filter(|row| row.contains("segment0")).count(),
+            1,
+            "{rows:?}"
+        );
+        let thought = rows
+            .iter()
+            .position(|row| row.contains("segment0"))
+            .unwrap();
+        let answer = rows.iter().position(|row| row.contains("┌─ dext")).unwrap();
+        assert!(thought < answer, "{rows:?}");
+        assert!(rows.iter().any(|row| row.contains("segment5")), "{rows:?}");
+        let active = &state.provisional_thinking[0];
+        assert_eq!(active.handoff.as_ref().unwrap().boundaries.len(), 1);
+    }
+
+    #[test]
+    fn answer_handoff_audit_deferred_completed_privacy_switch_does_not_disclose_protocol() {
+        let mut state = answer_test_state();
+        state.verbose = true;
+        state.apply_event(AgentEvent::TextDelta("Answer\n\nTail".into()));
+        let raw = "Before <tool_call>private payload</tool_call> After\n";
+        state.apply_event(AgentEvent::ThinkingDelta(raw.into()));
+        state.apply_event(AgentEvent::ThinkingBlockComplete(raw.into()));
+        state.context_mode = ContextMode::Frugal;
+        state.sync_active_thinking_visibility();
+        state.sync_answer_visibility();
+        state.apply_event(AgentEvent::TextBlockComplete("Answer\n\nTail".into()));
+        let rows = state
+            .pending_insert
+            .iter()
+            .flat_map(|line| flatten_lines(&line_to_text(line, 79)))
+            .collect::<Vec<_>>();
+        assert_answer_card_uninterrupted(&rows);
+        assert!(
+            !rows.iter().any(|row| row.contains("private payload")),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("Before"))
+                && rows.iter().any(|row| row.contains("After")),
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn answer_handoff_audit_normal_corrected_thinking_deferred_with_contiguous_card() {
+        let mut state = answer_test_state();
+        state.verbose = true;
+        state.transcript_rendered_width = 80;
+        state.apply_event(AgentEvent::ThinkingDelta("Before\n\nEarly".into()));
+        state.apply_event(AgentEvent::TextDelta("Answer\n\nTail".into()));
+        state.apply_event(AgentEvent::ThinkingDelta("\n\nLate".into()));
+        state.apply_event(AgentEvent::ThinkingBlockComplete(
+            "Updated\n\nChanged\n\nDeferred".into(),
+        ));
+        state.apply_event(AgentEvent::TextBlockComplete("Answer\n\nTail".into()));
+        let rows = state
+            .pending_insert
+            .iter()
+            .flat_map(|line| flatten_lines(&line_to_text(line, 79)))
+            .collect::<Vec<_>>();
+        assert_answer_card_uninterrupted(&rows);
+        assert_eq!(rows.iter().filter(|row| row.contains("Updated")).count(), 1);
+        assert_eq!(rows.iter().filter(|row| row.contains("Changed")).count(), 1);
+        let closing = rows.iter().position(|row| row == "└").unwrap();
+        assert!(
+            rows.iter()
+                .position(|row| row.contains("Deferred"))
+                .unwrap()
+                > closing
+        );
+    }
+
+    #[test]
+    fn answer_handoff_audit_deferred_privacy_refresh_preserves_handed_prefix_and_committed_units() {
+        for committed in [false, true] {
+            let mut state = answer_test_state();
+            state.verbose = true;
+            let initial = "Before <tool_call>secret1</tool_call> Safe1";
+            let late = "\n\nLate <tool_call>secret2</tool_call> Safe2\n";
+            state.apply_event(AgentEvent::ThinkingDelta(initial.into()));
+            state.apply_event(AgentEvent::TextDelta("Answer\n\nTail".into()));
+            state.apply_event(AgentEvent::ThinkingDelta(late.into()));
+            state.apply_event(AgentEvent::ThinkingBlockComplete(format!(
+                "{initial}{late}"
+            )));
+            if committed {
+                state.apply_event(AgentEvent::ThinkingPreviewCommitted);
+            }
+            state.context_mode = ContextMode::Frugal;
+            state.sync_active_thinking_visibility();
+            state.sync_answer_visibility();
+            state.apply_event(AgentEvent::TextBlockComplete("Answer\n\nTail".into()));
+            let rows = state
+                .pending_insert
+                .iter()
+                .flat_map(|line| flatten_lines(&line_to_text(line, 79)))
+                .collect::<Vec<_>>();
+            assert_answer_card_uninterrupted(&rows);
+            assert!(!rows.iter().any(|row| row.contains("secret")), "{rows:?}");
+            let opening = rows.iter().position(|row| row.contains("┌─ dext")).unwrap();
+            let closing = rows.iter().position(|row| row == "└").unwrap();
+            assert!(
+                rows.iter().position(|row| row.contains("Safe1")).unwrap() < opening,
+                "{rows:?}"
+            );
+            assert!(
+                rows.iter().position(|row| row.contains("Safe2")).unwrap() > closing,
+                "{rows:?}"
+            );
+            assert!(
+                state
+                    .provisional_thinking
+                    .iter()
+                    .all(|thinking| thinking.deferred_source.is_none())
+            );
+        }
+    }
+
+    #[test]
+    fn answer_handoff_audit_deferred_source_budget_has_explicit_safe_fallback() {
+        let mut state = answer_test_state();
+        state.verbose = true;
+        state.apply_event(AgentEvent::TextDelta("Answer\n\nTail".into()));
+        let raw = format!(
+            "{}\n",
+            "private".repeat(DEFERRED_THINKING_SOURCE_CAP / 7 + 1)
+        );
+        state.apply_event(AgentEvent::ThinkingBlockComplete(raw));
+        assert!(state.provisional_thinking[0].deferred_source.is_none());
+        state.context_mode = ContextMode::Frugal;
+        state.sync_active_thinking_visibility();
+        state.apply_event(AgentEvent::TextBlockComplete("Answer\n\nTail".into()));
+        let rows = state
+            .pending_insert
+            .iter()
+            .flat_map(|line| flatten_lines(&line_to_text(line, 79)))
+            .collect::<Vec<_>>();
+        assert_answer_card_uninterrupted(&rows);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.contains("display source limit"))
+                .count(),
+            1,
+            "{rows:?}"
+        );
+        assert!(!rows.iter().any(|row| row.contains("private")));
+    }
+
+    #[test]
+    fn answer_handoff_audit_deferred_source_budget_is_aggregate_and_released_after_flush() {
+        let mut state = answer_test_state();
+        state.verbose = true;
+        state.apply_event(AgentEvent::TextDelta("Answer\n\nTail".into()));
+        for _ in 0..2 {
+            state.apply_event(AgentEvent::ThinkingBlockComplete(format!(
+                "{}\n",
+                "x".repeat(DEFERRED_THINKING_SOURCE_CAP / 2)
+            )));
+        }
+        let retained = state
+            .provisional_thinking
+            .iter()
+            .filter_map(|thinking| thinking.deferred_source.as_ref())
+            .map(String::len)
+            .sum::<usize>();
+        assert!(retained <= DEFERRED_THINKING_SOURCE_CAP);
+        assert!(state.provisional_thinking.iter().any(|thinking| {
+            thinking
+                .units
+                .iter()
+                .any(|unit| unit.text == DEFERRED_THINKING_OMITTED)
+        }));
+        state.apply_event(AgentEvent::TextBlockComplete("Answer\n\nTail".into()));
+        assert!(
+            state
+                .provisional_thinking
+                .iter()
+                .all(|thinking| thinking.deferred_source.is_none())
+        );
+    }
+
+    #[test]
+    fn answer_handoff_audit_event_order_permutations_preserve_thoughts_and_single_card() {
+        for first_completion in [true, false] {
+            for commit_at in 0..=3 {
+                for location in 0..3 {
+                    let mut state = answer_test_state();
+                    state.verbose = true;
+                    state.transcript_rendered_width = 80;
+                    state.apply_event(AgentEvent::ThinkingDelta("Before\n\nPending".into()));
+                    state.apply_event(AgentEvent::TextDelta("Answer\n\nTail".into()));
+                    state.apply_event(AgentEvent::ThinkingDelta("\n\nAfter\n".into()));
+                    match location {
+                        1 => state.transcript.append(&mut state.pending_insert),
+                        2 => state
+                            .prepared_insert_retry
+                            .append(&mut state.pending_insert),
+                        _ => {}
+                    }
+                    let events = if first_completion {
+                        [
+                            AgentEvent::ThinkingBlockComplete(
+                                "Before\n\nPending\n\nAfter\n".into(),
+                            ),
+                            AgentEvent::TextBlockComplete("Answer\n\nTail".into()),
+                        ]
+                    } else {
+                        [
+                            AgentEvent::TextBlockComplete("Answer\n\nTail".into()),
+                            AgentEvent::ThinkingBlockComplete(
+                                "Before\n\nPending\n\nAfter\n".into(),
+                            ),
+                        ]
+                    };
+                    if commit_at == 0 {
+                        state.apply_event(AgentEvent::ThinkingPreviewCommitted);
+                    }
+                    state.apply_event(events[0].clone());
+                    if commit_at == 1 {
+                        state.apply_event(AgentEvent::ThinkingPreviewCommitted);
+                    }
+                    state.apply_event(events[1].clone());
+                    if commit_at == 2 {
+                        state.apply_event(AgentEvent::ThinkingPreviewCommitted);
+                    }
+                    let rows = state
+                        .transcript
+                        .iter()
+                        .chain(&state.prepared_insert_retry)
+                        .chain(&state.pending_insert)
+                        .flat_map(|line| flatten_lines(&line_to_text(line, 79)))
+                        .collect::<Vec<_>>();
+                    assert_answer_card_uninterrupted(&rows);
+                    for marker in ["Before", "Pending", "After", "Answer", "Tail"] {
+                        assert_eq!(
+                            rows.iter().filter(|row| row.contains(marker)).count(),
+                            1,
+                            "{first_completion}/{commit_at}/{location}: {rows:?}"
+                        );
+                    }
+                    let opening = rows.iter().position(|row| row.contains("┌─ dext")).unwrap();
+                    let closing = rows.iter().position(|row| row == "└").unwrap();
+                    assert!(rows.iter().position(|row| row.contains("Pending")).unwrap() < opening);
+                    assert!(rows.iter().position(|row| row.contains("After")).unwrap() > closing);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn answer_handoff_audit_whitespace_trailer_preserves_actual_history_and_replay() {
+        use ratatui::backend::TestBackend;
+        for width in [60, 100, 160] {
+            let mut terminal = Terminal::with_options(
+                ReplayBackend::new(TestBackend::new(width, 28)),
+                TerminalOptions {
+                    viewport: Viewport::Inline(VIEWPORT_HEIGHT),
+                },
+            )
+            .unwrap();
+            let mut state = answer_test_state();
+            state.apply_event(AgentEvent::TextBlockComplete(
+                "Completed answer survives".into(),
+            ));
+            flush_pending_insert(&mut terminal, &mut state, width).unwrap();
+            state.apply_event(AgentEvent::TextDelta(" \n\n".into()));
+            state.apply_event(AgentEvent::TurnEnd {
+                failed: true,
+                usage: Usage::default(),
+            });
+            state.set_answer_width(width);
+            if state.transcript_needs_rebuild {
+                rebuild_transcript_from_origin(&mut terminal, &mut state, width).unwrap();
+            }
+            flush_pending_insert(&mut terminal, &mut state, width).unwrap();
+            for replay in [false, true] {
+                if replay {
+                    rebuild_transcript_from_origin(&mut terminal, &mut state, width).unwrap();
+                }
+                let rows = [
+                    terminal.backend().inner.scrollback(),
+                    terminal.backend().inner.buffer(),
+                ]
+                .into_iter()
+                .flat_map(|buffer| buffer_to_lines(buffer, buffer.area))
+                .map(|row| rendered_line_text(&row).trim_end().to_string())
+                .collect::<Vec<_>>();
+                assert_eq!(
+                    rows.iter()
+                        .filter(|row| row.contains("Completed answer survives"))
+                        .count(),
+                    1,
+                    "{rows:?}"
+                );
+                assert_answer_card_uninterrupted(&rows);
+            }
+        }
+    }
+
+    #[test]
+    fn answer_handoff_audit_privacy_refresh_matches_native_history_before_resize() {
+        use ratatui::backend::TestBackend;
+        for width in [60, 100, 160] {
+            let mut terminal = Terminal::with_options(
+                ReplayBackend::new(TestBackend::new(width, 28)),
+                TerminalOptions {
+                    viewport: Viewport::Inline(VIEWPORT_HEIGHT),
+                },
+            )
+            .unwrap();
+            let mut state = answer_test_state();
+            state.verbose = true;
+            state.apply_event(AgentEvent::TextDelta("Answer\n\nTail".into()));
+            state.set_answer_width(width);
+            flush_pending_insert(&mut terminal, &mut state, width).unwrap();
+            let raw = "Before <tool_call>private payload</tool_call> After\n";
+            state.apply_event(AgentEvent::ThinkingDelta(raw.into()));
+            state.apply_event(AgentEvent::ThinkingBlockComplete(raw.into()));
+            state.apply_event(AgentEvent::ThinkingPreviewCommitted);
+            state.context_mode = ContextMode::Frugal;
+            state.sync_active_thinking_visibility();
+            state.sync_answer_visibility();
+            state.apply_event(AgentEvent::TextBlockComplete("Answer\n\nTail".into()));
+            state.set_answer_width(width);
+            if state.transcript_needs_rebuild {
+                rebuild_transcript_from_origin(&mut terminal, &mut state, width).unwrap();
+            }
+            flush_pending_insert(&mut terminal, &mut state, width).unwrap();
+            let mut rows = [
+                terminal.backend().inner.scrollback(),
+                terminal.backend().inner.buffer(),
+            ]
+            .into_iter()
+            .flat_map(|buffer| buffer_to_lines(buffer, buffer.area))
+            .map(|row| rendered_line_text(&row).trim_end().to_string())
+            .collect::<Vec<_>>();
+            while rows.last().is_some_and(|row| row.is_empty()) {
+                rows.pop();
+            }
+            assert_answer_card_uninterrupted(&rows);
+            assert!(
+                !rows.iter().any(|row| row.contains("private payload")),
+                "{rows:?}"
+            );
+            assert_eq!(
+                rows.iter().filter(|row| row.contains("After")).count(),
+                1,
+                "{rows:?}"
+            );
+            let expected = state
+                .transcript
+                .iter()
+                .flat_map(|line| line_to_text(line, width - 1).lines)
+                .map(|row| rendered_line_text(&row).trim_end().to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(rows, expected);
+            assert!(state.provisional_thinking.is_empty());
+        }
+    }
+
+    #[test]
+    fn answer_handoff_audit_deferred_privacy_mode_roundtrip_preserves_all_units() {
+        let mut state = answer_test_state();
+        state.verbose = true;
+        let first = "Before <tool_call>private1</tool_call> After1";
+        let late = "\n\nLate <tool_call>private2</tool_call> After2\n";
+        state.apply_event(AgentEvent::ThinkingDelta(first.into()));
+        state.apply_event(AgentEvent::TextDelta("Answer\n\nTail".into()));
+        state.apply_event(AgentEvent::ThinkingDelta(late.into()));
+        state.apply_event(AgentEvent::ThinkingBlockComplete(format!("{first}{late}")));
+        for mode in [
+            ContextMode::Frugal,
+            ContextMode::Standard,
+            ContextMode::Frugal,
+        ] {
+            state.context_mode = mode;
+            state.sync_active_thinking_visibility();
+            state.sync_answer_visibility();
+        }
+        state.apply_event(AgentEvent::TextBlockComplete("Answer\n\nTail".into()));
+        let rows = state
+            .pending_insert
+            .iter()
+            .flat_map(|line| flatten_lines(&line_to_text(line, 79)))
+            .collect::<Vec<_>>();
+        assert_answer_card_uninterrupted(&rows);
+        for marker in ["Before", "After1", "Late", "After2"] {
+            assert_eq!(
+                rows.iter().filter(|row| row.contains(marker)).count(),
+                1,
+                "{rows:?}"
+            );
+        }
+        assert!(!rows.iter().any(|row| row.contains("private")), "{rows:?}");
+        assert!(
+            state
+                .provisional_thinking
+                .iter()
+                .all(|thinking| thinking.deferred_source.is_none())
+        );
+    }
+
+    #[test]
+    fn answer_handoff_audit_display_omission_preserves_handed_prefix_at_source_budget() {
+        let mut state = answer_test_state();
+        state.verbose = true;
+        state.apply_event(AgentEvent::ThinkingDelta("Handed prefix".into()));
+        state.apply_event(AgentEvent::TextDelta("Answer\n\nTail".into()));
+        state.apply_event(AgentEvent::ThinkingBlockComplete(format!(
+            "Handed prefix\n{}",
+            "x".repeat(DEFERRED_THINKING_SOURCE_CAP + 1)
+        )));
+        state.context_mode = ContextMode::Frugal;
+        state.sync_active_thinking_visibility();
+        state.apply_event(AgentEvent::TextBlockComplete("Answer\n\nTail".into()));
+        let rows = state
+            .pending_insert
+            .iter()
+            .flat_map(|line| flatten_lines(&line_to_text(line, 79)))
+            .collect::<Vec<_>>();
+        assert_answer_card_uninterrupted(&rows);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.contains("Handed prefix"))
+                .count(),
+            1,
+            "{rows:?}"
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.contains("display source limit"))
+                .count(),
+            1,
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .position(|row| row.contains("Handed prefix"))
+                .unwrap()
+                < rows.iter().position(|row| row.contains("┌─ dext")).unwrap()
+        );
+    }
+
+    #[test]
+    fn answer_handoff_audit_committed_whitespace_trailer_cleanup_keeps_context_estimate() {
+        let mut state = answer_test_state();
+        state.history_chars = 100;
+        state.apply_event(AgentEvent::TextDelta("Kept answer".into()));
+        state.apply_event(AgentEvent::TextBlockComplete("Kept answer".into()));
+        state.apply_event(AgentEvent::ThinkingPreviewCommitted);
+        let before = state.history_chars;
+        state.apply_event(AgentEvent::TextDelta(" \n\n".into()));
+        state.apply_event(AgentEvent::TurnEnd {
+            failed: false,
+            usage: Usage::default(),
+        });
+        assert_eq!(state.history_chars, before + 3);
+        assert_eq!(answer_parts(&state), "Kept answer");
+    }
+
+    #[test]
+    fn answer_handoff_audit_deferred_completed_source_releases_after_retry_or_turn_boundary() {
+        for event in [
+            AgentEvent::HttpRetry {
+                attempt: 1,
+                wait_secs: 1,
+                reason: "test".into(),
+            },
+            AgentEvent::TurnEnd {
+                failed: true,
+                usage: Usage::default(),
+            },
+            AgentEvent::TurnStart,
+            AgentEvent::Interrupted,
+        ] {
+            let mut state = answer_test_state();
+            state.verbose = true;
+            state.apply_event(AgentEvent::TextDelta("Answer\n\nTail".into()));
+            state.apply_event(AgentEvent::ThinkingBlockComplete(
+                "Deferred thought\n".into(),
+            ));
+            assert!(state.provisional_thinking[0].deferred_source.is_some());
+            state.apply_event(event);
+            assert!(
+                state
+                    .provisional_thinking
+                    .iter()
+                    .all(|thinking| thinking.deferred_source.is_none())
+            );
+            assert!(state.active_answer.is_none());
+        }
     }
 
     #[test]
