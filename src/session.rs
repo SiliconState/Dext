@@ -61,9 +61,15 @@ fn test_process_state_dir() -> PathBuf {
         let temp_root = std::env::temp_dir();
         let dir = temp_root.join(format!("dext-test-home-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create test state home");
-        dir
+        std::fs::canonicalize(&dir).expect("canonical test state home")
     })
     .clone()
+}
+
+#[test]
+fn shared_test_state_home_is_canonical() {
+    let dir = test_process_state_dir();
+    assert_eq!(dir, std::fs::canonicalize(&dir).unwrap());
 }
 
 fn canonicalize_with_missing_ancestors(path: &Path) -> std::result::Result<PathBuf, String> {
