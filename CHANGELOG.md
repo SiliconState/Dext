@@ -8,6 +8,7 @@ Second tagged release; the default `install.sh`/`install.ps1` paths now download
 
 ### Maintenance
 
+- Preserved only Windows `SystemRoot` alongside explicit fixture variables in the environment-cleared loopback-provider child, so Windows networking starts without inheriting provider credentials. The idle-summary test now fails immediately if its foreground request fails or no background job starts.
 - Streaming resize assertions wait for a new replay-tail marker rather than sampling after a fixed sleep. The idle-summary integration fixture confirms the provider barrier and reports terminal rejection, child status and collected events under one bounded application deadline.
 - Isolated the Bash call-identity fixture behind the shared environment lock and a private state home, preventing parallel state-override tests from removing its persistence path. The Mermaid/prose PTY fixture retains its explicit pre-completion barrier with a bounded longer wait for macOS small-delta redraw backpressure.
 - Canonicalized the shared test-only state home so macOS `/tmp` symlink aliases do not trip memo ancestor-integrity checks. A canonical-path regression covers the fixture; production symlink refusal remains unchanged.

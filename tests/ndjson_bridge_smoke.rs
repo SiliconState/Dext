@@ -403,8 +403,14 @@ fn background_compaction_finishes_while_ndjson_is_idle_without_busy_turn() {
         fixture.push_str(&format!("{}\n", serde_json::json!({"role":if index % 2 == 0 {"user"} else {"assistant"},"content":[{"type":"text","text":"context ".repeat(250)}]})));
     }
     std::fs::write(root.join("source.jsonl"), fixture).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_dext"));
+    command.env_clear();
+    #[cfg(windows)]
+    if let Some(system_root) = std::env::var_os("SystemRoot") {
+        command.env("SystemRoot", system_root);
+    }
     let mut child = BackgroundTestChild(
-        Command::new(env!("CARGO_BIN_EXE_dext"))
+        command
             .args([
                 "--input",
                 "ndjson",
@@ -416,7 +422,6 @@ fn background_compaction_finishes_while_ndjson_is_idle_without_busy_turn() {
             ])
             .arg(&root)
             .current_dir(&root)
-            .env_clear()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", &root)
             .env("DEXT_HOME", root.join(".dext"))
@@ -459,6 +464,19 @@ fn background_compaction_finishes_while_ndjson_is_idle_without_busy_turn() {
             break;
         }
     }
+    assert!(
+        !events
+            .iter()
+            .any(|event| event["event"] == "turn_end" && event["data"]["failed"] == true),
+        "foreground request failed before the summary barrier: {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event["event"] == "background_compaction"
+                && event["data"]["phase"] == "running"),
+        "summary was not started: {events:?}"
+    );
     assert!(!events.iter().any(|event| event["event"] == "compact_end"));
     writeln!(input, "{{\"type\":\"control\",\"command\":\"/history\"}}").unwrap();
     loop {
