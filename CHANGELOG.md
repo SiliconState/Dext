@@ -2,9 +2,23 @@
 
 ## Unreleased
 
+## v0.2.1 - 2026-10-07
+
+Patch release replacing the unpublished `v0.2.0`, whose release workflow stopped before publication; the `v0.2.0` tag is retained unchanged.
+
+### Fixed
+
+- The thinking-handoff PTY regression waits for fresh replay-tail output before inspecting the answer-card footer, instead of taking an incomplete resize snapshot after a fixed 200 ms. Completion checks likewise require newly captured output; ordering and no-repaint assertions remain unchanged, and missing borders include replay evidence. Resize clear-count assertions now measure complete synchronized replay transactions rather than including unrelated viewport clears; the original limits remain unchanged, with negative parser tests for incomplete, nested, unpaired and duplicate resets.
+- Normalized accepted sockets in the total-timeout and runtime-control fixtures so Winsock cannot return `WouldBlock` before a delayed request arrives. A delayed-client regression covers blocking-mode restoration; timeout checks retain their two-second request deadline and reap the server before reporting any failure.
+- Isolated the built-in HTTP proxy regression in a bounded single-test subprocess. Process-wide proxy changes previously raced parallel provider clients; a panic also leaked the proxy environment and caused cascading failures. Mock-server accepts and sockets now have deadlines, including the blocking compaction success/error redaction fixture, without disabling provider proxy support or skipping assertions.
+- Fixed Windows atomic publication with an open delete-sharing reader. The existing write-through replacement remains the normal path; an access-denied failure uses Rust's atomic handle-based rename path. State and prepared mutations share the helper. Native regressions preserve old-reader contents, publish new contents, and refuse locks that deny deletion without clobbering files or leaving temporary files. The cross-provider `/model` regression retains an old catalog reader and reports actual slash errors.
+- Removed a Linux image-worker fixture's freshly written executable launch race (`ETXTBSY`): the unlink regression uses a same-filesystem hard-link launch alias, removes it while the agent runs, and retains the sanitized-image gateway assertions. Production image-worker behavior is unchanged.
+- Added Intel macOS to branch CI before tagging, matching the release's fourth platform. Windows shelf-alias discovery uses a directory junction so its deduplication assertions do not require Developer Mode or symbolic-link privilege. Verification-batch failures report the captured command output, including host Application Control denials.
+- The release workflow's packaged-binary smoke checks on Linux, macOS and Windows now expect the current empty-catalog `dext pack list` output (`Packs  0 found`) instead of the retired `Packs  none found` text, which had stopped every `v0.2.0` platform build before publication. A new `tests/release_smoke.rs` integration test runs the same version and empty-catalog checks against the built binary in an isolated home and asserts the workflow strings match, so this drift fails branch CI instead of a tagged release.
+
 ## v0.2.0 - 2026-10-06
 
-Second tagged release; the default `install.sh`/`install.ps1` paths now download these prebuilt archives. The changelog was not split at `v0.1.0`, so the entries below also include changes that first shipped in `v0.1.0`.
+Tagged but never published: the release workflow stopped at the packaged-binary smoke check before creating a release, so no `v0.2.0` archives exist and installers never served it. Its changes ship in `v0.2.1`. The changelog was not split at `v0.1.0`, so the entries below also include changes that first shipped in `v0.1.0`.
 
 ### Maintenance
 

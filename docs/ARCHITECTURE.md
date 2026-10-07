@@ -205,6 +205,7 @@ Dext distinguishes project files from runtime state:
 
 - Project files live in the Git repository.
 - State defaults to `~/.dext` or `DEXT_HOME`.
+- State and prepared mutations share synced temporary-file publication. Windows retains write-through `MoveFileExW`; access-denied failures try Rust's atomic handle-based rename for destinations held by delete-sharing readers. Old handles retain old contents; new opens see the candidate. Delete-denying locks remain fatal with no-clobber cleanup, and no copy/delete fallback exists. Unix retains `fs::rename`.
 - Runtime provider/auth loads reject symlinks, non-regular files, oversized content, and foreign Unix ownership. Group/world-writable provider catalogs are rejected; owner-owned auth files with loose Unix mode are repaired to `0600` on load. Doctor uses bounded no-follow, inode-stable inspection and reports the same policy without repairing files.
 - Project latest sessions/logs and durable Seats are scoped by a stable project key.
 - A Seat is a durable agent identity; a session is one disposable incarnation. Seat records are bounded owner-private JSON under `projects/<project-key>/seats/<seat-id>/seat.json`; selection is in-memory until a successful durable save or explicit metadata update, while transcripts and crash recovery remain session-owned.
@@ -316,6 +317,8 @@ Compaction preserves recent tool evidence and summarizes older conversation when
 ## Verification surface
 
 Expected release assets also include a CycloneDX JSON SBOM. The release workflow includes the SBOM in `SHA256SUMS`, provenance attestation, verification, and publication alongside the four platform archives. This path completed end to end for `v0.1.0`; [`RELEASING.md`](RELEASING.md) records the workflow and verification evidence.
+
+Branch CI covers Linux, arm64 macOS, Intel macOS and Windows before tagging. The HTTP proxy-env regression runs in a bounded single-test child: process-wide proxy mutation cannot race parallel provider clients or leak on panic. Mock-server accepts normalize accepted sockets to blocking mode and impose connection/read/write deadlines; a delayed-client regression covers Winsock inheritance, and total-timeout tests retain their two-second deadline while reaping fixture servers before reporting errors; the blocking-compaction redaction fixture also bounds total execution and reaps its server before asserting results. The Linux running-binary unlink regression creates a hard-link launch alias beside the built binary, then removes that alias while the child runs; this preserves the `/proc/self/exe` worker assertion without writing an executable immediately before `exec`. Windows directory-alias discovery uses a junction without requiring symbolic-link privilege. Native Windows MSVC evidence is separate from WSL/Linux evidence; Application Control launch denials do not satisfy gates.
 
 Expected checks before releasing Dext changes:
 

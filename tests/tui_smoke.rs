@@ -117,6 +117,12 @@ fn tui_resize_keeps_inline_session_responsive_and_dsr_bounded() {
     }
     pty.pump_for(&mut child, Duration::from_millis(500))
         .expect("settle narrow resize burst");
+    assert_resize_replay_complete(
+        &mut pty,
+        &mut child,
+        before_resize_capture,
+        Duration::from_secs(5),
+    );
     let narrow_resize = pty.terminal_io_counts() - before_resize;
     eprintln!("narrow resize terminal I/O: {narrow_resize:?}");
     assert!(
@@ -145,9 +151,11 @@ fn tui_resize_keeps_inline_session_responsive_and_dsr_bounded() {
         usize::from(TUI_NARROW_ROWS),
         resize_burst.len(),
     );
+    let narrow_replay_clears =
+        resize_replay_clear_after_count(&pty.capture[before_resize_capture..]);
     assert!(
-        narrow_resize.clear_after_cursor <= narrow_clear_bound,
-        "narrow resize exceeded its per-width, terminal-height chunk bound ({narrow_clear_bound}): {narrow_resize:?}"
+        narrow_replay_clears <= narrow_clear_bound,
+        "narrow replay clears {narrow_replay_clears} exceeded the terminal-height chunk bound ({narrow_clear_bound}): {narrow_resize:?}"
     );
 
     let before_wide = pty.terminal_io_counts();
@@ -166,8 +174,14 @@ fn tui_resize_keeps_inline_session_responsive_and_dsr_bounded() {
         "wide resize replay did not start within the bounded wait: {:?}",
         pty.terminal_io_counts() - before_wide
     );
+    assert_resize_replay_complete(
+        &mut pty,
+        &mut child,
+        before_wide_capture,
+        Duration::from_secs(5),
+    );
     pty.pump_for(&mut child, Duration::from_millis(200))
-        .expect("settle wide resize");
+        .expect("observe settled wide resize");
     let wide_resize = pty.terminal_io_counts() - before_wide;
     eprintln!("wide resize terminal I/O: {wide_resize:?}");
     assert!(
@@ -188,9 +202,10 @@ fn tui_resize_keeps_inline_session_responsive_and_dsr_bounded() {
     );
     let wide_clear_bound =
         resize_clear_after_bound(rendered_row_budget, 1, usize::from(TUI_WIDE_ROWS), 1);
+    let wide_replay_clears = resize_replay_clear_after_count(&pty.capture[before_wide_capture..]);
     assert!(
-        wide_resize.clear_after_cursor <= wide_clear_bound,
-        "wide resize exceeded its single-replay, terminal-height chunk bound ({wide_clear_bound}): {wide_resize:?}"
+        wide_replay_clears <= wide_clear_bound,
+        "wide replay clears {wide_replay_clears} exceeded the terminal-height chunk bound ({wide_clear_bound}): {wide_resize:?}"
     );
 
     assert!(
@@ -508,9 +523,10 @@ fn tui_thinking_handoff_keeps_answer_card_contiguous_without_completion_repaint(
     let before = pty.terminal_io_counts();
     let completion_start = pty.capture.len();
     release_tx.send(()).unwrap();
-    assert_visible(
+    assert_visible_since(
         &mut pty,
         &mut child,
+        completion_start,
         "late-thinking-after-card",
         Duration::from_secs(5),
     );
@@ -543,11 +559,21 @@ fn tui_thinking_handoff_keeps_answer_card_contiguous_without_completion_repaint(
         pty.wait_for_clear_all(&mut child, after.clear_all + 1, Duration::from_secs(3))
             .unwrap()
     );
-    pty.pump_for(&mut child, Duration::from_millis(200))
-        .unwrap();
+    assert_visible_since(
+        &mut pty,
+        &mut child,
+        replay_start,
+        "compact threshold set to 17%",
+        Duration::from_secs(10),
+    );
     let replay = strip_ansi(&String::from_utf8_lossy(&pty.capture[replay_start..]));
-    let opening = replay.find("┌─ dext").unwrap();
-    let closing = opening + replay[opening..].find('└').unwrap();
+    let opening = replay
+        .find("┌─ dext")
+        .unwrap_or_else(|| panic!("missing answer opening:\n{replay}"));
+    let closing = opening
+        + replay[opening..]
+            .find('└')
+            .unwrap_or_else(|| panic!("missing answer closing:\n{replay}"));
     assert!(
         replay.find("pending-thinking-before-answer").unwrap() < opening,
         "{replay}"
@@ -1398,6 +1424,127 @@ fn byte_offsets(haystack: &[u8], needle: &[u8]) -> Vec<usize> {
         .enumerate()
         .filter_map(|(index, window)| (window == needle).then_some(index))
         .collect()
+}
+
+fn resize_replay_transactions(capture: &[u8]) -> Result<Vec<&[u8]>, &'static str> {
+    const BEGIN: &[u8] = b"\x1b[?2026h";
+    const END: &[u8] = b"\x1b[?2026l";
+    let mut transactions = Vec::new();
+    let mut start = None;
+    let mut cleared = false;
+    let mut purged = false;
+    let mut offset = 0;
+    while offset < capture.len() {
+        let bytes = &capture[offset..];
+        if bytes.starts_with(BEGIN) {
+            if start.replace(offset).is_some() {
+                return Err("nested synchronized transaction");
+            }
+            cleared = false;
+            purged = false;
+            offset += BEGIN.len();
+        } else if bytes.starts_with(END) {
+            if let Some(begin) = start.take()
+                && cleared
+            {
+                if !purged {
+                    return Err("resize clear has no paired scrollback purge");
+                }
+                transactions.push(&capture[begin..offset + END.len()]);
+            }
+            offset += END.len();
+        } else if bytes.starts_with(b"\x1b[2J") {
+            if start.is_none() || cleared {
+                return Err("resize clear is unowned or duplicated");
+            }
+            cleared = true;
+            offset += b"\x1b[2J".len();
+        } else if bytes.starts_with(b"\x1b[3J") {
+            if start.is_none() || !cleared || purged {
+                return Err("scrollback purge is unowned, unpaired or duplicated");
+            }
+            purged = true;
+            offset += b"\x1b[3J".len();
+        } else {
+            offset += 1;
+        }
+    }
+    if start.is_some() && cleared {
+        return Err("resize replay has not completed its synchronized transaction");
+    }
+    Ok(transactions)
+}
+
+fn resize_replay_clear_after_count(capture: &[u8]) -> usize {
+    resize_replay_transactions(capture)
+        .expect("complete synchronized resize replay")
+        .iter()
+        .map(|transaction| {
+            count_bytes(transaction, b"\x1b[J") + count_bytes(transaction, b"\x1b[0J")
+        })
+        .sum()
+}
+
+fn assert_resize_replay_complete(
+    pty: &mut Pty,
+    child: &mut Child,
+    offset: usize,
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        pty.read_available().expect("read resize replay");
+        pty.answer_cursor_position_queries()
+            .expect("answer resize cursor query");
+        let capture = pty.capture.get(offset..).unwrap_or_default();
+        if resize_replay_transactions(capture).is_ok_and(|transactions| !transactions.is_empty()) {
+            return;
+        }
+        if Instant::now() >= deadline || child.try_wait().expect("query resize child").is_some() {
+            let output = strip_ansi(&String::from_utf8_lossy(capture));
+            terminate_child(child);
+            panic!("resize replay did not complete within {timeout:?}:\n{output}");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn resize_replay_accounting_excludes_unrelated_clears_and_rejects_partial_output() {
+    let complete = b"\x1b[J\x1b[?2026h\x1b[2J\x1b[3Jbanner\x1b[J\x1b[0J\x1b[?2026l\x1b[J";
+    let transactions = resize_replay_transactions(complete).unwrap();
+    assert_eq!(transactions.len(), 1);
+    assert_eq!(count_bytes(transactions[0], b"\x1b[J"), 1);
+    assert_eq!(count_bytes(transactions[0], b"\x1b[0J"), 1);
+    assert_eq!(resize_replay_clear_after_count(complete), 2);
+    assert!(resize_replay_transactions(b"\x1b[?2026h\x1b[2J\x1b[2J\x1b[?2026l").is_err());
+    assert!(resize_replay_transactions(b"\x1b[?2026h\x1b[2J\x1b[3Jpartial").is_err());
+    assert!(resize_replay_transactions(b"\x1b[2J\x1b[3Junowned").is_err());
+    let multiple = [complete.as_slice(), complete.as_slice()].concat();
+    assert_eq!(resize_replay_transactions(&multiple).unwrap().len(), 2);
+    assert_eq!(resize_replay_clear_after_count(&multiple), 4);
+    let redraw = b"\x1b[?2026hredraw\x1b[J\x1b[?2026l";
+    let interleaved = [redraw.as_slice(), complete.as_slice(), redraw.as_slice()].concat();
+    assert_eq!(resize_replay_clear_after_count(&interleaved), 2);
+    for malformed in [
+        b"\x1b[?2026h\x1b[2J\x1b[?2026l".as_slice(),
+        b"\x1b[?2026h\x1b[3J\x1b[2J\x1b[?2026l".as_slice(),
+        b"\x1b[?2026h\x1b[2J\x1b[3J\x1b[3J\x1b[?2026l".as_slice(),
+        b"\x1b[?2026h\x1b[?2026h\x1b[2J\x1b[3J\x1b[?2026l".as_slice(),
+    ] {
+        assert!(
+            resize_replay_transactions(malformed).is_err(),
+            "{malformed:?}"
+        );
+    }
+    let end_start = byte_offsets(complete, b"\x1b[?2026l")[0];
+    let clear_end = byte_offsets(complete, b"\x1b[2J")[0] + b"\x1b[2J".len();
+    for length in clear_end..end_start + b"\x1b[?2026l".len() {
+        assert!(
+            resize_replay_transactions(&complete[..length]).is_err(),
+            "accepted partial replay at byte {length}"
+        );
+    }
 }
 
 fn assert_resize_resets_clear_before_purge_and_replay_one_banner(

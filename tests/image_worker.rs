@@ -193,17 +193,25 @@ fn image_gateway_round_trip(unlink_binary: bool) {
     use base64::Engine as _;
     use serde_json::{Value, json};
 
-    let root = std::env::temp_dir().join(format!(
+    let built_binary = std::path::PathBuf::from(env!("CARGO_BIN_EXE_dext"));
+    let fixture_parent = if unlink_binary {
+        built_binary.parent().unwrap().to_path_buf()
+    } else {
+        std::env::temp_dir()
+    };
+    let root = fixture_parent.join(format!(
         "dext-image-gateway-{}-{unlink_binary}",
         std::process::id()
     ));
     let executable = if unlink_binary {
-        let copy = root.join("running-dext");
+        let alias = root.join("running-dext");
         std::fs::create_dir_all(&root).unwrap();
-        std::fs::copy(env!("CARGO_BIN_EXE_dext"), &copy).unwrap();
-        copy
+        // A same-filesystem hard link gives the child a removable launch path
+        // without a fresh executable write racing exec with ETXTBSY.
+        std::fs::hard_link(&built_binary, &alias).unwrap();
+        alias
     } else {
-        std::path::PathBuf::from(env!("CARGO_BIN_EXE_dext"))
+        built_binary
     };
     let running_binary = executable.clone();
     let state = root.join("state");

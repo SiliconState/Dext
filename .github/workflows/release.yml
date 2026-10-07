@@ -208,7 +208,7 @@ jobs:
           tar -C verify -xzf "dist/${archive}"
           test "$(verify/dext --version)" = "dext ${version}"
           DEXT_HOME="$PWD/verify-home" verify/dext pack list \
-            | grep -F "Packs  none found"
+            | grep -F "Packs  0 found"
       - name: Package Windows archive and smoke test packaged binary
         if: runner.os == 'Windows'
         shell: pwsh
@@ -227,7 +227,7 @@ jobs:
           }
           $env:DEXT_HOME = Join-Path $PWD "verify-home"
           $pack = (& .\verify\dext.exe pack list) -join "`n"
-          if (-not $pack.Contains("Packs  none found")) {
+          if (-not $pack.Contains("Packs  0 found")) {
             throw "packaged binary unexpectedly included pack content"
           }
       - name: Upload release archive
