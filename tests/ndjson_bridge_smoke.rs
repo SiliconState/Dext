@@ -329,6 +329,7 @@ fn background_compaction_finishes_while_ndjson_is_idle_without_busy_turn() {
     listener.set_nonblocking(true).unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let (summary_started_tx, summary_started_rx) = std::sync::mpsc::channel();
     let provider = std::thread::spawn(move || {
         let until = Instant::now() + Duration::from_secs(15);
         let mut completed = 0;
@@ -379,9 +380,10 @@ fn background_compaction_finishes_while_ndjson_is_idle_without_busy_turn() {
             let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
             completed += 1;
             if request["stream"] == false {
+                summary_started_tx.send(()).unwrap();
                 let release = release_rx.take().unwrap();
                 summary = Some(std::thread::spawn(move || {
-                    release.recv_timeout(Duration::from_secs(10)).unwrap();
+                    release.recv_timeout(Duration::from_secs(30)).unwrap();
                     let body = r#"{"choices":[{"message":{"content":"idle background summary"}}],"usage":{"prompt_tokens":11,"completion_tokens":7}}"#;
                     write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
                 }));
@@ -474,12 +476,31 @@ fn background_compaction_finishes_while_ndjson_is_idle_without_busy_turn() {
             break;
         }
     }
+    summary_started_rx
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap_or_else(|error| {
+            panic!("summary request did not reach the barrier: {error}; events={events:?}")
+        });
     release_tx.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
     loop {
-        let event = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let event = rx
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or_else(|error| {
+                panic!(
+                    "idle summary did not apply: {error}; child={:?}; events={events:?}",
+                    child.0.try_wait()
+                )
+            });
         let applied =
             event["event"] == "background_compaction" && event["data"]["phase"] == "applied";
+        let rejected = event["event"] == "background_compaction"
+            && matches!(
+                event["data"]["phase"].as_str(),
+                Some("failed" | "discarded" | "cancelled")
+            );
         events.push(event);
+        assert!(!rejected, "idle summary was rejected: {events:?}");
         if applied {
             break;
         }

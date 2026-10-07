@@ -347,8 +347,13 @@ fn tui_streams_mermaid_and_prose_into_history_before_provider_completion() {
         pty.wait_for_clear_all(&mut child, before.clear_all + 1, Duration::from_secs(3))
             .unwrap()
     );
-    pty.pump_for(&mut child, Duration::from_millis(250))
-        .unwrap();
+    assert_visible_since(
+        &mut pty,
+        &mut child,
+        narrow_start,
+        "live-tail-before-complete",
+        Duration::from_secs(10),
+    );
     let narrow = strip_ansi(&String::from_utf8_lossy(&pty.capture[narrow_start..]));
     assert!(narrow.contains("vertical reflow"), "{narrow}");
     assert!(
@@ -388,8 +393,13 @@ fn tui_streams_mermaid_and_prose_into_history_before_provider_completion() {
         )
         .unwrap()
     );
-    pty.pump_for(&mut child, Duration::from_millis(300))
-        .unwrap();
+    assert_visible_since(
+        &mut pty,
+        &mut child,
+        wide_start,
+        "completion-after-release",
+        Duration::from_secs(10),
+    );
     let wide = strip_ansi(&String::from_utf8_lossy(&pty.capture[wide_start..]));
     assert!(
         wide.contains("view line 0+64") && wide.contains("msg 41, whole"),
