@@ -12,7 +12,7 @@ Patch release replacing the unpublished `v0.2.0`, whose release workflow stopped
 
 ## v0.2.0 - 2026-10-06
 
-Second tagged release; the default `install.sh`/`install.ps1` paths now download these prebuilt archives. The changelog was not split at `v0.1.0`, so the entries below also include changes that first shipped in `v0.1.0`.
+Tagged but never published: the release workflow stopped at the packaged-binary smoke check before creating a release, so no `v0.2.0` archives exist and installers never served it. Its changes ship in `v0.2.1`. The changelog was not split at `v0.1.0`, so the entries below also include changes that first shipped in `v0.1.0`.
 
 ### Maintenance
 
