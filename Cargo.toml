@@ -1,6 +1,6 @@
 [package]
 name = "dext"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 
@@ -27,6 +27,7 @@ getrandom = "0.4"
 ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm", "unstable-rendered-line-info"] }
 ratatui-core = "=0.1.2"
 tui-markdown = { version = "=0.3.8", default-features = false }
+pulldown-cmark = { version = "=0.13.3", default-features = false }
 crossterm = { version = "=0.29.0", features = ["event-stream"] }
 ra_ap_syntax = "=0.0.348"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }

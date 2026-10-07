@@ -162,11 +162,34 @@ pub(crate) enum AgentEvent {
         usage: Usage,
         failed: bool,
     },
+    BackgroundCompactionSetting {
+        enabled: bool,
+    },
+    BackgroundCompaction {
+        version: u32,
+        session_id: String,
+        session_epoch: u64,
+        job_id: String,
+        origin_turn_id: String,
+        phase: String,
+        blocking: bool,
+        reason: String,
+        elapsed_ms: u64,
+        wait_ms: u64,
+        before_chars: usize,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        after_chars: Option<usize>,
+        usage_known: bool,
+    },
     CompactStart,
     CompactEnd {
         before: usize,
         after: usize,
         summary: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        job_id: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        background: bool,
     },
     CompactFailed {
         message: String,

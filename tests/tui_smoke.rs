@@ -240,6 +240,334 @@ fn tui_resize_keeps_inline_session_responsive_and_dsr_bounded() {
 }
 
 #[test]
+fn tui_streams_mermaid_and_prose_into_history_before_provider_completion() {
+    let temp = TempDir::new("dext-tui-answer-history").expect("temp dir");
+    let sandbox = temp.path().join("sandbox");
+    let dext_home = temp.path().join("dext-home");
+    let home = temp.path().join("home");
+    for path in [&sandbox, &dext_home, &home] {
+        fs::create_dir_all(path).expect("fixture directory");
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").expect("mock server");
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        for connection in listener.incoming() {
+            let mut stream = connection.expect("mock connection");
+            let request = read_mock_openai_request(&mut stream);
+            if !String::from_utf8_lossy(&request).starts_with("POST /v1/chat/completions ") {
+                stream
+                    .write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+                continue;
+            }
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n").unwrap();
+            let source = format!(
+                "history-before-complete.\n\n```mermaid\nflowchart LR\nA[Request] --> B[(\"Result\")]\n```\n\n```mermaid\nflowchart TD\nSTART[CycleStart] --> DB[(\"CycleStore\")]\nDB --> DONE[CycleDone]\nDONE -.->|retry| START\n```\n\n```mermaid\nflowchart LR\nV[\"view line 0+64\"] -->|\"zoom(0,64)\"| A[\"0+32, 32+32\"]\nA -->|\"zoom(32,32)\"| B[\"32+16, 48+16\"]\nB -->|\"3 more zooms\"| C[\"40+2, 42+2\"]\nC -->|\"zoom(40,2)\"| D[\"40+1, 41+1\"]\nD -->|\"zoom(41,1)\"| E[\"msg 41, whole\"]\n```\n\n{}",
+                "Progressive prose remains readable while the response is still being written. "
+                    .repeat(14)
+            );
+            for chunk in source.as_bytes().chunks(43) {
+                let text = std::str::from_utf8(chunk).unwrap();
+                let frame = format!(
+                    "data: {}\n\n",
+                    serde_json::json!({"choices":[{"delta":{"content":text},"finish_reason":null}]})
+                );
+                stream.write_all(frame.as_bytes()).unwrap();
+                stream.flush().unwrap();
+                std::thread::sleep(Duration::from_millis(12));
+            }
+            let live_marker = format!(
+                "data: {}\n\n",
+                serde_json::json!({"choices":[{"delta":{"content":"\n\nlive-tail-before-complete"},"finish_reason":null}]})
+            );
+            stream.write_all(live_marker.as_bytes()).unwrap();
+            stream.flush().unwrap();
+            release_rx
+                .recv_timeout(Duration::from_secs(40))
+                .expect("release delayed stream");
+            let frame = format!(
+                "data: {}\n\n",
+                serde_json::json!({"choices":[{"delta":{"content":"\n\ncompletion-after-release"},"finish_reason":null}]})
+            );
+            stream.write_all(frame.as_bytes()).unwrap();
+            stream.write_all(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n").unwrap();
+            stream.flush().unwrap();
+            break;
+        }
+    });
+    let mut pty = Pty::open(240, 40).expect("pty");
+    let mut child = spawn_dext_with_env(
+        &pty,
+        &sandbox,
+        &dext_home,
+        &home,
+        &[
+            ("DEXT_PROVIDER", "local"),
+            ("DEXT_BASE_URL", &base_url),
+            ("DEXT_MODEL", "mock-model"),
+            ("DEXT_MODEL_FORCE", "1"),
+        ],
+    )
+    .expect("spawn dext");
+    assert_visible(&mut pty, &mut child, "◆ Dext  v", Duration::from_secs(5));
+    pty.write_all_retry(b"Show the flow\r").unwrap();
+    // macOS PTY redraws can backpressure the small-delta fixture under parallel CI load.
+    assert_visible(
+        &mut pty,
+        &mut child,
+        "live-tail-before-complete",
+        Duration::from_secs(15),
+    );
+    pty.pump_for(&mut child, Duration::from_millis(200))
+        .unwrap();
+    let output = pty.visible_text();
+    assert!(output.contains("history-before-complete"), "{output}");
+    assert!(
+        output.contains("Request") && output.contains("Result") && output.contains('▶'),
+        "{output}"
+    );
+    assert!(
+        output.contains("CycleStore") && output.contains("CycleDone"),
+        "{output}"
+    );
+    assert!(output.contains('├') && output.contains('┆'), "{output}");
+    assert!(!output.contains("flowchart LR"), "{output}");
+    assert!(!output.contains("completion-after-release"));
+    assert_eq!(output.matches("┌─ dext").count(), 1, "{output}");
+    pty.write_all_retry(b"/compact 13").unwrap();
+    pty.pump_for(&mut child, Duration::from_millis(200))
+        .unwrap();
+    let before = pty.terminal_io_counts();
+    let narrow_start = pty.capture.len();
+    pty.resize(&child, 80, 35).unwrap();
+    assert!(
+        pty.wait_for_clear_all(&mut child, before.clear_all + 1, Duration::from_secs(3))
+            .unwrap()
+    );
+    assert_visible_since(
+        &mut pty,
+        &mut child,
+        narrow_start,
+        "live-tail-before-complete",
+        Duration::from_secs(10),
+    );
+    let narrow = strip_ansi(&String::from_utf8_lossy(&pty.capture[narrow_start..]));
+    assert!(narrow.contains("vertical reflow"), "{narrow}");
+    assert!(
+        narrow.contains("view line 0+64") && narrow.contains("msg 41, whole"),
+        "{narrow}"
+    );
+    assert_eq!(narrow.matches('▼').count(), 8, "{narrow}");
+    assert!(
+        narrow.contains("CycleStore") && narrow.contains("CycleStart"),
+        "{narrow}"
+    );
+    assert!(!narrow.contains("Mermaid source"), "{narrow}");
+    release_tx.send(()).unwrap();
+    assert_visible(
+        &mut pty,
+        &mut child,
+        "completion-after-release",
+        Duration::from_secs(10),
+    );
+    pty.pump_for(&mut child, Duration::from_millis(300))
+        .unwrap();
+    pty.write_all_retry(b"%\r").unwrap();
+    assert_visible(
+        &mut pty,
+        &mut child,
+        "compact threshold set to 13%",
+        Duration::from_secs(5),
+    );
+    let before_wide = pty.terminal_io_counts();
+    let wide_start = pty.capture.len();
+    pty.resize(&child, 240, 40).unwrap();
+    assert!(
+        pty.wait_for_clear_all(
+            &mut child,
+            before_wide.clear_all + 1,
+            Duration::from_secs(3)
+        )
+        .unwrap()
+    );
+    assert_visible_since(
+        &mut pty,
+        &mut child,
+        wide_start,
+        "completion-after-release",
+        Duration::from_secs(10),
+    );
+    let wide = strip_ansi(&String::from_utf8_lossy(&pty.capture[wide_start..]));
+    assert!(
+        wide.contains("view line 0+64") && wide.contains("msg 41, whole"),
+        "{wide}"
+    );
+    assert_eq!(wide.matches('▶').count(), 6, "{wide}");
+    assert_eq!(wide.matches('▼').count(), 3, "{wide}");
+    assert!(
+        wide.contains("CycleStore") && wide.contains("CycleDone"),
+        "{wide}"
+    );
+    assert!(
+        !wide.contains("vertical reflow") && !wide.contains("Mermaid source"),
+        "{wide}"
+    );
+    assert_no_crash_text(&pty.visible_text());
+    pty.write_all_retry(b"\x04").unwrap();
+    let status = wait_for_exit(&mut child, Duration::from_secs(5), &mut pty).unwrap();
+    assert!(status.success());
+    server.join().unwrap();
+}
+
+#[test]
+fn tui_thinking_handoff_keeps_answer_card_contiguous_without_completion_repaint() {
+    let temp = TempDir::new("dext-tui-thinking-handoff").expect("temp dir");
+    let sandbox = temp.path().join("sandbox");
+    let dext_home = temp.path().join("dext-home");
+    let home = temp.path().join("home");
+    for path in [&sandbox, &dext_home, &home] {
+        fs::create_dir_all(path).unwrap();
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        for connection in listener.incoming() {
+            let mut stream = connection.unwrap();
+            let request = read_mock_openai_request(&mut stream);
+            if !String::from_utf8_lossy(&request).starts_with("POST /v1/chat/completions ") {
+                stream
+                    .write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+                continue;
+            }
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n").unwrap();
+            let frames = [
+                serde_json::json!({"choices":[{"delta":{"reasoning_content":"Considering Git Tree Status\n\npending-thinking-before-answer"},"finish_reason":null}]}),
+                serde_json::json!({"choices":[{"delta":{"content":"Committed successfully.\n\n- Included implementation and documentation.\n- Preserved evidence.\n\nanswer-live-marker"},"finish_reason":null}]}),
+            ];
+            for frame in frames {
+                stream
+                    .write_all(format!("data: {frame}\n\n").as_bytes())
+                    .unwrap();
+            }
+            stream.flush().unwrap();
+            release_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+            let frames = [
+                serde_json::json!({"choices":[{"delta":{"reasoning_content":"\n\nlate-thinking-after-card\n"},"finish_reason":null}]}),
+                serde_json::json!({"choices":[{"delta":{"content":"\n\nanswer-completed-marker"},"finish_reason":null}]}),
+                serde_json::json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+            ];
+            for frame in frames {
+                stream
+                    .write_all(format!("data: {frame}\n\n").as_bytes())
+                    .unwrap();
+            }
+            stream.write_all(b"data: [DONE]\n\n").unwrap();
+            stream.flush().unwrap();
+            break;
+        }
+    });
+    let mut pty = Pty::open(100, 35).unwrap();
+    let mut child = spawn_dext_with_env(
+        &pty,
+        &sandbox,
+        &dext_home,
+        &home,
+        &[
+            ("DEXT_PROVIDER", "local"),
+            ("DEXT_BASE_URL", &base_url),
+            ("DEXT_MODEL", "mock-model"),
+            ("DEXT_MODEL_FORCE", "1"),
+        ],
+    )
+    .unwrap();
+    assert_visible(&mut pty, &mut child, "◆ Dext  v", Duration::from_secs(5));
+    pty.write_all_retry(b"Show the status\r").unwrap();
+    assert_visible(
+        &mut pty,
+        &mut child,
+        "answer-live-marker",
+        Duration::from_secs(5),
+    );
+    pty.pump_for(&mut child, Duration::from_millis(200))
+        .unwrap();
+    let live = pty.visible_text();
+    assert!(
+        live.rfind("pending-thinking-before-answer").unwrap() < live.find("┌─ dext").unwrap(),
+        "{live}"
+    );
+    pty.write_all_retry(b"/compact 17").unwrap();
+    pty.pump_for(&mut child, Duration::from_millis(150))
+        .unwrap();
+    let before = pty.terminal_io_counts();
+    let completion_start = pty.capture.len();
+    release_tx.send(()).unwrap();
+    assert_visible(
+        &mut pty,
+        &mut child,
+        "late-thinking-after-card",
+        Duration::from_secs(5),
+    );
+    pty.pump_for(&mut child, Duration::from_millis(200))
+        .unwrap();
+    let completed = strip_ansi(&String::from_utf8_lossy(&pty.capture[completion_start..]));
+    assert!(completed.contains("answer-completed-marker"), "{completed}");
+    assert!(
+        !completed.contains("pending-thinking-before-answer"),
+        "{completed}"
+    );
+    assert!(!completed.contains("┌─ dext"), "{completed}");
+    assert!(
+        completed.find('└').unwrap() < completed.find("late-thinking-after-card").unwrap(),
+        "{completed}"
+    );
+    let after = pty.terminal_io_counts();
+    assert_eq!(after.clear_all, before.clear_all);
+    assert_eq!(after.purge_scrollback, before.purge_scrollback);
+    pty.write_all_retry(b"%\r").unwrap();
+    assert_visible(
+        &mut pty,
+        &mut child,
+        "compact threshold set to 17%",
+        Duration::from_secs(5),
+    );
+    let replay_start = pty.capture.len();
+    pty.resize(&child, 80, 35).unwrap();
+    assert!(
+        pty.wait_for_clear_all(&mut child, after.clear_all + 1, Duration::from_secs(3))
+            .unwrap()
+    );
+    pty.pump_for(&mut child, Duration::from_millis(200))
+        .unwrap();
+    let replay = strip_ansi(&String::from_utf8_lossy(&pty.capture[replay_start..]));
+    let opening = replay.find("┌─ dext").unwrap();
+    let closing = opening + replay[opening..].find('└').unwrap();
+    assert!(
+        replay.find("pending-thinking-before-answer").unwrap() < opening,
+        "{replay}"
+    );
+    assert!(
+        replay.find("late-thinking-after-card").unwrap() > closing,
+        "{replay}"
+    );
+    assert_eq!(replay.matches("┌─ dext").count(), 1);
+    assert_no_crash_text(&pty.visible_text());
+    pty.write_all_retry(b"\x04").unwrap();
+    assert!(
+        wait_for_exit(&mut child, Duration::from_secs(5), &mut pty)
+            .unwrap()
+            .success()
+    );
+    server.join().unwrap();
+}
+
+#[test]
 fn tui_smoke_shift_enter_inserts_newline() {
     let temp = TempDir::new("dext-tui-shift-enter").expect("temp dir");
     let sandbox = temp.path().join("sandbox");
@@ -343,6 +671,269 @@ fn tui_path_picker_inserts_without_submitting_and_preserves_draft_on_cancel() {
         "visible tail:\n{}",
         tail(&pty.visible_text(), 3000)
     );
+}
+
+#[test]
+fn tui_background_preference_is_saved_and_controls_keep_terminal_usable() {
+    let temp = TempDir::new("dext-tui-background-preference").unwrap();
+    let sandbox = temp.path().join("sandbox");
+    let state = temp.path().join("state");
+    let home = temp.path().join("home");
+    let sessions = temp.path().join("sessions");
+    for path in [&sandbox, &state, &home, &sessions] {
+        fs::create_dir_all(path).unwrap();
+    }
+    let mut pty = Pty::open(TUI_COLS, TUI_ROWS).unwrap();
+    let mut child = spawn_dext_configured(
+        &pty,
+        &sandbox,
+        &state,
+        &home,
+        &[
+            ("DEXT_PROVIDER", "local"),
+            ("DEXT_BASE_URL", "http://127.0.0.1:1"),
+            ("DEXT_MODEL", "mock-model"),
+            ("DEXT_MODEL_FORCE", "1"),
+            ("DEXT_SESSIONS_DIR", sessions.to_str().unwrap()),
+        ],
+        true,
+    )
+    .unwrap();
+    assert_visible(
+        &mut pty,
+        &mut child,
+        "Type a request",
+        Duration::from_secs(5),
+    );
+    pty.write_all_retry(b"/compact background status\r")
+        .unwrap();
+    assert_visible(
+        &mut pty,
+        &mut child,
+        "background compaction: on",
+        Duration::from_secs(5),
+    );
+    pty.write_all_retry(b"/compact background off\r").unwrap();
+    assert_visible(
+        &mut pty,
+        &mut child,
+        "background compaction: off",
+        Duration::from_secs(5),
+    );
+    let saved = fs::read_dir(&sessions)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path().join("_latest.jsonl"))
+        .find(|file| file.is_file())
+        .expect("per-session choice saves even empty history");
+    let header = || -> serde_json::Value {
+        serde_json::from_str(fs::read_to_string(&saved).unwrap().lines().next().unwrap()).unwrap()
+    };
+    assert_eq!(header()["background_compact"], false);
+    let at = pty.capture.len();
+    pty.write_all_retry(format!("/resume {}\r", saved.display()).as_bytes())
+        .unwrap();
+    assert_visible_since(&mut pty, &mut child, at, "loaded", Duration::from_secs(5));
+    let at = pty.capture.len();
+    pty.write_all_retry(b"/compact background status\r")
+        .unwrap();
+    assert_visible_since(
+        &mut pty,
+        &mut child,
+        at,
+        "background compaction: off",
+        Duration::from_secs(5),
+    );
+    pty.write_all_retry(b"/compact background on\r").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while header()["background_compact"] != true {
+        assert!(
+            Instant::now() < deadline,
+            "re-enabled preference was not saved"
+        );
+        pty.pump_for(&mut child, Duration::from_millis(30)).unwrap();
+    }
+    pty.write_all_retry(b"/history\r").unwrap();
+    assert_visible(
+        &mut pty,
+        &mut child,
+        "history: 0 messages",
+        Duration::from_secs(5),
+    );
+    pty.write_all_retry(b"\x04").unwrap();
+    assert!(
+        wait_for_exit(&mut child, Duration::from_secs(5), &mut pty)
+            .unwrap()
+            .success()
+    );
+}
+
+#[test]
+fn tui_background_summary_applies_while_idle_and_keeps_input_available() {
+    run_tui_background_summary(false);
+}
+
+#[test]
+fn tui_background_discard_persists_usage_before_shutdown() {
+    run_tui_background_summary(true);
+}
+
+fn run_tui_background_summary(discard: bool) {
+    let temp = TempDir::new("dext-tui-background").unwrap();
+    let sandbox = temp.path().join("sandbox");
+    let state = temp.path().join("state");
+    let home = temp.path().join("home");
+    let sessions = temp.path().join("sessions");
+    for path in [&sandbox, &state, &home, &sessions] {
+        fs::create_dir_all(path).unwrap();
+    }
+    let mut fixture = format!(
+        "{}\n",
+        serde_json::json!({"version":4,"model":"mock-model","system":"test","session_id":"background-source","sandbox":sandbox,"compact_threshold_chars":30000})
+    );
+    for index in 0..12 {
+        fixture.push_str(&format!("{}\n", serde_json::json!({"role":if index % 2 == 0 {"user"} else {"assistant"},"content":[{"type":"text","text":"context ".repeat(250)}]})));
+    }
+    fs::write(sandbox.join("source.jsonl"), fixture).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut completed = 0;
+        let mut summary = None;
+        let mut release_rx = Some(release_rx);
+        while completed < 2 && Instant::now() < deadline {
+            let (mut stream, _) = match listener.accept() {
+                Ok(value) => value,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(error) => panic!("background provider: {error}"),
+            };
+            stream.set_nonblocking(false).unwrap();
+            let request = read_mock_openai_request(&mut stream);
+            let end = request.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+            if request.len() == end {
+                stream
+                    .write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+                continue;
+            }
+            let value: serde_json::Value = serde_json::from_slice(&request[end..]).unwrap();
+            completed += 1;
+            if value["stream"] == false {
+                let release = release_rx.take().unwrap();
+                summary = Some(std::thread::spawn(move || {
+                    release.recv_timeout(Duration::from_secs(15)).unwrap();
+                    let summary = if discard {
+                        "context ".repeat(4000)
+                    } else {
+                        "background-idle-summary".into()
+                    };
+                    let body = serde_json::json!({"choices":[{"message":{"content":summary}}],"usage":{"prompt_tokens":11,"completion_tokens":7}}).to_string();
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                }));
+            } else {
+                let body = "data: {\"choices\":[{\"delta\":{\"content\":\"Foreground TUI answer completed while the background summary worker is blocked; input stays usable and ready.\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        }
+        assert_eq!(completed, 2);
+        summary.unwrap().join().unwrap();
+    });
+    let mut pty = Pty::open(TUI_COLS, TUI_ROWS).unwrap();
+    let mut child = spawn_dext_configured(
+        &pty,
+        &sandbox,
+        &state,
+        &home,
+        &[
+            ("DEXT_PROVIDER", "local"),
+            ("DEXT_BASE_URL", &base),
+            ("DEXT_MODEL", "mock-model"),
+            ("DEXT_MODEL_FORCE", "1"),
+            ("DEXT_BACKGROUND_COMPACT", "1"),
+            ("DEXT_SESSIONS_DIR", sessions.to_str().unwrap()),
+        ],
+        true,
+    )
+    .unwrap();
+    assert_visible(
+        &mut pty,
+        &mut child,
+        "Type a request",
+        Duration::from_secs(5),
+    );
+    pty.write_all_retry(b"/resume source.jsonl\r").unwrap();
+    assert_visible(
+        &mut pty,
+        &mut child,
+        "loaded 12 messages",
+        Duration::from_secs(5),
+    );
+    pty.write_all_retry(b"Hello\r").unwrap();
+    assert_visible(
+        &mut pty,
+        &mut child,
+        "Foreground TUI answer",
+        Duration::from_secs(5),
+    );
+    pty.pump_for(&mut child, Duration::from_millis(150))
+        .unwrap();
+    pty.write_all_retry(b"/history\r").unwrap();
+    assert_visible(
+        &mut pty,
+        &mut child,
+        "history: 14 messages",
+        Duration::from_secs(5),
+    );
+    let saved = sessions.join("background-source/_latest.jsonl");
+    let usage = |file: &Path| -> Option<(u64, u64)> {
+        let text = fs::read_to_string(file).ok()?;
+        let header: serde_json::Value = serde_json::from_str(text.lines().next()?).ok()?;
+        Some((
+            header["usage"]["input"].as_u64()?,
+            header["usage"]["output"].as_u64()?,
+        ))
+    };
+    let before_usage = usage(&saved).expect("foreground session saved");
+    release_tx.send(()).unwrap();
+    if !discard {
+        assert_visible(
+            &mut pty,
+            &mut child,
+            "background-idle-summary",
+            Duration::from_secs(5),
+        );
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if usage(&saved) == Some((before_usage.0 + 11, before_usage.1 + 7)) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "idle summary usage was not persisted: {:?}",
+            usage(&saved)
+        );
+        pty.pump_for(&mut child, Duration::from_millis(30)).unwrap();
+    }
+    if discard {
+        assert_eq!(fs::read_to_string(&saved).unwrap().lines().count(), 15);
+        assert!(!pty.visible_text().contains("compacted 14"));
+    }
+    pty.write_all_retry(b"\x04").unwrap();
+    assert!(
+        wait_for_exit(&mut child, Duration::from_secs(5), &mut pty)
+            .unwrap()
+            .success()
+    );
+    server.join().unwrap();
 }
 
 #[test]
@@ -549,10 +1140,7 @@ fn spawn_slow_openai_server() -> (
     (format!("http://{address}"), release_tx, server)
 }
 
-fn serve_mock_openai_request(
-    mut stream: TcpStream,
-    release: &std::sync::mpsc::Receiver<()>,
-) -> bool {
+fn read_mock_openai_request(stream: &mut TcpStream) -> Vec<u8> {
     stream
         .set_read_timeout(Some(Duration::from_secs(2)))
         .expect("set mock request timeout");
@@ -582,6 +1170,15 @@ fn serve_mock_openai_request(
         assert!(read > 0, "client closed before mock request body");
         request.extend_from_slice(&buf[..read]);
     }
+
+    request
+}
+
+fn serve_mock_openai_request(
+    mut stream: TcpStream,
+    release: &std::sync::mpsc::Receiver<()>,
+) -> bool {
+    let request = read_mock_openai_request(&mut stream);
 
     if !String::from_utf8_lossy(&request).starts_with("POST /v1/chat/completions ") {
         stream
@@ -639,13 +1236,27 @@ fn spawn_dext_with_env(
     home: &Path,
     extra_env: &[(&str, &str)],
 ) -> io::Result<Child> {
+    spawn_dext_configured(pty, sandbox, dext_home, home, extra_env, false)
+}
+
+fn spawn_dext_configured(
+    pty: &Pty,
+    sandbox: &Path,
+    dext_home: &Path,
+    home: &Path,
+    extra_env: &[(&str, &str)],
+    persistent: bool,
+) -> io::Result<Child> {
     let stdin = unsafe { File::from_raw_fd(dup_fd(pty.slave_file())?) };
     let stdout = unsafe { File::from_raw_fd(dup_fd(pty.slave_file())?) };
     let stderr = unsafe { File::from_raw_fd(dup_fd(pty.slave_file())?) };
     let path = std::env::var_os("PATH").unwrap_or_else(|| OsString::from("/usr/bin:/bin"));
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_dext"));
-    cmd.args(["--no-session", "--cd"])
+    if !persistent {
+        cmd.arg("--no-session");
+    }
+    cmd.arg("--cd")
         .arg(sandbox)
         .current_dir(sandbox)
         .env_clear()

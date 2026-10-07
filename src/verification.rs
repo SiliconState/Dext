@@ -387,7 +387,11 @@ pub(crate) fn workspace_fingerprint_for_tool(
     let mut paths = nul_paths(&tracked.stdout)?;
     paths.extend(nul_paths(&untracked.stdout)?);
     if let Some(ignored) = ignored_build_inputs {
-        paths.extend(nul_paths(&ignored.stdout)?);
+        paths.extend(nul_paths(&ignored.stdout)?.into_iter().filter(|path| {
+            !["target", ".dext", ".auto"]
+                .iter()
+                .any(|root| path.starts_with(root))
+        }));
     }
     paths.sort();
     paths.dedup();
@@ -881,6 +885,43 @@ mod tests {
         std::fs::write(root.join("untracked.txt"), "new\n").unwrap();
         let untracked = workspace_fingerprint(&root).unwrap();
         assert_ne!(tracked, untracked);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn workspace_fingerprint_excludes_ignored_runtime_repositories_but_not_tracked_files() {
+        let _guard = crate::test_env_lock();
+        let root = std::env::temp_dir().join(format!(
+            "dext-verification-runtime-repos-{}-{}",
+            std::process::id(),
+            crate::unix_timestamp_secs()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "-q"]);
+        git(&root, &["config", "user.email", "test@example.invalid"]);
+        git(&root, &["config", "user.name", "Test"]);
+        std::fs::write(root.join(".gitignore"), "/target/\n/.dext/\n/.auto/\n").unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"dext\"\nversion = \"0.0.0\"\n",
+        )
+        .unwrap();
+        git(&root, &["add", ".gitignore", "Cargo.toml"]);
+        git(&root, &["commit", "-q", "-m", "base"]);
+        let clean = workspace_fingerprint(&root).unwrap();
+        for directory in ["target", ".dext", ".auto"] {
+            let nested = root.join(directory).join("nested");
+            std::fs::create_dir_all(&nested).unwrap();
+            git(&nested, &["init", "-q"]);
+            std::fs::write(nested.join("scratch.txt"), "runtime\n").unwrap();
+        }
+        assert_eq!(workspace_fingerprint(&root).unwrap(), clean);
+        std::fs::write(root.join(".dext/tracked.txt"), "base\n").unwrap();
+        git(&root, &["add", "-f", ".dext/tracked.txt"]);
+        git(&root, &["commit", "-q", "-m", "tracked runtime path"]);
+        let tracked = workspace_fingerprint(&root).unwrap();
+        std::fs::write(root.join(".dext/tracked.txt"), "changed\n").unwrap();
+        assert_ne!(workspace_fingerprint(&root).unwrap(), tracked);
         std::fs::remove_dir_all(root).unwrap();
     }
 

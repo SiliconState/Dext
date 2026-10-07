@@ -183,6 +183,7 @@ fn test_agent(root: &Path) -> Agent {
         session_model_pins: HashMap::new(),
         partial_stream_text: None,
         quiet_stream_events: false,
+        background: compaction::BackgroundState::default(),
         compact_threshold_chars: None,
         compact_threshold_percent: None,
         context_window_tokens: model_context_window("test-model"),
@@ -8445,6 +8446,32 @@ fn ndjson_budget_bounds_busy_batches_and_releases_on_consumption() {
 }
 
 #[test]
+fn ndjson_budget_concurrent_reservations_and_releases_stay_bounded() {
+    let pending = AtomicUsize::new(0);
+    let accepted = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..NDJSON_MAX_PENDING * 2)
+            .map(|_| scope.spawn(|| reserve_ndjson_pending(&pending, 1)))
+            .collect();
+        workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .filter(|accepted| *accepted)
+            .count()
+    });
+    assert_eq!(accepted, NDJSON_MAX_PENDING);
+    assert_eq!(pending.load(Ordering::SeqCst), NDJSON_MAX_PENDING);
+    assert!(!reserve_ndjson_pending(&pending, usize::MAX));
+    std::thread::scope(|scope| {
+        for _ in 0..NDJSON_MAX_PENDING * 2 {
+            scope.spawn(|| release_ndjson_pending(&pending));
+        }
+    });
+    assert_eq!(pending.load(Ordering::SeqCst), 0);
+    assert!(reserve_ndjson_pending(&pending, NDJSON_MAX_PENDING));
+    assert!(!reserve_ndjson_pending(&pending, 1));
+}
+
+#[test]
 fn permission_bridge_matches_ids_and_denies_on_interrupt_or_eof() {
     let interrupt = Arc::new(AtomicBool::new(false));
     let (tx, rx) = std::sync::mpsc::sync_channel::<PermissionReply>(8);
@@ -9187,6 +9214,989 @@ fn builtin_parallel_policy_only_allows_read_only_rounds() {
     assert!(!should_parallelize_builtin_tools(&["bash"]));
     assert!(!should_parallelize_builtin_tools(&["http", "rg"]));
     assert!(!should_parallelize_builtin_tools(&[]));
+}
+
+fn background_test_history(agent: &mut Agent) {
+    agent.history = (0..12)
+        .map(|index| Message {
+            role: if index % 2 == 0 { "user" } else { "assistant" }.into(),
+            content: vec![Block::Text {
+                text: format!("{index:02} {}", "context ".repeat(250)),
+            }],
+        })
+        .collect();
+    agent.background.enabled = true;
+    agent.compact_threshold_chars = Some(30_000);
+}
+
+fn background_test_candidate(agent: &mut Agent) -> tokio::sync::oneshot::Sender<String> {
+    let split = agent.find_compact_split().expect("pair-safe prefix");
+    let (_, preserved) = agent.split_compaction_inputs(&agent.history[..split]);
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    agent.background.job = Some(compaction::BackgroundJob {
+        worker: compaction::SummaryWorker {
+            task: tokio::spawn(async move { Ok(rx.await?) }),
+            cancel: Arc::new(AtomicBool::new(false)),
+            accounting: Arc::new(Mutex::new(compaction::SummaryAccounting {
+                usage: Usage {
+                    input: 11,
+                    output: 7,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })),
+            started: std::time::Instant::now(),
+        },
+        id: "test-job".into(),
+        session: agent.session_id.clone(),
+        turn: "test-turn".into(),
+        history_epoch: agent.background.history_epoch,
+        config_epoch: agent.background.config_epoch,
+        config_digest: agent.background_config_digest(),
+        prefix_digest: tool_journal::input_sha256(&json!(&agent.history[..split])).unwrap(),
+        split,
+        preserved,
+        before_chars: agent.history_chars(),
+    });
+    tx
+}
+
+#[test]
+fn background_compaction_default_and_cli_choices_are_explicit() -> Result<()> {
+    let _guard = env_lock();
+    let previous = std::env::var_os("DEXT_BACKGROUND_COMPACT");
+    unsafe { std::env::remove_var("DEXT_BACKGROUND_COMPACT") };
+    assert!(compaction::background_default());
+    unsafe { std::env::set_var("DEXT_BACKGROUND_COMPACT", "0") };
+    assert!(!compaction::background_default());
+    unsafe { std::env::set_var("DEXT_BACKGROUND_COMPACT", "1") };
+    assert!(compaction::background_default());
+    restore_env_var("DEXT_BACKGROUND_COMPACT", previous);
+    assert_eq!(
+        parse_cli_options(vec!["--background-compact=off".into()])?.background_compact,
+        Some(false)
+    );
+    assert_eq!(
+        parse_cli_options(vec!["--background-compact".into(), "on".into()])?.background_compact,
+        Some(true)
+    );
+    for flags in [
+        vec!["--background-compact"],
+        vec!["--background-compact=maybe"],
+        vec!["--background-compact="],
+    ] {
+        assert!(parse_cli_options(flags.into_iter().map(str::to_string).collect()).is_err());
+    }
+    for (command, value) in [
+        ("/compact background", None),
+        ("/compact background status", None),
+        ("/compact background on", Some(true)),
+        ("/compact background OFF", Some(false)),
+    ] {
+        assert_eq!(
+            parse_compact_slash(command),
+            Some(Ok(CompactSlash::Background(value)))
+        );
+    }
+    assert!(matches!(
+        parse_compact_slash("/compact background off extra"),
+        Some(Err(_))
+    ));
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[allow(clippy::await_holding_lock)]
+async fn background_compaction_preference_persists_and_legacy_uses_startup_default() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("background-setting-resume").canonicalize()?;
+    let _cleanup = RemoveDirOnDrop(root.clone());
+    let state = root.join("state");
+    std::fs::create_dir(&state)?;
+    let _state_env = PackEnvGuard::new(&state);
+    let mut source = test_agent(&root);
+    background_test_history(&mut source);
+    source.latest_session_path = root.join("saved.jsonl");
+    source.configure_background_compaction(Some(false)).await?;
+    let (header, history) = read_session_jsonl(&source.latest_session_path)?;
+    assert_eq!(header.background_compact, Some(false));
+    let mut resumed = test_agent(&root);
+    resumed.session_enabled = false;
+    resumed.background.enabled = true;
+    resumed.load_session_from_path(&source.latest_session_path)?;
+    assert!(
+        !resumed.background.enabled,
+        "saved choice wins over the startup default"
+    );
+    resumed.apply_background_compaction_override(Some(true))?;
+    assert!(
+        resumed.background.enabled,
+        "explicit CLI wins after saved preference"
+    );
+    resumed.apply_background_compaction_override(Some(false))?;
+    assert!(!resumed.background.enabled);
+    let old_env = std::env::var_os("DEXT_BACKGROUND_COMPACT");
+    unsafe { std::env::remove_var("DEXT_BACKGROUND_COMPACT") };
+    let mut legacy = serde_json::to_value(header)?;
+    legacy["version"] = json!(SEAT_TRANSITIONAL_FORMAT_VERSION);
+    legacy.as_object_mut().unwrap().remove("background_compact");
+    let legacy_path = root.join("legacy.jsonl");
+    let mut bytes = format!("{legacy}\n");
+    for message in history {
+        bytes.push_str(&format!("{}\n", serde_json::to_string(&message)?));
+    }
+    std::fs::write(&legacy_path, bytes)?;
+    resumed.load_session_from_path(&legacy_path)?;
+    assert!(
+        resumed.background.enabled,
+        "legacy missing preference defaults on"
+    );
+    unsafe { std::env::set_var("DEXT_BACKGROUND_COMPACT", "0") };
+    resumed.load_session_from_path(&legacy_path)?;
+    assert!(
+        !resumed.background.enabled,
+        "legacy missing preference uses startup override"
+    );
+    restore_env_var("DEXT_BACKGROUND_COMPACT", old_env);
+    for version in [1, 3, 4] {
+        let invalid =
+            json!({"version":version,"model":"test","system":"test","background_compact":"off"});
+        assert!(parse_session_header(&invalid.to_string()).is_err());
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn background_compaction_disable_reaps_accounts_saves_and_keeps_regular_fallback()
+-> Result<()> {
+    let root = temp_test_dir("background-setting-disable");
+    let _cleanup = RemoveDirOnDrop(root.clone());
+    let mut agent = test_agent(&root);
+    background_test_history(&mut agent);
+    agent.latest_session_path = root.join("saved.jsonl");
+    let before = serde_json::to_value(&agent.history)?;
+    let tx = background_test_candidate(&mut agent);
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    agent.set_sink(Box::new(ChannelSink { tx: event_tx }));
+    assert!(
+        agent
+            .configure_background_compaction(Some(false))
+            .await?
+            .contains("off")
+    );
+    assert!(!agent.background.enabled);
+    assert!(agent.background.job.is_none());
+    assert!(tx.send("must not apply".into()).is_err());
+    assert_eq!(serde_json::to_value(&agent.history)?, before);
+    assert_eq!(agent.session_usage.input, 11);
+    let (saved, _) = read_session_jsonl(&agent.latest_session_path)?;
+    assert_eq!(saved.background_compact, Some(false));
+    assert_eq!(saved.usage.input, 11);
+    let events = drain_events(&mut event_rx);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::BackgroundCompactionSetting { enabled: false }
+    )));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::CompactEnd { .. }))
+    );
+    agent.start_background("disabled")?;
+    assert!(agent.background.job.is_none());
+    let threshold = agent.history_chars() - 1;
+    assert!(
+        agent
+            .compact_if_over_threshold(threshold, "regular-fallback")
+            .await
+    );
+    assert!(agent.history_chars() < threshold);
+    assert!(drain_events(&mut event_rx).iter().any(|event| matches!(
+        event,
+        AgentEvent::CompactEnd {
+            background: false,
+            ..
+        }
+    )));
+    agent.background.last_prefix = Some("cancelled-prefix".into());
+    agent.configure_background_compaction(Some(true)).await?;
+    assert!(agent.background.enabled);
+    assert!(agent.background.last_prefix.is_none());
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn background_compaction_not_useful_uses_regular_compaction_at_threshold() -> Result<()> {
+    let root = temp_test_dir("background-setting-fallback");
+    let _cleanup = RemoveDirOnDrop(root.clone());
+    let mut agent = test_agent(&root);
+    background_test_history(&mut agent);
+    agent.latest_session_path = root.join("saved.jsonl");
+    let threshold = agent.history_chars() - 1;
+    let tx = background_test_candidate(&mut agent);
+    tx.send("oversized summary ".repeat(5000)).unwrap();
+    agent.background_wakeup().await;
+    let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+    agent.set_sink(Box::new(ChannelSink { tx }));
+    assert!(
+        agent
+            .compact_if_over_threshold(threshold, "unusable-background-fallback")
+            .await
+    );
+    assert!(agent.history_chars() < threshold);
+    assert!(agent.background.enabled);
+    assert!(agent.background.job.is_none());
+    assert_eq!(agent.session_usage.input, 11);
+    let events = drain_events(&mut events);
+    assert!(events.iter().any(|event| matches!(event,
+        AgentEvent::BackgroundCompaction { phase, reason, .. }
+        if phase == "discarded" && reason == "not_useful_or_unpaired")));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::CompactEnd {
+            background: false,
+            ..
+        }
+    )));
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        AgentEvent::CompactEnd {
+            background: true,
+            ..
+        }
+    )));
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn background_compaction_setting_save_failure_stays_safe_and_retries_accounting_once()
+-> Result<()> {
+    let root = temp_test_dir("background-setting-save-failure");
+    let _cleanup = RemoveDirOnDrop(root.clone());
+    let mut agent = test_agent(&root);
+    background_test_history(&mut agent);
+    agent.latest_session_path = root.join("blocked.jsonl");
+    std::fs::create_dir(&agent.latest_session_path)?;
+    let _tx = background_test_candidate(&mut agent);
+    let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+    agent.set_sink(Box::new(ChannelSink { tx }));
+    assert!(
+        agent
+            .configure_background_compaction(Some(false))
+            .await
+            .is_err()
+    );
+    assert!(!agent.background.enabled);
+    assert!(agent.background.job.is_none());
+    assert!(agent.background.retirement_usage_pending);
+    assert_eq!(agent.session_usage.input, 11);
+    assert!(
+        !drain_events(&mut events)
+            .iter()
+            .any(|event| matches!(event, AgentEvent::BackgroundCompactionSetting { .. }))
+    );
+    assert!(
+        agent
+            .configure_background_compaction(Some(true))
+            .await
+            .is_err()
+    );
+    assert!(
+        !agent.background.enabled,
+        "failed enable never launches speculation"
+    );
+    std::fs::remove_dir(&agent.latest_session_path)?;
+    agent.configure_background_compaction(Some(false)).await?;
+    let (saved, _) = read_session_jsonl(&agent.latest_session_path)?;
+    assert_eq!(saved.background_compact, Some(false));
+    assert_eq!(saved.usage.input, 11);
+    assert!(!agent.background.retirement_usage_pending);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn background_compaction_overlaps_foreground_request_and_idle_apply() -> Result<()> {
+    let root = temp_test_dir("background-overlap");
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let address = listener.local_addr()?;
+    let (summary_seen_tx, summary_seen_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let server = std::thread::spawn(move || {
+        let mut summary_seen_tx = Some(summary_seen_tx);
+        let mut release_rx = Some(release_rx);
+        let mut summary_thread = None;
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 4096];
+            let value = loop {
+                let count = stream.read(&mut buffer).unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&buffer[..count]);
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..end]);
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                        })
+                        .unwrap();
+                    if request.len() >= end + 4 + length {
+                        break serde_json::from_slice::<Value>(&request[end + 4..end + 4 + length])
+                            .unwrap();
+                    }
+                }
+            };
+            if value["stream"] == false {
+                let release = release_rx.take().expect("one summary only");
+                summary_seen_tx.take().unwrap().send(()).unwrap();
+                summary_thread = Some(std::thread::spawn(move || {
+                    release
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                    let body = r#"{"choices":[{"message":{"content":"short summary"},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":7}}"#;
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                }));
+            } else {
+                let body = "data: {\"choices\":[{\"delta\":{\"content\":\"The foreground answer completed while the summary worker remained blocked at its barrier; this proves real overlap.\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":13,\"completion_tokens\":9}}\n\ndata: [DONE]\n\n";
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        }
+        summary_thread.unwrap().join().unwrap();
+    });
+    let mut agent = test_agent(&root);
+    configure_local_openai_agent(&mut agent, format!("http://{address}"));
+    background_test_history(&mut agent);
+    agent.max_iterations = Some(2);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    agent.set_sink(Box::new(ChannelSink { tx }));
+    let started = std::time::Instant::now();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        agent.chat("Hello".into()),
+    )
+    .await??;
+    let foreground_ms = started.elapsed().as_millis();
+    tokio::time::timeout(std::time::Duration::from_secs(1), summary_seen_rx).await??;
+    assert!(
+        agent.background.job.is_some(),
+        "summary must still be blocked after foreground completes"
+    );
+    assert!(!agent.quiet_stream_events);
+    let split = agent.background.job.as_ref().unwrap().split;
+    let tail = serde_json::to_value(&agent.history[split..])?;
+    let foreground_events = drain_events(&mut rx);
+    assert!(foreground_events.iter().any(
+        |event| matches!(event, AgentEvent::TextDelta(text) if text.contains("foreground answer"))
+    ));
+    assert!(
+        foreground_events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::TurnEnd { .. }))
+    );
+    release_tx.send(())?;
+    agent.background_wakeup().await;
+    assert!(
+        agent.service_background(false).await,
+        "idle completion applies without another prompt"
+    );
+    assert_eq!(serde_json::to_value(&agent.history[2..])?, tail);
+    assert_eq!(agent.session_usage.input, 24);
+    assert_eq!(agent.session_usage.output, 16);
+    eprintln!(
+        "overlap foreground_ms={foreground_ms} summary_barrier_total_ms={} exact_tail_messages={}",
+        started.elapsed().as_millis(),
+        agent.history.len() - 2
+    );
+    server.join().unwrap();
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn background_compaction_applies_exact_current_tail_and_accounts_once() -> Result<()> {
+    let root = temp_test_dir("background-tail");
+    let mut agent = test_agent(&root);
+    background_test_history(&mut agent);
+    let tx = background_test_candidate(&mut agent);
+    let split = agent.background.job.as_ref().unwrap().split;
+    agent.history.extend([
+        Message {
+            role: "assistant".into(),
+            content: vec![Block::ToolUse {
+                id: "new-pair".into(),
+                name: "read_file".into(),
+                input: json!({"path":"current"}),
+            }],
+        },
+        Message {
+            role: "user".into(),
+            content: vec![tool_result_block("new-pair", "latest result", None)],
+        },
+        Message {
+            role: "user".into(),
+            content: vec![Block::Text {
+                text: "[queued-user-update] correction wins".into(),
+            }],
+        },
+    ]);
+    let tail = serde_json::to_value(&agent.history[split..])?;
+    tx.send("Short summary".into()).unwrap();
+    agent.background_wakeup().await;
+    assert!(agent.service_background(false).await);
+    assert_eq!(serde_json::to_value(&agent.history[2..])?, tail);
+    assert_eq!(agent.session_usage.input, 11);
+    assert_eq!(agent.session_usage.output, 7);
+    assert!(!agent.service_background(false).await);
+    assert_eq!(agent.session_usage.input, 11);
+    assert!(agent.background.job.is_none());
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn background_compaction_rejects_same_length_prefix_route_clear_and_fork_changes()
+-> Result<()> {
+    let root = temp_test_dir("background-invalidation");
+    for mutation in ["prefix", "route", "clear", "fork", "privacy", "epoch"] {
+        let mut agent = test_agent(&root);
+        background_test_history(&mut agent);
+        let tx = background_test_candidate(&mut agent);
+        match mutation {
+            "prefix" => {
+                let Block::Text { text } = &mut agent.history[0].content[0] else {
+                    unreachable!()
+                };
+                text.replace_range(0..2, "XX");
+            }
+            "route" => agent.base_url.push_str("/changed"),
+            "clear" => agent.history.clear(),
+            "fork" => agent.session_id = new_session_id(),
+            "privacy" => agent.privacy.enabled = false,
+            "epoch" => agent.background.history_epoch += 1,
+            _ => unreachable!(),
+        }
+        let expected = serde_json::to_value(&agent.history)?;
+        tx.send("stale summary".into()).unwrap();
+        agent.background_wakeup().await;
+        assert!(!agent.service_background(false).await, "{mutation}");
+        assert_eq!(
+            serde_json::to_value(&agent.history)?,
+            expected,
+            "{mutation}"
+        );
+        assert_eq!(
+            agent.session_usage.input, 11,
+            "discard accounting {mutation}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn background_compaction_policy_changes_cancel_and_account_once() -> Result<()> {
+    let root = temp_test_dir("background-policy");
+    for policy in ["approval", "sandbox", "budget"] {
+        let mut agent = test_agent(&root);
+        background_test_history(&mut agent);
+        let tx = background_test_candidate(&mut agent);
+        let expected = serde_json::to_value(&agent.history)?;
+        let epoch = agent.background.config_epoch;
+        match policy {
+            "approval" => {
+                agent.set_approval_profile(ApprovalProfile::Never);
+            }
+            "sandbox" => agent.set_sandbox_profile(SandboxProfile::ReadOnly),
+            "budget" => agent.set_budget_cap(BudgetCap::parse("100k tokens")),
+            _ => unreachable!(),
+        }
+        assert!(agent.background.config_epoch > epoch, "{policy}");
+        assert!(
+            agent
+                .background
+                .job
+                .as_ref()
+                .unwrap()
+                .worker
+                .cancel
+                .load(Ordering::SeqCst)
+        );
+        assert_eq!(agent.session_usage.input, 0);
+        assert_eq!(agent.session_usage.output, 0);
+        {
+            let accounting = agent
+                .background
+                .job
+                .as_ref()
+                .unwrap()
+                .worker
+                .accounting
+                .clone();
+            let mut accounting = accounting.lock().unwrap();
+            assert!(!accounting.accounted);
+            accounting.usage.input += 5;
+            accounting.usage.output += 3;
+        }
+        assert!(!agent.service_background(false).await, "{policy}");
+        assert!(tx.send("cancelled summary".into()).is_err());
+        assert!(agent.background.job.is_none());
+        assert_eq!(serde_json::to_value(&agent.history)?, expected);
+        assert_eq!(agent.session_usage.input, 16);
+        assert_eq!(agent.session_usage.output, 10);
+    }
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn background_compaction_retirement_isolated_from_new_session_and_hook_gate() -> Result<()> {
+    let root = temp_test_dir("background-retirement");
+    let mut agent = test_agent(&root);
+    background_test_history(&mut agent);
+    agent.latest_session_path = root.join("old-session.jsonl");
+    let _tx = background_test_candidate(&mut agent);
+    agent.retire_background_session("test_load")?;
+    assert!(agent.background.job.is_none());
+    assert_eq!(agent.session_usage.input, 11);
+    let (saved, _) = read_session_jsonl(&agent.latest_session_path)?;
+    assert_eq!(saved.usage.input, 11);
+    assert_eq!(saved.usage.output, 7);
+    agent.session_usage = Usage {
+        input: 101,
+        output: 73,
+        ..Default::default()
+    };
+    assert!(!agent.service_background(false).await);
+    assert_eq!(agent.session_usage.input, 101);
+    agent.background.cooldown = None;
+    agent.hooks.pre_request.push(Hook {
+        tool_match: None,
+        command: "exit 1".into(),
+    });
+    agent.start_background("gated")?;
+    assert!(agent.background.job.is_none());
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn background_compaction_retirement_persist_failure_blocks_switch_and_retries_once()
+-> Result<()> {
+    let root = temp_test_dir("background-retirement-persist-failure");
+    let _cleanup = RemoveDirOnDrop(root.clone());
+    let next = root.join("next-root");
+    std::fs::create_dir(&next)?;
+    let mut agent = test_agent(&root);
+    background_test_history(&mut agent);
+    agent.latest_session_path = root.join("blocked.jsonl");
+    std::fs::create_dir(&agent.latest_session_path)?;
+    let _tx = background_test_candidate(&mut agent);
+    assert!(agent.set_sandbox_root(next.clone()).is_err());
+    assert_eq!(agent.sandbox_root, root);
+    assert_eq!(agent.session_usage.input, 11);
+    assert!(agent.background.job.is_none());
+    assert!(agent.background.retirement_usage_pending);
+    std::fs::remove_dir(&agent.latest_session_path)?;
+    agent.set_sandbox_root(next.canonicalize()?)?;
+    let (saved, _) = read_session_jsonl(&root.join("blocked.jsonl"))?;
+    assert_eq!(saved.usage.input, 11);
+    assert_eq!(saved.usage.output, 7);
+    assert_eq!(agent.session_usage.input, 11);
+    assert!(agent.background.job.is_none());
+    assert!(!agent.background.retirement_usage_pending);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn background_compaction_rejected_load_does_not_retire_live_job() -> Result<()> {
+    let root = temp_test_dir("background-rejected-load");
+    let _cleanup = RemoveDirOnDrop(root.clone());
+    let mut agent = test_agent(&root);
+    background_test_history(&mut agent);
+    let tx = background_test_candidate(&mut agent);
+    let epochs = (
+        agent.background.history_epoch,
+        agent.background.config_epoch,
+    );
+    assert!(
+        agent
+            .load_session_from_path(&root.join("missing.jsonl"))
+            .is_err()
+    );
+    assert_eq!(
+        (
+            agent.background.history_epoch,
+            agent.background.config_epoch
+        ),
+        epochs
+    );
+    assert_eq!(agent.session_usage.input, 0);
+    assert!(agent.background.job.is_some());
+    tx.send("summary survives rejected load".into()).unwrap();
+    agent.background_wakeup().await;
+    assert!(agent.service_background(false).await);
+    assert_eq!(agent.session_usage.input, 11);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[allow(clippy::await_holding_lock)]
+async fn background_compaction_reload_current_preserves_retired_usage() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("background-reload-current").canonicalize()?;
+    let _cleanup = RemoveDirOnDrop(root.clone());
+    let state = root.join("state");
+    std::fs::create_dir(&state)?;
+    let _state_env = PackEnvGuard::new(&state);
+    let mut agent = test_agent(&root);
+    background_test_history(&mut agent);
+    agent.latest_session_path = root.join("current.jsonl");
+    agent.save_latest_session()?;
+    let _tx = background_test_candidate(&mut agent);
+    agent.background.last_prefix = Some("old-prefix".into());
+    let path = agent.latest_session_path.clone();
+    agent.load_session_from_path(&path)?;
+    assert!(agent.background.job.is_none());
+    assert!(agent.background.last_prefix.is_none());
+    assert_eq!(agent.session_usage.input, 11);
+    assert_eq!(agent.session_usage.output, 7);
+    let (saved, _) = read_session_jsonl(&path)?;
+    assert_eq!(saved.usage.input, 11);
+    assert_eq!(saved.usage.output, 7);
+    Ok(())
+}
+
+#[test]
+fn kept_fork_boundary_handles_long_unpaired_suffix_without_repeated_scans() -> Result<()> {
+    let mut history = vec![Message {
+        role: "user".into(),
+        content: vec![Block::Text {
+            text: "before".into(),
+        }],
+    }];
+    history.extend((0..10_000).map(|index| Message {
+        role: "assistant".into(),
+        content: vec![Block::ToolUse {
+            id: format!("unpaired-{index}"),
+            name: "read_file".into(),
+            input: json!({"path":"x"}),
+        }],
+    }));
+    assert_eq!(kept_fork_boundary(&history, history.len())?, 0);
+    let closed = vec![
+        Message {
+            role: "user".into(),
+            content: vec![Block::Text {
+                text: "before".into(),
+            }],
+        },
+        Message {
+            role: "assistant".into(),
+            content: vec![Block::ToolUse {
+                id: "one".into(),
+                name: "read_file".into(),
+                input: json!({"path":"x"}),
+            }],
+        },
+        Message {
+            role: "user".into(),
+            content: vec![tool_result_block("one", "result", None)],
+        },
+        Message {
+            role: "assistant".into(),
+            content: vec![Block::Text {
+                text: "after".into(),
+            }],
+        },
+    ];
+    for (cut, expected) in [(0, 0), (1, 1), (2, 1), (3, 3), (4, 4)] {
+        assert_eq!(kept_fork_boundary(&closed, cut)?, expected);
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn background_compaction_wait_is_interruptible_and_off_budget_paths_do_not_spawn()
+-> Result<()> {
+    let root = temp_test_dir("background-interrupt");
+    let mut agent = test_agent(&root);
+    background_test_history(&mut agent);
+    agent.background.enabled = false;
+    agent.start_background("off")?;
+    assert!(agent.background.job.is_none());
+    agent.background.enabled = true;
+    agent.budget_cap = BudgetCap::parse("100k tokens");
+    agent.start_background("budget")?;
+    assert!(agent.background.job.is_none());
+    agent.budget_cap = None;
+    let _tx = background_test_candidate(&mut agent);
+    let cancel = agent.interrupt.clone();
+    let signal = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        cancel.store(true, Ordering::SeqCst);
+    });
+    let started = std::time::Instant::now();
+    assert!(!agent.service_background(true).await);
+    assert!(started.elapsed() < std::time::Duration::from_millis(500));
+    signal.await?;
+    assert!(agent.background.job.is_none());
+    assert_eq!(agent.session_usage.input, 11);
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn background_compaction_hard_limit_reuses_job_then_falls_back_if_insufficient() -> Result<()>
+{
+    let root = temp_test_dir("background-hard-limit");
+    let mut agent = test_agent(&root);
+    background_test_history(&mut agent);
+    let tx = background_test_candidate(&mut agent);
+    let threshold = agent.active_compact_threshold_chars();
+    agent.history.push(Message {
+        role: "user".into(),
+        content: vec![Block::Text {
+            text: "new tail ".repeat(3000),
+        }],
+    });
+    assert!(agent.history_chars() > threshold);
+    let release = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        tx.send("summary".into()).unwrap();
+    });
+    let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+    agent.set_sink(Box::new(ChannelSink { tx }));
+    assert!(
+        agent
+            .compact_if_over_threshold(threshold, "hard-limit-test")
+            .await
+    );
+    release.await?;
+    assert!(agent.background.job.is_none());
+    assert!(drain_events(&mut events).iter().any(|event| matches!(event, AgentEvent::BackgroundCompaction { phase, .. } if phase == "waiting")));
+    assert_eq!(agent.session_usage.input, 11);
+    // The appended tail still exceeds headroom after the speculative prefix shrinks.
+    // The normal blocking fallback may also be insufficient; request guards must reject it.
+    assert!(agent.history_chars() > threshold);
+    agent.max_iterations = Some(1);
+    let error = agent
+        .chat("Hello".into())
+        .await
+        .expect_err("never dispatch oversized foreground");
+    assert!(
+        error.to_string().contains("headroom exhausted"),
+        "{error:#}"
+    );
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn background_compaction_persist_failure_keeps_history_and_emits_no_apply() -> Result<()> {
+    let root = temp_test_dir("background-persist-failure");
+    let mut agent = test_agent(&root);
+    background_test_history(&mut agent);
+    agent.session_enabled = true;
+    agent.latest_session_path = root.join("directory-not-file");
+    std::fs::create_dir(&agent.latest_session_path)?;
+    let tx = background_test_candidate(&mut agent);
+    let before = serde_json::to_value(&agent.history)?;
+    let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+    agent.set_sink(Box::new(ChannelSink { tx: events_tx }));
+    tx.send("short summary".into()).unwrap();
+    agent.background_wakeup().await;
+    assert!(!agent.service_background(false).await);
+    assert_eq!(serde_json::to_value(&agent.history)?, before);
+    let events = drain_events(&mut events_rx);
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        AgentEvent::CompactEnd { .. } | AgentEvent::HistoryContextUpdated { .. }
+    )));
+    assert_eq!(agent.session_usage.input, 11);
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn background_compaction_shutdown_settles_worker_and_hooks_fire_only_on_apply() -> Result<()>
+{
+    let root = temp_test_dir("background-shutdown-hooks");
+    let mut agent = test_agent(&root);
+    background_test_history(&mut agent);
+    agent.set_approval_profile(ApprovalProfile::Always);
+    agent.hooks.post_compact.push(Hook {
+        tool_match: None,
+        command: "printf x >> applied".into(),
+    });
+    let tx = background_test_candidate(&mut agent);
+    let handle = agent
+        .background
+        .job
+        .as_ref()
+        .unwrap()
+        .worker
+        .task
+        .abort_handle();
+    agent.settle_background("shutdown_test").await;
+    assert!(handle.is_finished());
+    assert!(tx.send("too late".into()).is_err());
+    assert!(!root.join("applied").exists());
+    assert_eq!(agent.session_usage.input, 11);
+    let tx = background_test_candidate(&mut agent);
+    tx.send("installed".into()).unwrap();
+    agent.background_wakeup().await;
+    assert!(agent.service_background(false).await);
+    assert_eq!(std::fs::read_to_string(root.join("applied"))?, "x");
+    assert_eq!(agent.session_usage.input, 22);
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[test]
+fn kept_fork_cli_rejects_conflicts_and_parses_message_count() -> Result<()> {
+    let options = parse_cli_options(vec![
+        "--fork-to".into(),
+        "child".into(),
+        "--at=3".into(),
+        "--resume".into(),
+        "source.jsonl".into(),
+    ])?;
+    assert_eq!(options.fork_to.as_deref(), Some("child"));
+    assert_eq!(options.fork_at, Some(3));
+    assert_eq!(options.resume_selector.as_deref(), Some("source.jsonl"));
+    for flags in [
+        vec!["--at", "1"],
+        vec!["--fork-to", "../bad"],
+        vec!["--fork-to", "child", "--fork"],
+        vec!["--fork-to", "child", "--no-session"],
+        vec!["--fork-to", "child", "--input", "ndjson"],
+        vec!["--fork-to", "child", "-p"],
+        vec!["--fork-to", "child", "prompt"],
+    ] {
+        assert!(parse_cli_options(flags.into_iter().map(str::to_string).collect()).is_err());
+    }
+    Ok(())
+}
+
+#[test]
+fn kept_fork_preserves_pairs_new_identity_and_source_without_journal_replay() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("kept-fork").canonicalize()?;
+    let _cleanup = RemoveDirOnDrop(root.clone());
+    let state = root.join("state");
+    std::fs::create_dir(&state)?;
+    let _state_env = PackEnvGuard::new(&state);
+    let old_sessions = std::env::var_os("DEXT_SESSIONS_DIR");
+    unsafe { std::env::remove_var("DEXT_SESSIONS_DIR") };
+    let result = (|| -> Result<()> {
+        let mut agent = test_agent(&root);
+        agent.select_seat("parent")?;
+        agent.background.enabled = false;
+        agent.history = vec![
+            Message {
+                role: "user".into(),
+                content: vec![Block::Text {
+                    text: "before".into(),
+                }],
+            },
+            Message {
+                role: "assistant".into(),
+                content: vec![Block::ToolUse {
+                    id: "pair".into(),
+                    name: "write_file".into(),
+                    input: json!({"path":"never-write","content":"bad"}),
+                }],
+            },
+            Message {
+                role: "user".into(),
+                content: vec![tool_result_block("pair", "already written", None)],
+            },
+            Message {
+                role: "assistant".into(),
+                content: vec![Block::Text {
+                    text: "after".into(),
+                }],
+            },
+        ];
+        let path = agent.save_latest_session()?;
+        let before = std::fs::read(&path)?;
+        let options = parse_cli_options(vec![
+            "--fork-to".into(),
+            "child".into(),
+            "--at".into(),
+            "2".into(),
+            "--seat".into(),
+            "parent".into(),
+            "--cd".into(),
+            root.to_string_lossy().into_owned(),
+        ])?;
+        let fork = keep_session_fork(&options)?;
+        assert_eq!(fork["at"], 1);
+        assert_eq!(fork["source_session_id"], agent.session_id);
+        let id = fork["session_id"].as_str().expect("new id");
+        assert_ne!(id, agent.session_id);
+        let new_path = seats::latest_session_path(&root, "child")?;
+        let (header, history) = read_session_jsonl(&new_path)?;
+        assert_eq!(history.len(), 1);
+        assert_eq!(header.seat.as_ref().map(|s| s.id.as_str()), Some("child"));
+        assert_eq!(header.session_id.as_deref(), Some(id));
+        assert_eq!(header.background_compact, Some(false));
+        assert!(header.active_pack_runtimes.is_empty());
+        assert!(header.allowed.is_empty());
+        assert!(
+            tool_journal::load_for_session_file(&new_path)?
+                .expect("empty journal")
+                .is_empty()
+        );
+        assert_eq!(std::fs::read(&path)?, before);
+        assert!(!root.join("never-write").exists());
+        assert!(keep_session_fork(&options).is_err());
+        assert_eq!(kept_fork_boundary(&agent.history, 3)?, 3);
+        assert_eq!(kept_fork_boundary(&agent.history, 4)?, 4);
+        assert_eq!(kept_fork_boundary(&agent.history, 0)?, 0);
+        assert!(kept_fork_boundary(&agent.history, 5).is_err());
+        Ok(())
+    })();
+    restore_env_var("DEXT_SESSIONS_DIR", old_sessions);
+    result
+}
+
+#[test]
+fn replay_safe_registry_is_parallel_safe_without_sensitive_reads() {
+    let expected = HashSet::from([
+        "read_file",
+        "read_symbol",
+        "fd",
+        "rg",
+        "jq",
+        "fzf",
+        "git_diff",
+        "git_status",
+        "git_log",
+        "todo_read",
+    ]);
+    let actual = tools::registered_tool_names()
+        .filter(|name| tools::is_replay_safe_tool(name))
+        .collect::<HashSet<_>>();
+    assert_eq!(actual, expected);
+    for name in tools::registered_tool_names() {
+        assert_eq!(
+            tools::is_replay_safe_tool(name),
+            is_parallel_safe_tool(name) && !is_sensitive_read_tool(name),
+            "replay classification drift for {name}"
+        );
+        if tools::is_replay_safe_tool(name) {
+            assert!(!is_side_effect_capable_tool(name));
+        }
+    }
+    assert!(!tools::is_replay_safe_tool("unknown_tool"));
+    assert!(!tools::is_replay_safe_tool("pack.read"));
 }
 
 #[test]
@@ -10902,6 +11912,42 @@ fn canonical_dext_install_from_nested_directory_is_blocked() {
     assert_eq!(status, "error");
     assert!(agent.work_ledger.verification.is_empty());
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn bash_receives_exact_call_and_core_session_identity() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("bash-identity");
+    let _cleanup = RemoveDirOnDrop(root.clone());
+    let _state_env = PackEnvGuard::new(&root.join("state"));
+    let mut agent = test_agent(&root);
+    agent.set_approval_profile(ApprovalProfile::Always);
+    agent.set_sandbox_profile(SandboxProfile::DangerFullAccess);
+    let mut state = orchestrator::TurnRuntimeState::new();
+    tokio::runtime::Runtime::new()?.block_on(agent.execute_tool_round(ToolRoundContext {
+        tool_calls: vec![(
+            "provider-call-identity".into(),
+            "bash".into(),
+            json!({"command":"printf '%s/%s' \"$DEXT_TOOL_CALL_ID\" \"$DEXT_SESSION_ID\""}),
+        )],
+        iterations: 1,
+        turn_id: "turn-identity".into(),
+        objective_apply_fixes_allowed: false,
+        turn_state: &mut state,
+        denied_signatures: HashSet::new(),
+        hooks_approval_decided: true,
+        hooks_approved: false,
+    }))?;
+    let (output, _) = last_tool_result(&agent.history).expect("bash result");
+    assert!(
+        output.contains(&format!("provider-call-identity/{}", agent.session_id)),
+        "{output}"
+    );
+    assert!(!tool_credential_env_key("DEXT_TOOL_CALL_ID"));
+    assert!(!tool_credential_env_key("DEXT_SESSION_ID"));
+    assert!(!tool_credential_env_key("DEXTUI_SESSION_ID"));
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
 }
 
 #[tokio::test]
@@ -13662,6 +14708,75 @@ fn provider_total_timeout_is_opt_in_independent_and_validated_per_request() {
     for (var, value) in vars.into_iter().zip(old_values) {
         restore_env_var(var, value);
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn provider_responses_large_terminal_frame_completes_over_http() -> Result<()> {
+    let terminal = json!({"type":"response.completed", "response": {
+        "status":"completed", "usage":{"input_tokens":17,"output_tokens":9},
+        "output":[{"type":"reasoning", "id":"rs_large", "summary":[],
+            "encrypted_content":"x".repeat(300_000)}]}});
+    let body = format!(
+        "data: {{\"type\":\"response.output_text.delta\",\"delta\":\"visible answer\"}}\n\nevent: response.completed\ndata: {terminal}\n\n"
+    );
+    for contract in [
+        RequestContract::ChatGptResponses,
+        RequestContract::OpenAiResponses,
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let body = body.clone();
+        let server = std::thread::spawn(move || -> Result<()> {
+            let (mut stream, _) = listener.accept()?;
+            stream.set_nonblocking(false)?;
+            stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+            stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+            let mut request = Vec::new();
+            let mut buffer = [0; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = stream.read(&mut buffer)?;
+                anyhow::ensure!(
+                    count > 0 && request.len() + count <= 16_384,
+                    "invalid test request"
+                );
+                request.extend_from_slice(&buffer[..count]);
+            }
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )?;
+            for chunk in body.as_bytes().chunks(4093) {
+                stream.write_all(chunk)?;
+            }
+            Ok(())
+        });
+        let response = reqwest::Client::new()
+            .get(format!("http://{address}"))
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await?;
+        let mut agent = test_agent(Path::new("."));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        agent.set_sink(Box::new(ChannelSink { tx }));
+        let parsed = agent.read_provider_stream(response, contract).await;
+        server.join().expect("test server join")?;
+        let parsed = parsed?;
+        assert_eq!(parsed.stop_reason.as_deref(), Some("completed"));
+        assert_eq!(parsed.usage.input, 17);
+        assert_eq!(parsed.usage.output, 9);
+        assert!(parsed.blocks.iter().any(|block| matches!(block,
+            Block::Text { text } if text == "visible answer")));
+        assert_eq!(
+            drain_events(&mut rx)
+                .iter()
+                .filter(|event| matches!(event,
+            AgentEvent::TextDelta(text) if text == "visible answer"))
+                .count(),
+            1
+        );
+    }
+    Ok(())
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -18797,8 +19912,8 @@ fn local_llama_replays_only_current_turn_reasoning_and_cloud_chat_omits_it() {
     assert_eq!(current["content"], "");
     assert_eq!(current["reasoning_content"], "inspect current todos");
 
-    agent.provider_id = "deepseek".to_string();
-    agent.base_url = "https://api.deepseek.com".to_string();
+    agent.provider_id = "openai".to_string();
+    agent.base_url = "https://api.openai.com".to_string();
     let cloud_history_chars = agent.history_chars();
     assert_eq!(
         local_history_chars - cloud_history_chars,
@@ -19040,18 +20155,18 @@ fn runtime_control_model_switch_updates_next_request_material() -> Result<()> {
 
         let applied = finish_active_runtime_controls(
             &mut agent,
-            vec!["/model deepseek/deepseek-reasoner".to_string()],
+            vec!["/model deepseek/deepseek-v4-pro".to_string()],
             true,
         );
         assert!(applied.changed_model);
         assert!(applied.aborted_stream);
         assert_eq!(agent.provider_id, "deepseek");
-        assert_eq!(agent.model, "deepseek-reasoner");
+        assert_eq!(agent.model, "deepseek-v4-pro");
         assert_eq!(agent.api_provider, ApiProvider::OpenAi);
         assert!(
             agent.history.iter().any(|message| {
                 message.content.iter().any(|block| {
-                    matches!(block, Block::Text { text } if text.starts_with("[provider-route continuation]") && text.contains("glm/") && text.contains("deepseek/deepseek-reasoner"))
+                    matches!(block, Block::Text { text } if text.starts_with("[provider-route continuation]") && text.contains("glm/") && text.contains("deepseek/deepseek-v4-pro"))
                 })
             }),
             "provider-route continuation missing"
@@ -19068,8 +20183,8 @@ fn runtime_control_model_switch_updates_next_request_material() -> Result<()> {
             agent.build_streaming_request("sys", "env", &[], &[], chatgpt_session_id)?;
         assert!(url.contains("api.deepseek.com"), "{url}");
         let body_json: Value = serde_json::from_slice(&body)?;
-        assert_eq!(body_json["model"], "deepseek-reasoner");
-        assert_eq!(body_json["max_tokens"], 8192);
+        assert_eq!(body_json["model"], "deepseek-v4-pro");
+        assert_eq!(body_json["max_tokens"], 393_216);
         assert_eq!(body_json["stream_options"]["include_usage"], true);
         Ok(())
     })();
@@ -19584,6 +20699,692 @@ fn provider_effort_mapping_prefers_exact_levels_before_clamping() {
         Some("medium")
     );
     assert!(map_effort_to_provider_levels(&levels, ThinkingEffort::Off).is_none());
+}
+
+#[test]
+fn deepseek_catalog_migrates_retired_selections_and_generated_metadata() {
+    let builtin = built_in_provider_profiles()
+        .into_iter()
+        .find(|profile| profile.id == "deepseek")
+        .expect("DeepSeek profile");
+    assert_eq!(builtin.default_model, "deepseek-flash");
+    assert_eq!(builtin.models, ["deepseek-flash", "deepseek-v4-pro"]);
+    for (model, image, input, output, cache) in [
+        ("deepseek-flash", true, 0.3, 1.2, 0.006),
+        ("deepseek-v4-pro", false, 1.32, 3.96, 0.044),
+    ] {
+        let spec = resolve_model_spec(&builtin, model);
+        assert_eq!(spec.context_window, Some(1_000_000));
+        assert_eq!(spec.max_output_tokens, Some(393_216));
+        assert_eq!(spec.effort_levels, ["low", "high", "max"]);
+        assert!(spec.tools && spec.reasoning && spec.prompt_cache);
+        assert_eq!(spec.image_input, image);
+        let pricing = spec.pricing.expect("model pricing");
+        let fallback = crate::usage::deepseek_pricing(model).expect("fallback pricing");
+        assert_eq!(pricing.input_usd_per_mtok, input);
+        assert_eq!(pricing.output_usd_per_mtok, output);
+        assert_eq!(pricing.cache_read_usd_per_mtok, cache);
+        assert_eq!(pricing.cache_create_usd_per_mtok, 0.0);
+        assert_eq!(fallback.input, input);
+        assert_eq!(fallback.output, output);
+        assert_eq!(fallback.cache_read, cache);
+    }
+    assert!(crate::usage::deepseek_pricing("not-deepseek-flash").is_none());
+    for version in [1, 2, 3] {
+        for (retired, current, pricing) in [
+            (
+                "deepseek-chat",
+                "deepseek-flash",
+                ModelPricing {
+                    input_usd_per_mtok: 0.27,
+                    output_usd_per_mtok: 1.1,
+                    cache_read_usd_per_mtok: 0.07,
+                    cache_create_usd_per_mtok: 0.27,
+                },
+            ),
+            (
+                "deepseek-reasoner",
+                "deepseek-v4-pro",
+                ModelPricing {
+                    input_usd_per_mtok: 0.55,
+                    output_usd_per_mtok: 2.19,
+                    cache_read_usd_per_mtok: 0.14,
+                    cache_create_usd_per_mtok: 0.55,
+                },
+            ),
+        ] {
+            let mut stored = builtin.clone();
+            stored.default_model = retired.to_string();
+            stored.models = vec![retired.to_string()];
+            stored.model_aliases.clear();
+            stored.context_window = Some(128_000);
+            stored.model_defaults.max_output_tokens = Some(8_192);
+            stored.model_specs = HashMap::from([(
+                retired.to_string(),
+                ModelSpec {
+                    context_window: Some(128_000),
+                    max_output_tokens: Some(8_192),
+                    pricing: Some(pricing),
+                    capabilities: ModelCapabilities {
+                        reasoning: Some(retired != "deepseek-chat"),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )]);
+            let migrated = crate::provider::normalize_provider_catalog(ProviderCatalog {
+                version,
+                active_provider: "deepseek".to_string(),
+                providers: vec![stored],
+            })
+            .expect("migration");
+            let profile = find_provider_profile(&migrated, "deepseek").expect("migrated profile");
+            assert_eq!(profile.default_model, current);
+            assert_eq!(profile.models, ["deepseek-flash", "deepseek-v4-pro"]);
+            let spec = resolve_model_spec(&profile, current);
+            assert_eq!(spec.context_window, Some(1_000_000));
+            assert_eq!(spec.max_output_tokens, Some(393_216));
+            assert!(spec.reasoning);
+            assert_eq!(spec.pricing, resolve_model_spec(&builtin, current).pricing);
+        }
+    }
+    let mut stored = builtin.clone();
+    stored.default_model = "deepseek-v4-flash".to_string();
+    stored.context_window = Some(42_000);
+    stored
+        .model_specs
+        .get_mut("deepseek-v4-pro")
+        .unwrap()
+        .pricing
+        .as_mut()
+        .unwrap()
+        .input_usd_per_mtok = 7.0;
+    let current = crate::provider::normalize_provider_catalog(ProviderCatalog {
+        version: crate::provider::default_provider_catalog_version(),
+        active_provider: "deepseek".to_string(),
+        providers: vec![stored],
+    })
+    .expect("current catalog");
+    let profile = find_provider_profile(&current, "deepseek").unwrap();
+    assert_eq!(profile.default_model, "deepseek-flash");
+    assert_eq!(profile.context_window, Some(42_000));
+    assert_eq!(
+        resolve_model_spec(&profile, "deepseek-v4-pro")
+            .pricing
+            .unwrap()
+            .input_usd_per_mtok,
+        7.0
+    );
+}
+
+#[test]
+fn deepseek_review_migrates_alias_targets_and_case_varied_metadata() {
+    let mut stored = built_in_provider_profiles()
+        .into_iter()
+        .find(|profile| profile.id == "deepseek")
+        .unwrap();
+    stored.default_model = "fast".into();
+    stored.model_aliases = HashMap::from([
+        ("fast".into(), "DEEPSEEK-CHAT".into()),
+        ("careful".into(), "deepseek-reasoner".into()),
+    ]);
+    stored.models = vec!["fast".into(), "careful".into()];
+    stored.model_specs = HashMap::from([(
+        "DEEPSEEK-CHAT".into(),
+        ModelSpec {
+            context_window: Some(128_000),
+            max_output_tokens: Some(8_192),
+            capabilities: ModelCapabilities {
+                reasoning: Some(false),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )]);
+    let catalog = crate::provider::normalize_provider_catalog(ProviderCatalog {
+        version: 3,
+        active_provider: "deepseek".into(),
+        providers: vec![stored],
+    })
+    .unwrap();
+    let profile = find_provider_profile(&catalog, "deepseek").unwrap();
+    assert_eq!(profile.default_model, "deepseek-flash");
+    assert_eq!(
+        normalize_provider_model_value(&profile, "fast"),
+        "deepseek-flash"
+    );
+    assert_eq!(
+        normalize_provider_model_value(&profile, "careful"),
+        "deepseek-v4-pro"
+    );
+    let spec = resolve_model_spec(&profile, "fast");
+    assert_eq!(spec.context_window, Some(1_000_000));
+    assert_eq!(spec.max_output_tokens, Some(393_216));
+    assert!(spec.reasoning);
+    let catalog = crate::provider::normalize_provider_catalog(catalog).unwrap();
+    let profile = find_provider_profile(&catalog, "deepseek").unwrap();
+    assert_eq!(profile.default_model, "deepseek-flash");
+    assert_eq!(
+        normalize_provider_model_value(&profile, "fast"),
+        "deepseek-flash"
+    );
+    assert_eq!(
+        resolve_model_spec(&profile, "fast").context_window,
+        Some(1_000_000)
+    );
+}
+
+#[test]
+fn deepseek_review_canonical_metadata_wins_alias_collisions_deterministically() {
+    for _ in 0..32 {
+        let mut stored = built_in_provider_profiles()
+            .into_iter()
+            .find(|profile| profile.id == "deepseek")
+            .unwrap();
+        stored.model_specs = HashMap::from([
+            (
+                "deepseek-chat".into(),
+                ModelSpec {
+                    context_window: Some(12_000),
+                    max_output_tokens: Some(2_000),
+                    capabilities: ModelCapabilities {
+                        tools: Some(false),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ),
+            (
+                "deepseek-flash".into(),
+                ModelSpec {
+                    context_window: Some(48_000),
+                    capabilities: ModelCapabilities {
+                        tools: Some(true),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ),
+        ]);
+        stored.model_context_windows = HashMap::from([
+            ("deepseek-chat".into(), 12_000),
+            ("deepseek-flash".into(), 48_000),
+        ]);
+        stored.model_effort_levels = HashMap::from([
+            ("deepseek-chat".into(), vec!["low".into()]),
+            ("deepseek-flash".into(), vec!["high".into()]),
+        ]);
+        let normalized = crate::provider::normalize_provider_profile(stored).unwrap();
+        let spec = resolve_model_spec(&normalized, "deepseek-flash");
+        assert_eq!(spec.context_window, Some(48_000));
+        assert_eq!(
+            spec.max_output_tokens,
+            Some(2_000),
+            "disjoint alias metadata was lost"
+        );
+        assert!(spec.tools);
+        assert_eq!(normalized.model_context_windows["deepseek-flash"], 48_000);
+        assert_eq!(normalized.model_effort_levels["deepseek-flash"], ["high"]);
+        let catalog = crate::provider::normalize_provider_catalog(ProviderCatalog {
+            version: 4,
+            active_provider: "deepseek".into(),
+            providers: vec![normalized],
+        })
+        .unwrap();
+        let profile = find_provider_profile(&catalog, "deepseek").unwrap();
+        let spec = resolve_model_spec(&profile, "deepseek-flash");
+        assert_eq!(spec.context_window, Some(48_000));
+        assert_eq!(spec.max_output_tokens, Some(2_000));
+        assert!(spec.tools);
+    }
+}
+
+#[test]
+fn deepseek_review_legacy_per_model_overrides_take_effect_after_merge() {
+    let mut stored = built_in_provider_profiles()
+        .into_iter()
+        .find(|profile| profile.id == "deepseek")
+        .unwrap();
+    stored.model_specs.clear();
+    stored.model_context_windows = HashMap::from([("deepseek-chat".into(), 42_000)]);
+    stored.model_effort_levels = HashMap::from([("deepseek-chat".into(), vec!["high".into()])]);
+    let catalog = crate::provider::normalize_provider_catalog(ProviderCatalog {
+        version: 3,
+        active_provider: "deepseek".into(),
+        providers: vec![stored],
+    })
+    .unwrap();
+    let profile = find_provider_profile(&catalog, "deepseek").unwrap();
+    let spec = resolve_model_spec(&profile, "deepseek-flash");
+    assert_eq!(spec.context_window, Some(42_000));
+    assert_eq!(spec.effort_levels, ["high"]);
+    assert_eq!(spec.max_output_tokens, Some(393_216));
+    let catalog = crate::provider::normalize_provider_catalog(catalog).unwrap();
+    let profile = find_provider_profile(&catalog, "deepseek").unwrap();
+    assert_eq!(
+        resolve_model_spec(&profile, "deepseek-flash").context_window,
+        Some(42_000)
+    );
+    let mut stored = profile;
+    stored
+        .model_specs
+        .get_mut("deepseek-flash")
+        .unwrap()
+        .context_window = Some(64_000);
+    stored
+        .model_specs
+        .get_mut("deepseek-flash")
+        .unwrap()
+        .effort_levels = vec!["low".into()];
+    let catalog = crate::provider::normalize_provider_catalog(ProviderCatalog {
+        version: 4,
+        active_provider: "deepseek".into(),
+        providers: vec![stored],
+    })
+    .unwrap();
+    let profile = find_provider_profile(&catalog, "deepseek").unwrap();
+    let spec = resolve_model_spec(&profile, "deepseek-flash");
+    assert_eq!(spec.context_window, Some(64_000));
+    assert_eq!(spec.effort_levels, ["low"]);
+}
+
+#[test]
+fn deepseek_review_respects_declared_effort_limits_and_loopback_vendor_isolation() -> Result<()> {
+    let root = temp_test_dir("deepseek-review-effort-limits");
+    let mut agent = test_agent(&root);
+    let mut profile = built_in_provider_profiles()
+        .into_iter()
+        .find(|profile| profile.id == "deepseek")
+        .unwrap();
+    profile
+        .model_specs
+        .get_mut("deepseek-flash")
+        .unwrap()
+        .effort_levels = vec!["low".into(), "high".into()];
+    agent.provider_id = profile.id.clone();
+    agent.api_provider = profile.api_provider;
+    agent.model = profile.default_model.clone();
+    agent.base_url = "http://127.0.0.1:8080".into();
+    agent.provider_profile = Some(profile);
+    agent.thinking_effort = ThinkingEffort::Max;
+    let (_, bytes) = agent.build_streaming_request("sys", "env", &[], &[], "unused")?;
+    let body: Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(body["reasoning_effort"], "high");
+    assert!(body.get("chat_template_kwargs").is_none());
+    assert_eq!(body["stream_options"]["include_usage"], true);
+    assert!(
+        llama_tool_grammar_for(
+            "deepseek",
+            ApiProvider::OpenAi,
+            &agent.base_url,
+            &["todo_read"],
+            true
+        )
+        .is_none()
+    );
+    let pricing = crate::usage::usage_pricing_default_for(
+        "deepseek",
+        ApiProvider::OpenAi,
+        &agent.base_url,
+        &agent.model,
+    );
+    assert_eq!(pricing.input, 0.3);
+    assert_eq!(pricing.output, 1.2);
+    let summary = agent.prepare_summary_request(&[], "")?;
+    let summary: Value = serde_json::from_slice(
+        summary
+            .request
+            .body()
+            .and_then(reqwest::Body::as_bytes)
+            .context("summary bytes")?,
+    )?;
+    assert!(summary.get("chat_template_kwargs").is_none());
+    assert_eq!(summary["thinking"]["type"], "disabled");
+    agent.tools.clear();
+    agent.history = vec![Message {
+        role: "assistant".into(),
+        content: vec![
+            Block::Thinking {
+                text: "not replayed without tools".into(),
+                signature: None,
+            },
+            Block::Text {
+                text: "answer".into(),
+            },
+        ],
+    }];
+    let messages = serde_json::to_value(agent.history_to_oai_messages("sys"))?;
+    assert!(
+        messages
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|message| message.get("reasoning_content").is_none())
+    );
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[test]
+fn deepseek_request_maps_effort_and_isolates_vendor_fields() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("deepseek-request-contract");
+    let mut agent = test_agent(&root);
+    let profile = built_in_provider_profiles()
+        .into_iter()
+        .find(|profile| profile.id == "deepseek")
+        .unwrap();
+    agent.provider_id = profile.id.clone();
+    agent.api_provider = profile.api_provider;
+    agent.base_url = profile.base_url.clone();
+    agent.model = profile.default_model.clone();
+    agent.provider_profile = Some(profile);
+    for (effort, wire) in [
+        (ThinkingEffort::Off, None),
+        (ThinkingEffort::Minimal, Some("low")),
+        (ThinkingEffort::Low, Some("low")),
+        (ThinkingEffort::Medium, Some("high")),
+        (ThinkingEffort::High, Some("high")),
+        (ThinkingEffort::XHigh, Some("high")),
+        (ThinkingEffort::Max, Some("max")),
+    ] {
+        agent.thinking_effort = effort;
+        let (url, bytes) = agent.build_streaming_request("sys", "env", &[], &[], "unused")?;
+        let body: Value = serde_json::from_slice(&bytes)?;
+        assert_eq!(url, "https://api.deepseek.com/v1/chat/completions");
+        assert_eq!(body["model"], "deepseek-flash");
+        assert_eq!(
+            body["thinking"]["type"],
+            if wire.is_some() {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        );
+        assert_eq!(body.get("reasoning_effort").and_then(Value::as_str), wire);
+        assert_eq!(body["max_tokens"], 393_216);
+        assert_eq!(body["stream_options"]["include_usage"], true);
+        assert!(body.get("chat_template_kwargs").is_none());
+        assert!(body.get("max_completion_tokens").is_none());
+    }
+    let old = std::env::var_os("DEXT_MAX_OUTPUT_TOKENS");
+    unsafe { std::env::set_var("DEXT_MAX_OUTPUT_TOKENS", "500000") };
+    let result = agent.build_streaming_request("sys", "env", &[], &[], "unused");
+    restore_env_var("DEXT_MAX_OUTPUT_TOKENS", old);
+    let body: Value = serde_json::from_slice(&result?.1)?;
+    assert_eq!(body["max_tokens"], 393_216);
+    let summary = agent.prepare_summary_request(&[], "")?;
+    let summary: Value = serde_json::from_slice(
+        summary
+            .request
+            .body()
+            .and_then(reqwest::Body::as_bytes)
+            .context("summary bytes")?,
+    )?;
+    assert_eq!(summary["thinking"]["type"], "disabled");
+    assert!(summary.get("tools").is_none());
+    assert!(summary.get("reasoning_effort").is_none());
+    agent.provider_profile = None;
+    agent.provider_id = "openai".to_string();
+    agent.base_url = "https://api.openai.com".to_string();
+    agent.model = "gpt-4o".to_string();
+    let (_, bytes) = agent.build_streaming_request("sys", "env", &[], &[], "unused")?;
+    let body: Value = serde_json::from_slice(&bytes)?;
+    assert!(body.get("thinking").is_none());
+    for (id, api, url, expected) in [
+        (
+            "custom",
+            ApiProvider::OpenAi,
+            "https://api.deepseek.com/v1",
+            true,
+        ),
+        (
+            "custom",
+            ApiProvider::OpenAi,
+            "https://example.test/api.deepseek.com",
+            false,
+        ),
+        (
+            "custom",
+            ApiProvider::OpenAi,
+            "https://api.deepseek.com.example.test",
+            false,
+        ),
+        (
+            "deepseek",
+            ApiProvider::Anthropic,
+            "https://api.deepseek.com/anthropic",
+            false,
+        ),
+    ] {
+        assert_eq!(
+            crate::provider::is_deepseek_provider(id, api, url),
+            expected
+        );
+    }
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[test]
+fn deepseek_replays_all_retained_turns_but_fences_route_changes() {
+    let root = temp_test_dir("deepseek-reasoning-replay");
+    let mut agent = test_agent(&root);
+    agent.provider_id = "deepseek".to_string();
+    agent.api_provider = ApiProvider::OpenAi;
+    agent.base_url = "https://api.deepseek.com".to_string();
+    agent.model = "deepseek-flash".to_string();
+    agent.history = vec![
+        Message {
+            role: "user".into(),
+            content: vec![Block::Text {
+                text: "old question".into(),
+            }],
+        },
+        Message {
+            role: "assistant".into(),
+            content: vec![
+                Block::Thinking {
+                    text: "old thought".into(),
+                    signature: None,
+                },
+                Block::Text {
+                    text: "old answer".into(),
+                },
+            ],
+        },
+        Message {
+            role: "user".into(),
+            content: vec![Block::Text {
+                text: "new question".into(),
+            }],
+        },
+        Message {
+            role: "assistant".into(),
+            content: vec![
+                Block::Thinking {
+                    text: "new ".into(),
+                    signature: None,
+                },
+                Block::Thinking {
+                    text: "thought".into(),
+                    signature: None,
+                },
+                Block::ToolUse {
+                    id: "call_1".into(),
+                    name: "todo_read".into(),
+                    input: json!({}),
+                },
+            ],
+        },
+        Message {
+            role: "user".into(),
+            content: vec![tool_result_block("call_1", "(no todos)", None)],
+        },
+    ];
+    let with_reasoning = agent.history_chars();
+    let wire = serde_json::to_value(agent.history_to_oai_messages("sys")).unwrap();
+    let assistant: Vec<_> = wire
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] == "assistant")
+        .collect();
+    assert_eq!(assistant[0]["reasoning_content"], "old thought");
+    assert_eq!(assistant[1]["reasoning_content"], "new thought");
+    let (_, kept) = agent.split_compaction_inputs(&agent.history);
+    assert!(
+        kept.iter()
+            .flat_map(|message| &message.content)
+            .any(|block| matches!(block, Block::Thinking { text, .. } if text == "new "))
+    );
+    agent.tools.clear();
+    let without_reasoning = agent.history_chars();
+    assert_eq!(
+        with_reasoning - without_reasoning,
+        "old thoughtnew thought".len()
+    );
+    let wire = serde_json::to_value(agent.history_to_oai_messages("sys")).unwrap();
+    assert!(
+        wire.as_array()
+            .unwrap()
+            .iter()
+            .all(|message| message.get("reasoning_content").is_none())
+    );
+    agent.tools = provider_tool_definitions();
+    agent.push_reasoning_replay_boundary("openai", "gpt-5");
+    let wire = serde_json::to_value(agent.history_to_oai_messages("sys")).unwrap();
+    assert!(
+        wire.as_array()
+            .unwrap()
+            .iter()
+            .all(|message| message.get("reasoning_content").is_none())
+    );
+    let (_, kept) = agent.split_compaction_inputs(&agent.history);
+    let compacted = build_compacted_history("Resume packet", kept, &[]);
+    let original = std::mem::replace(&mut agent.history, compacted);
+    let wire = serde_json::to_value(agent.history_to_oai_messages("sys")).unwrap();
+    assert!(
+        wire.as_array()
+            .unwrap()
+            .iter()
+            .all(|message| message.get("reasoning_content").is_none())
+    );
+    agent.history = original;
+    agent.history.push(Message {
+        role: "assistant".into(),
+        content: vec![
+            Block::Thinking {
+                text: "same route".into(),
+                signature: None,
+            },
+            Block::Text {
+                text: "new answer".into(),
+            },
+        ],
+    });
+    let wire = serde_json::to_value(agent.history_to_oai_messages("sys")).unwrap();
+    assert_eq!(
+        wire.as_array().unwrap().last().unwrap()["reasoning_content"],
+        "same route"
+    );
+    assert!(has_provider_bound_reasoning(&agent.history));
+    let route = provider_route_hash(
+        &agent.provider_id,
+        agent.request_contract(),
+        &agent.base_url,
+        &agent.model,
+        agent.auth_kind,
+    );
+    assert!(!resume_requires_reasoning_replay_boundary(
+        Some(&route),
+        &route,
+        &agent.history
+    ));
+    assert!(resume_requires_reasoning_replay_boundary(
+        Some("different"),
+        &route,
+        &agent.history
+    ));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn deepseek_saved_model_names_normalize_and_fence_migrated_reasoning() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("deepseek-saved-model-migration");
+    let keys = [
+        "DEXT_PROVIDER",
+        "DEXT_PROFILE",
+        "DEXT_API_PROVIDER",
+        "DEXT_MODEL",
+        "DEXT_MODEL_DEEPSEEK",
+    ];
+    let previous = keys.map(std::env::var_os);
+    for key in keys {
+        unsafe { std::env::remove_var(key) };
+    }
+    let result = (|| -> Result<()> {
+        let profile = built_in_provider_profiles()
+            .into_iter()
+            .find(|profile| profile.id == "deepseek")
+            .context("DeepSeek")?;
+        for (saved_model, current_model) in [
+            ("deepseek-flash", "deepseek-flash"),
+            ("deepseek-chat", "deepseek-flash"),
+            ("deepseek-reasoner", "deepseek-v4-pro"),
+        ] {
+            let path = root.join(format!("{saved_model}.jsonl"));
+            let mut saved = test_agent(&root);
+            saved.provider_id = "deepseek".into();
+            saved.api_provider = ApiProvider::OpenAi;
+            saved.provider_profile = Some(profile.clone());
+            saved.base_url = profile.base_url.clone();
+            saved.model = saved_model.into();
+            saved.history = vec![Message {
+                role: "assistant".into(),
+                content: vec![
+                    Block::Thinking {
+                        text: "saved thought".into(),
+                        signature: None,
+                    },
+                    Block::Text {
+                        text: "saved answer".into(),
+                    },
+                ],
+            }];
+            assert_eq!(
+                saved.session_header().version,
+                PROVIDER_REASONING_ROUTE_FORMAT_VERSION
+            );
+            saved.save_session_to_path(&path)?;
+            let mut resumed = test_agent(&root);
+            resumed.provider_id = "deepseek".into();
+            resumed.api_provider = ApiProvider::OpenAi;
+            resumed.provider_profile = Some(profile.clone());
+            resumed.base_url = profile.base_url.clone();
+            resumed.model = profile.default_model.clone();
+            resumed.load_session_from_path(&path)?;
+            assert_eq!(resumed.model, current_model);
+            assert_eq!(resumed.context_window_tokens(), 1_000_000);
+            let wire = serde_json::to_value(resumed.history_to_oai_messages("sys"))?;
+            let thought = wire
+                .as_array()
+                .context("messages")?
+                .iter()
+                .find_map(|message| message.get("reasoning_content").and_then(Value::as_str));
+            assert_eq!(
+                thought,
+                (saved_model == current_model).then_some("saved thought")
+            );
+        }
+        Ok(())
+    })();
+    for (key, value) in keys.into_iter().zip(previous) {
+        restore_env_var(key, value);
+    }
+    let _ = std::fs::remove_dir_all(root);
+    result
 }
 
 #[test]
@@ -20124,6 +21925,416 @@ fn hooks_loads_project_hooks_json_by_default() {
     assert!(out[0].0.contains("pack"), "{}", out[0].0);
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn hooks_extended_phases_and_turn_end_use_stdout_only() -> Result<()> {
+    let root = temp_test_dir("hooks-phases");
+    let mut hooks: Hooks = serde_json::from_value(json!({
+        "pre_request": [{"command": "printf request"}],
+        "post_compact": [{"command": "printf compact"}],
+        "turn_end": [
+            {"command": "printf continue; printf diagnostic >&2; exit 2"},
+            {"command": "printf should-not-run"}
+        ]
+    }))?;
+    assert!(!hooks.is_empty());
+    hooks.extend(Hooks::default());
+    for (phase, expected) in [("pre_request", "request"), ("post_compact", "compact")] {
+        let out = hooks.fire(phase, "", &[], &[], &root, SandboxProfile::WorkspaceWrite);
+        assert_eq!(out[0].2, expected);
+    }
+    let out = hooks.fire(
+        "turn_end",
+        "",
+        &[],
+        &[],
+        &root,
+        SandboxProfile::WorkspaceWrite,
+    );
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].1, 2);
+    assert_eq!(out[0].2, "continue");
+    assert!(out[0].0.contains("diagnostic"));
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[test]
+fn hook_identity_env_cannot_be_replaced_by_pack_env() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("hook-identity");
+    let hooks = Hooks { pre_tool: vec![Hook { tool_match: None, command:
+        "printf '%s\\n%s\\n%s' \"$DEXT_SESSION_ID\" \"$DEXT_TOOL_CALL_ID\" \"${DEXT_HOOK_MEMO_DIR:-none}\"".into() }], ..Default::default() };
+    let extra = vec![
+        ("DEXT_SESSION_ID".into(), "spoof-session".into()),
+        ("DEXT_TOOL_CALL_ID".into(), "spoof-call".into()),
+        ("DEXT_HOOK_MEMO_DIR".into(), "spoof-dir".into()),
+        ("DEXT_HOOK_MEMO_BIN".into(), "spoof-bin".into()),
+    ];
+    let out = hooks.fire(
+        "pre_tool",
+        "read_file",
+        &[
+            ("DEXT_SESSION_ID", "real-session"),
+            ("DEXT_TOOL_CALL_ID", "real-call"),
+        ],
+        &extra,
+        &root,
+        SandboxProfile::WorkspaceWrite,
+    );
+    assert_eq!(out[0].1, 0);
+    assert!(out[0].2.starts_with("real-session\nreal-call\n"));
+    assert!(!out[0].2.contains("spoof"));
+    let out = hooks.fire(
+        "pre_tool",
+        "read_file",
+        &[("DEXT_SESSION_ID", ""), ("DEXT_TOOL_CALL_ID", "real-call")],
+        &extra,
+        &root,
+        SandboxProfile::WorkspaceWrite,
+    );
+    assert_eq!(out[0].2, "\nreal-call\nnone");
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[test]
+fn hook_memo_concurrent_writers_observe_one_complete_value() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("hook-memo-concurrent");
+    let _cleanup = RemoveDirOnDrop(root.clone());
+    let _state_env = PackEnvGuard::new(&root.join("state"));
+    let old_sessions = std::env::var_os("DEXT_SESSIONS_DIR");
+    unsafe { std::env::remove_var("DEXT_SESSIONS_DIR") };
+    let result = (|| -> Result<()> {
+        let barrier = std::sync::Barrier::new(16);
+        let values = std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..16)
+                .map(|index| {
+                    let root = &root;
+                    let barrier = &barrier;
+                    scope.spawn(move || -> Result<_> {
+                        barrier.wait();
+                        let dir = seats::hook_memo_dir(root, "session-concurrent", "call")?;
+                        let value = seats::hook_memo_value(
+                            &dir,
+                            "winner",
+                            Some(format!("value-{index}").as_bytes()),
+                        )?
+                        .context("memo winner missing")?;
+                        Ok((dir, value))
+                    })
+                })
+                .collect();
+            threads
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .collect::<Result<Vec<_>>>()
+        })?;
+        assert!(values.iter().all(|value| value == &values[0]));
+        assert_eq!(
+            seats::hook_memo_value(&values[0].0, "winner", None)?,
+            Some(values[0].1.clone())
+        );
+        Ok(())
+    })();
+    restore_env_var("DEXT_SESSIONS_DIR", old_sessions);
+    result
+}
+
+#[test]
+fn hook_memo_first_writer_wins_and_call_scope_is_private() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("hook-memo");
+    let dir = seats::hook_memo_dir(&root, "session-memo", "call/../unsafe-id")?;
+    assert!(dir.starts_with(session::session_state_dir(&root, "session-memo").join("hook-memo")));
+    assert_eq!(seats::hook_memo_value(&dir, "decision", None)?, None);
+    assert_eq!(
+        seats::hook_memo_value(&dir, "decision", Some(b"approved"))?,
+        Some(b"approved".to_vec())
+    );
+    assert_eq!(
+        seats::hook_memo_value(&dir, "decision", Some(b"denied"))?,
+        Some(b"approved".to_vec())
+    );
+    assert_eq!(
+        seats::hook_memo_dir(&root, "session-memo", "call/../unsafe-id")?,
+        dir
+    );
+    let other = seats::hook_memo_dir(&root, "session-memo", "other-call")?;
+    assert_eq!(seats::hook_memo_value(&other, "decision", None)?, None);
+    assert!(seats::hook_memo_value(&dir, "decision", Some(&[b'x'; 4097])).is_err());
+    assert!(seats::hook_memo_dir(&root, "../escape", "call").is_err());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        assert_eq!(std::fs::metadata(&dir)?.permissions().mode() & 0o777, 0o700);
+        let target = dir.join(sha256_hex_str("symlink"));
+        symlink(dir.join(sha256_hex_str("decision")), &target)?;
+        assert!(seats::hook_memo_value(&dir, "symlink", Some(b"new")).is_err());
+        std::fs::remove_file(target)?;
+        let decision = dir.join(sha256_hex_str("decision"));
+        let alias = dir.join(sha256_hex_str("hardlink"));
+        std::fs::hard_link(&decision, &alias)?;
+        assert!(seats::hook_memo_value(&dir, "hardlink", Some(b"new")).is_err());
+        assert_eq!(std::fs::read(&decision)?, b"approved");
+        std::fs::remove_file(alias)?;
+    }
+    assert_eq!(std::fs::read_dir(&dir)?.count(), 2);
+    assert_eq!(
+        seats::hook_memo_value(&dir, "decision", None)?,
+        Some(b"approved".to_vec())
+    );
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn hook_memo_sandbox_allows_only_the_call_directory() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("hook-memo-sandbox");
+    let session = "memo-sandbox";
+    let dir = seats::hook_memo_dir(&root, session, "call")?;
+    let outside = dir.parent().expect("memo parent").join("outside");
+    let hooks = Hooks {
+        pre_tool: vec![Hook {
+            tool_match: None,
+            command: format!(
+                "printf yes > \"$DEXT_HOOK_MEMO_DIR/decision\"; printf bad > {}",
+                shell_single_quote(&outside.to_string_lossy())
+            ),
+        }],
+        ..Default::default()
+    };
+    let out = hooks.fire(
+        "pre_tool",
+        "read_file",
+        &[("DEXT_SESSION_ID", session), ("DEXT_TOOL_CALL_ID", "call")],
+        &[],
+        &root,
+        SandboxProfile::ReadOnly,
+    );
+    if sandbox::is_enforced() {
+        assert_eq!(std::fs::read_to_string(dir.join("decision"))?, "yes");
+        assert!(!outside.exists());
+        assert_ne!(out[0].1, 0);
+    }
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn hooks_continue_with_stdout_before_turn_end_and_gate_requests() -> Result<()> {
+    let root = temp_test_dir("hooks-request-continue");
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let address = listener.local_addr()?;
+    let server = std::thread::spawn(move || {
+        let mut requests = Vec::new();
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().expect("accept hook request");
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut bytes = [0; 4096];
+            loop {
+                let count = stream.read(&mut bytes).unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&bytes[..count]);
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..end]);
+                    let length: usize = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse().unwrap())
+                        })
+                        .unwrap();
+                    if request.len() >= end + 4 + length {
+                        requests.push(
+                            serde_json::from_slice::<Value>(&request[end + 4..end + 4 + length])
+                                .unwrap(),
+                        );
+                        break;
+                    }
+                }
+            }
+            let body = "data: {\"choices\":[{\"delta\":{\"content\":\"This is a complete answer to the simple greeting, with enough detail to satisfy the existing objective tracker.\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        }
+        requests
+    });
+    let mut agent = test_agent(&root);
+    configure_local_openai_agent(&mut agent, format!("http://{address}"));
+    agent.max_iterations = Some(4);
+    agent.hooks.pre_request.push(Hook {
+        tool_match: None,
+        command: "printf request-context".into(),
+    });
+    agent.hooks.turn_end.push(Hook { tool_match: None, command: "if [ ! -f continued ]; then printf x > continued; printf 'hook followup'; printf 'not a prompt' >&2; exit 2; fi".into() });
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    agent.set_sink(Box::new(ChannelSink { tx }));
+    agent.chat("Hello".into()).await?;
+    let requests = server.join().expect("hook server");
+    assert!(requests[0].to_string().contains("request-context"));
+    assert!(requests[1].to_string().contains("hook followup"));
+    assert!(!requests[1].to_string().contains("not a prompt"));
+    let mut ends = 0;
+    while let Ok(event) = rx.try_recv() {
+        if matches!(event, AgentEvent::TurnEnd { .. }) {
+            ends += 1;
+        }
+    }
+    assert_eq!(ends, 1);
+    agent.hooks.pre_request[0].command = "printf refused; exit 1".into();
+    let error = agent
+        .chat("Hello again".into())
+        .await
+        .expect_err("hook blocks before network");
+    assert!(error.to_string().contains("pre_request hook blocked"));
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn blocking_compaction_redacts_summary_before_history_events_and_save() -> Result<()> {
+    let root = temp_test_dir("compact-summary-redaction");
+    let _cleanup = RemoveDirOnDrop(root.clone());
+    for status in [200, 400] {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let server = std::thread::spawn(move || -> Result<()> {
+            let (mut stream, _) = listener.accept()?;
+            stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+            let mut request = Vec::new();
+            let mut buffer = [0; 4096];
+            loop {
+                let count = stream.read(&mut buffer)?;
+                anyhow::ensure!(count > 0, "summary request ended before body");
+                request.extend_from_slice(&buffer[..count]);
+                if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..end]);
+                    let length: usize = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|value| value.trim().parse().ok())
+                        })
+                        .context("summary request content length")?;
+                    if request.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            let summary = format!("Task summary\n{}={}", "api_key", "fixturevalue123456789");
+            let body = if status == 200 {
+                json!({"choices":[{"message":{"content":summary},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":7}}).to_string()
+            } else {
+                summary
+            };
+            write!(
+                stream,
+                "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )?;
+            Ok(())
+        });
+        let mut agent = test_agent(&root);
+        configure_local_openai_agent(&mut agent, format!("http://{address}"));
+        background_test_history(&mut agent);
+        agent.background.enabled = false;
+        agent.latest_session_path = root.join("saved.jsonl");
+        agent.latest_log_path = root.join("latest.log");
+        let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+        agent.set_sink(Box::new(ChannelSink { tx }));
+        agent.compact().await?;
+        server.join().expect("summary fixture thread")?;
+        let history = serde_json::to_string(&agent.history)?;
+        let saved = std::fs::read_to_string(&agent.latest_session_path)?;
+        assert!(!history.contains("fixturevalue123456789"));
+        assert!(!saved.contains("fixturevalue123456789"));
+        let events = drain_events(&mut events);
+        for event in &events {
+            let text = match event {
+                AgentEvent::CompactEnd { summary, .. } => summary.as_str(),
+                AgentEvent::Warn(text) | AgentEvent::CompactFailed { message: text } => {
+                    text.as_str()
+                }
+                _ => continue,
+            };
+            assert!(!text.contains("fixturevalue123456789"));
+        }
+        if status == 200 {
+            assert!(history.contains("[REDACTED_SECRET]"));
+            assert!(events.iter().any(|event| matches!(event,
+            AgentEvent::CompactEnd { summary, .. } if summary.contains("[REDACTED_SECRET]"))));
+        } else {
+            assert!(events.iter().any(|event| matches!(event,
+            AgentEvent::Warn(text) if text.contains("[REDACTED_SECRET]"))));
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn blocking_compaction_persist_failure_keeps_history_and_does_not_observe() -> Result<()> {
+    let root = temp_test_dir("blocking-compact-persist-failure");
+    let _cleanup = RemoveDirOnDrop(root.clone());
+    let mut agent = test_agent(&root);
+    background_test_history(&mut agent);
+    agent.background.enabled = false;
+    agent.set_approval_profile(ApprovalProfile::Always);
+    agent.hooks.post_compact.push(Hook {
+        tool_match: None,
+        command: "printf x >> applied".into(),
+    });
+    agent.latest_session_path = root.join("not-a-file");
+    std::fs::create_dir(&agent.latest_session_path)?;
+    let before = serde_json::to_value(&agent.history)?;
+    let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+    agent.set_sink(Box::new(ChannelSink { tx }));
+    assert!(agent.compact().await.is_err());
+    assert_eq!(serde_json::to_value(&agent.history)?, before);
+    assert!(!root.join("applied").exists());
+    let events = drain_events(&mut events);
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::CompactFailed { .. }))
+    );
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        AgentEvent::CompactEnd { .. } | AgentEvent::HistoryContextUpdated { .. }
+    )));
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn post_compact_hook_runs_once_after_applied_history() -> Result<()> {
+    let root = temp_test_dir("post-compact-hook");
+    let mut agent = test_agent(&root);
+    agent.set_approval_profile(ApprovalProfile::Always);
+    agent.hooks.post_compact.push(Hook {
+        tool_match: None,
+        command: "printf x >> applied".into(),
+    });
+    agent.work_ledger.objective = "deterministic fallback".into();
+    agent.history = (0..12)
+        .map(|i| Message {
+            role: if i % 2 == 0 { "user" } else { "assistant" }.into(),
+            content: vec![Block::Text {
+                text: format!("message {i}"),
+            }],
+        })
+        .collect();
+    agent.compact().await?;
+    assert_eq!(std::fs::read_to_string(root.join("applied"))?, "x");
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
 }
 
 #[test]
@@ -23030,6 +25241,70 @@ fn eval_and_default_sandbox_cli_forms_are_parsed_as_policy() -> Result<()> {
 }
 
 #[test]
+fn resume_labels_replay_safe_reads_without_executing_or_repairing_pairs_twice() -> Result<()> {
+    let safe_names = tools::registered_tool_names()
+        .filter(|name| tools::is_replay_safe_tool(name))
+        .collect::<Vec<_>>();
+    let mut history = vec![Message {
+        role: "assistant".into(),
+        content: safe_names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| Block::ToolUse {
+                id: format!("read-{index}"),
+                name: (*name).into(),
+                input: json!({"path": "missing-read-must-not-execute"}),
+            })
+            .chain(
+                ["read_image", "bash", "unknown_tool", "pack.read"].map(|name| Block::ToolUse {
+                    id: name.into(),
+                    name: name.into(),
+                    input: json!({}),
+                }),
+            )
+            .collect(),
+    }];
+    let recovery = reconcile_pending_tool_calls(&mut history, None)?;
+    assert_eq!(recovery.replay_safe, safe_names.len());
+    assert_eq!(recovery.not_started, 4);
+    assert_eq!(recovery.uncertain, 0);
+    assert_eq!(recovery.recovered_terminal, 0);
+    assert_eq!(recovery.total(), safe_names.len() + 4);
+    assert!(recovery.warning().contains("no call was replayed"));
+    let results = &history.last().expect("recovery results").content;
+    for (index, name) in safe_names.iter().enumerate() {
+        let Block::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+            metadata,
+        } = &results[index]
+        else {
+            panic!("missing result for {name}");
+        };
+        assert_eq!(tool_use_id, &format!("read-{index}"));
+        assert_eq!(metadata.status.as_deref(), Some("replay_safe"));
+        assert_eq!(*is_error, Some(true));
+        assert_eq!(
+            content,
+            &format!(
+                "[resume recovery] {name} was interrupted; it is safe to call again. Dext did not replay it."
+            )
+        );
+    }
+    for result in &results[safe_names.len()..] {
+        let Block::ToolResult { metadata, .. } = result else {
+            panic!("missing conservative result");
+        };
+        assert_eq!(metadata.status.as_deref(), Some("not_started"));
+    }
+    let before = serde_json::to_value(&history)?;
+    assert_eq!(reconcile_pending_tool_calls(&mut history, None)?.total(), 0);
+    assert_eq!(serde_json::to_value(&history)?, before);
+    Ok(())
+}
+
+#[test]
 fn resume_reconciles_each_pending_tool_journal_fence_without_replay() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("tool-journal-resume-fences");
@@ -25221,7 +27496,7 @@ fn legacy_bundled_providers_are_pruned_from_catalog() -> Result<()> {
         let deepseek = find_provider_profile(&catalog, "deepseek").context("deepseek")?;
         assert_eq!(deepseek.api_provider, ApiProvider::OpenAi);
         assert_eq!(deepseek.env_vars, vec!["DEEPSEEK_API_KEY"]);
-        assert_eq!(deepseek.default_model, "deepseek-chat");
+        assert_eq!(deepseek.default_model, "deepseek-flash");
 
         let local = find_provider_profile(&catalog, "local").context("local")?;
         assert_eq!(local.api_provider, ApiProvider::OpenAi);
@@ -25744,13 +28019,13 @@ fn provider_and_auth_future_versions_fail_without_rewriting_source() -> Result<(
     let result = (|| -> Result<()> {
         let provider_path = provider_catalog_path();
         std::fs::create_dir_all(provider_path.parent().unwrap_or(Path::new(".")))?;
-        let provider_bytes = br#"{"version":4,"active_provider":"glm","providers":[]}"#;
+        let provider_bytes = br#"{"version":5,"active_provider":"glm","providers":[]}"#;
         std::fs::write(&provider_path, provider_bytes)?;
         let error = load_provider_catalog()
             .expect_err("future provider catalog must fail")
             .to_string();
         assert!(
-            error.contains("unsupported provider catalog version 4"),
+            error.contains("unsupported provider catalog version 5"),
             "{error}"
         );
         assert_eq!(std::fs::read(&provider_path)?, provider_bytes);
@@ -28343,7 +30618,7 @@ fn openai_and_chatgpt_requests_keep_system_stable_and_append_tail_env() -> Resul
     let root = std::fs::canonicalize(&root)?;
     let mut agent = test_agent(&root);
     agent.api_provider = ApiProvider::OpenAi;
-    agent.model = "deepseek-chat".to_string();
+    agent.model = "deepseek-flash".to_string();
     agent.history = vec![Message {
         role: "user".to_string(),
         content: vec![Block::Text {
@@ -28577,7 +30852,7 @@ fn kimi_builtin_metadata_is_isolated_from_existing_provider_profiles() {
             ApiProvider::OpenAi,
             RequestContract::OpenAiChatCompletions,
             "https://api.deepseek.com",
-            "deepseek-chat",
+            "deepseek-flash",
         ),
         (
             "local",
@@ -29907,6 +32182,174 @@ async fn openai_chat_length_truncated_tool_call_automatically_continues() {
 }
 
 #[tokio::test]
+async fn deepseek_thinking_tool_rounds_and_prior_turn_replay_reach_wire() -> Result<()> {
+    let root = temp_test_dir("deepseek-thinking-tool-wire");
+    let root = std::fs::canonicalize(root)?;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    listener.set_nonblocking(true)?;
+    let addr = listener.local_addr()?;
+    let server = std::thread::spawn(move || -> Result<Vec<Value>> {
+        let mut bodies = Vec::new();
+        for round in 0usize..4 {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        anyhow::ensure!(
+                            std::time::Instant::now() < deadline,
+                            "mock accept timeout"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            };
+            stream.set_nonblocking(false)?;
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+            stream.set_write_timeout(Some(std::time::Duration::from_secs(5)))?;
+            let mut request = Vec::new();
+            let mut buf = [0u8; 4096];
+            let header_end = loop {
+                let read = stream.read(&mut buf)?;
+                anyhow::ensure!(
+                    read > 0 && request.len() < 4 * 1024 * 1024,
+                    "invalid mock request"
+                );
+                request.extend_from_slice(&buf[..read]);
+                if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break end + 4;
+                }
+            };
+            let length = String::from_utf8_lossy(&request[..header_end])
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                })
+                .context("content length")?;
+            anyhow::ensure!(length <= 4 * 1024 * 1024, "request body cap");
+            while request.len() < header_end + length {
+                let read = stream.read(&mut buf)?;
+                anyhow::ensure!(read > 0, "incomplete request body");
+                request.extend_from_slice(&buf[..read]);
+            }
+            let body: Value = serde_json::from_slice(&request[header_end..header_end + length])?;
+            assert_eq!(body["thinking"]["type"], "enabled");
+            assert_eq!(body["reasoning_effort"], "max");
+            assert!(body.get("chat_template_kwargs").is_none());
+            assert_eq!(body["stream_options"]["include_usage"], true);
+            let tool_results = body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|message| message["role"] == "tool")
+                .collect::<Vec<_>>();
+            assert_eq!(tool_results.len(), round.div_ceil(2));
+            for result in tool_results {
+                assert!(
+                    result["content"].as_str().unwrap().starts_with("(no todos"),
+                    "{result}"
+                );
+            }
+            let assistants = body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|message| message["role"] == "assistant")
+                .collect::<Vec<_>>();
+            assert_eq!(assistants.len(), round);
+            for (index, message) in assistants.iter().enumerate() {
+                assert_eq!(message["reasoning_content"], format!("reasoning {index}"));
+            }
+            bodies.push(body);
+            let delta = if round % 2 == 0 {
+                json!({"tool_calls":[{"index":0,"id":format!("call_{round}"),"type":"function","function":{"name":"todo_read","arguments":"{}"}}]})
+            } else {
+                json!({"content":format!("Done: answer {round}")})
+            };
+            let reasoning = json!({"choices":[{"delta":{"reasoning_content":format!("reasoning {round}")},"finish_reason":null}],"usage":null});
+            let content = json!({"choices":[{"delta":delta,"finish_reason":null}],"usage":null});
+            let terminal = json!({"choices":[{"delta":{},"finish_reason":if round % 2 == 0 { "tool_calls" } else { "stop" }}],"usage":{"prompt_tokens":17,"completion_tokens":9,"prompt_cache_hit_tokens":6}});
+            let response = format!(
+                "data: {reasoning}\n\ndata: {content}\n\ndata: {terminal}\n\ndata: [DONE]\n\n"
+            );
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                response.len()
+            )?;
+            for part in response.as_bytes().chunks(7) {
+                stream.write_all(part)?;
+            }
+        }
+        Ok(bodies)
+    });
+    let mut agent = test_agent(&root);
+    agent.provider_id = "deepseek".to_string();
+    agent.api_provider = ApiProvider::OpenAi;
+    agent.base_url = format!("http://{addr}");
+    agent.model = "deepseek-flash".to_string();
+    agent.provider_profile = built_in_provider_profiles()
+        .into_iter()
+        .find(|profile| profile.id == "deepseek");
+    agent.thinking_effort = ThinkingEffort::Max;
+    agent.max_iterations = Some(3);
+    agent.session_enabled = false;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    agent.set_sink(Box::new(ChannelSink { tx }));
+    let result = async {
+        agent.chat("Hello.".to_string()).await?;
+        agent.chat("Hello again.".to_string()).await
+    }
+    .await;
+    let requests = server.join().expect("mock server");
+    assert!(
+        requests.is_ok(),
+        "mock server failed: {requests:?}; client: {result:?}"
+    );
+    let events = drain_events(&mut rx);
+    assert!(
+        result.is_ok(),
+        "client failed: {result:?}; requests: {}; runtime notes: {:?}",
+        requests.as_ref().unwrap().len(),
+        events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Warn(text) | AgentEvent::Info(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    );
+    result?;
+    assert_eq!(requests?.len(), 4);
+    assert_eq!(agent.session_usage.input, 44);
+    assert_eq!(agent.session_usage.cache_read, 24);
+    assert_eq!(agent.session_usage.output, 36);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::ThinkingBlockComplete(_)))
+            .count(),
+        4
+    );
+    assert_eq!(
+        events.iter().filter(|event| matches!(event, AgentEvent::ToolCallResult { name, ok: true, .. } if name == "todo_read")).count(),
+        2
+    );
+    assert!(
+        agent
+            .history
+            .iter()
+            .flat_map(|message| &message.content)
+            .any(|block| { matches!(block, Block::Text { text } if text == "Done: answer 3") })
+    );
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[tokio::test]
 async fn local_llama_reasoning_content_reaches_sink_and_history_blocks() {
     let root = temp_test_dir("local-reasoning-content-stream");
     let root = std::fs::canonicalize(&root).expect("canonical temp dir");
@@ -30662,6 +33105,7 @@ fn tool_disabled_models_expose_no_static_or_dynamic_tools() {
         stream: false,
         stream_options: None,
         reasoning_effort: None,
+        thinking: None,
         grammar: None,
         chat_template_kwargs: None,
     };

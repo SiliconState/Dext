@@ -9,6 +9,15 @@ pub(crate) use crate::sse::{SseDecoder, SseFrame};
 const TOOL_ARGUMENT_BUFFER_CAP: usize = 256_000;
 const REASONING_BUFFER_CAP: usize = 4 * 1024 * 1024;
 
+pub(crate) fn sse_event_cap(contract: RequestContract) -> usize {
+    // Responses terminals include full output snapshots and opaque reasoning items.
+    if contract.is_responses() {
+        crate::PROVIDER_JSON_BODY_CAP
+    } else {
+        256_000
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum StreamUpdate {
     TextDelta(String),
@@ -83,6 +92,7 @@ struct ChatGptState {
     reasoning_in_progress: bool,
     reasoning_items: BTreeMap<String, Value>,
     reasoning_item_order: Vec<String>,
+    reasoning_item_bytes: usize,
     tool_calls: BTreeMap<String, ToolCallParts>,
     tool_call_order: Vec<String>,
     stop_reason: Option<String>,
@@ -130,6 +140,14 @@ impl ProviderStreamParser {
             ProviderState::Anthropic(state) => parse_anthropic_frame(contract, state, frame),
             ProviderState::OpenAi(state) => parse_openai_frame(contract, state, frame),
             ProviderState::ChatGpt(state) => parse_chatgpt_frame(contract, state, frame),
+        }
+    }
+
+    pub(crate) fn known_usage(&self) -> Usage {
+        match &self.state {
+            ProviderState::Anthropic(state) => state.usage,
+            ProviderState::OpenAi(state) => state.usage,
+            ProviderState::ChatGpt(state) => state.usage,
         }
     }
 
@@ -310,6 +328,13 @@ fn parse_tool_arguments(
     call_label: &str,
     raw: &str,
 ) -> Result<Value> {
+    if raw.len() > TOOL_ARGUMENT_BUFFER_CAP {
+        return Err(protocol_error(
+            contract,
+            event,
+            "tool arguments exceeded buffer cap",
+        ));
+    }
     if raw.trim().is_empty() {
         return Err(protocol_error(
             contract,
@@ -920,10 +945,15 @@ fn parse_openai_frame(
     }
     if let Some(usage) = data_object.get("usage") {
         recognized = true;
-        object(contract, "chunk", usage, "usage")?;
-        let parsed = Usage::parse_openai(usage);
-        if !(state.preserve_timing_cache && state.usage.cache_read > 0 && parsed.cache_read == 0) {
-            state.usage = parsed;
+        if !usage.is_null() {
+            object(contract, "chunk", usage, "usage")?;
+            let parsed = Usage::parse_openai(usage);
+            if !(state.preserve_timing_cache
+                && state.usage.cache_read > 0
+                && parsed.cache_read == 0)
+            {
+                state.usage = parsed;
+            }
         }
     }
     if !recognized {
@@ -1158,6 +1188,13 @@ fn parse_chatgpt_frame(
                     .unwrap_or_default(),
                     done: false,
                 };
+                if call.arguments.len() > TOOL_ARGUMENT_BUFFER_CAP {
+                    return Err(protocol_error(
+                        contract,
+                        event,
+                        "tool arguments exceeded buffer cap",
+                    ));
+                }
                 state.tool_call_order.push(item_id.clone());
                 state.tool_calls.insert(item_id, call);
             }
@@ -1482,6 +1519,7 @@ fn parse_chatgpt_frame(
                 if discard_all_response_content {
                     state.reasoning_items.clear();
                     state.reasoning_item_order.clear();
+                    state.reasoning_item_bytes = 0;
                 }
                 if state.text_in_progress
                     || (discard_all_response_content && !state.text.is_empty())
@@ -1529,10 +1567,38 @@ fn capture_openai_reasoning_item(
     state: &mut ChatGptState,
     item: &serde_json::Map<String, Value>,
 ) -> Result<()> {
-    let item = Value::Object(item.clone());
-    if !crate::valid_openai_reasoning_item(&item) {
+    if item.get("type").and_then(Value::as_str) != Some("reasoning")
+        || item
+            .get("id")
+            .and_then(Value::as_str)
+            .is_none_or(|id| id.trim().is_empty())
+        || item
+            .get("encrypted_content")
+            .and_then(Value::as_str)
+            .is_none_or(|value| value.is_empty())
+    {
         return Ok(());
     }
+    let id = item["id"].as_str().expect("validated id");
+    let previous_bytes = state
+        .reasoning_items
+        .get(id)
+        .map(serde_json::to_vec)
+        .transpose()?
+        .map_or(0, |bytes| bytes.len());
+    let item_bytes = serde_json::to_vec(item)?.len();
+    let total = state
+        .reasoning_item_bytes
+        .saturating_sub(previous_bytes)
+        .saturating_add(item_bytes);
+    if total > REASONING_BUFFER_CAP {
+        return Err(protocol_error(
+            contract,
+            event,
+            "opaque reasoning items exceeded buffer cap",
+        ));
+    }
+    let item = Value::Object(item.clone());
     let id = item
         .get("id")
         .and_then(Value::as_str)
@@ -1550,6 +1616,7 @@ fn capture_openai_reasoning_item(
     if !state.reasoning_items.contains_key(&id) {
         state.reasoning_item_order.push(id.clone());
     }
+    state.reasoning_item_bytes = total;
     state.reasoning_items.insert(id, item);
     Ok(())
 }
@@ -2193,6 +2260,148 @@ mod tests {
     }
 
     #[test]
+    fn openai_null_usage_chunks_preserve_text_and_final_usage() {
+        let contract = RequestContract::OpenAiChatCompletions;
+        for usage_only_terminal in [false, true] {
+            let mut chunks = vec![
+                serde_json::json!({"choices":[{"delta":{"role":"assistant","content":""},"finish_reason":null}],"usage":null}),
+                serde_json::json!({"choices":[{"delta":{"content":"Hello é"},"finish_reason":null}],"usage":null}),
+            ];
+            let usage = serde_json::json!({
+                "prompt_tokens":17,"completion_tokens":9,"total_tokens":26,
+                "prompt_cache_hit_tokens":6,"prompt_cache_miss_tokens":11
+            });
+            chunks.push(serde_json::json!({
+                "choices":[{"delta":{},"finish_reason":"stop"}],
+                "usage":if usage_only_terminal { Value::Null } else { usage.clone() }
+            }));
+            if usage_only_terminal {
+                chunks.push(serde_json::json!({"choices":[],"usage":usage}));
+            }
+            let mut wire = chunks
+                .iter()
+                .map(|chunk| format!("data: {chunk}\r\n\r\n"))
+                .collect::<String>();
+            wire.push_str("data: [DONE]\r\n\r\n");
+            for chunk_size in [1, 7, wire.len()] {
+                let mut decoder = SseDecoder::new(sse_event_cap(contract));
+                let mut parser = ProviderStreamParser::new(contract, false);
+                let mut updates = Vec::new();
+                for bytes in wire.as_bytes().chunks(chunk_size) {
+                    for frame in decoder.push(bytes).unwrap() {
+                        updates.extend(parser.push_frame(frame).unwrap());
+                    }
+                }
+                for frame in decoder.finish().unwrap() {
+                    updates.extend(parser.push_frame(frame).unwrap());
+                }
+                assert_eq!(
+                    updates,
+                    [
+                        StreamUpdate::TextDelta(String::new()),
+                        StreamUpdate::TextDelta("Hello é".to_string()),
+                    ]
+                );
+                let parsed = parser.finish().unwrap();
+                assert!(matches!(
+                    parsed.blocks.as_slice(),
+                    [Block::Text { text }] if text == "Hello é"
+                ));
+                assert_eq!(parsed.stop_reason.as_deref(), Some("stop"));
+                assert_eq!(parsed.usage.input, 11);
+                assert_eq!(parsed.usage.cache_read, 6);
+                assert_eq!(parsed.usage.output, 9);
+                assert_eq!(parsed.unknown_events, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn openai_null_usage_preserves_tool_call_assembly() {
+        let mut parser = ProviderStreamParser::new(RequestContract::OpenAiChatCompletions, false);
+        for data in [
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"read_file","arguments":"{\"path\":"}}]},"finish_reason":null}],"usage":null}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"README.md\"}"}}]},"finish_reason":null}],"usage":null}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":12,"completion_tokens":4}}"#,
+            "[DONE]",
+        ] {
+            parser
+                .push_frame(SseFrame {
+                    event: None,
+                    data: Some(data.to_string()),
+                })
+                .unwrap();
+        }
+        let parsed = parser.finish().unwrap();
+        assert!(matches!(
+            parsed.blocks.as_slice(),
+            [Block::ToolUse { id, name, input }]
+                if id == "call_1" && name == "read_file" && input["path"] == "README.md"
+        ));
+        assert_eq!(parsed.stop_reason.as_deref(), Some("tool_calls"));
+        assert_eq!(parsed.usage.input, 12);
+        assert_eq!(parsed.usage.output, 4);
+        assert_eq!(parsed.unfinished_tool_calls, 0);
+    }
+
+    #[test]
+    fn openai_null_usage_does_not_clear_known_usage() {
+        for preserve_timing_cache in [false, true] {
+            for source in [
+                serde_json::json!({"usage":{"prompt_tokens":17,"completion_tokens":9,"prompt_cache_hit_tokens":6}}),
+                serde_json::json!({"timings":{"prompt_n":11,"predicted_n":9,"cache_n":6}}),
+            ] {
+                let mut parser = ProviderStreamParser::new(
+                    RequestContract::OpenAiChatCompletions,
+                    preserve_timing_cache,
+                );
+                let null_frame = || SseFrame {
+                    event: None,
+                    data: Some(r#"{"usage":null}"#.to_string()),
+                };
+                assert!(parser.push_frame(null_frame()).unwrap().is_empty());
+                assert_eq!(parser.known_usage().total_tokens(), 0);
+                parser
+                    .push_frame(SseFrame {
+                        event: None,
+                        data: Some(source.to_string()),
+                    })
+                    .unwrap();
+                assert!(parser.push_frame(null_frame()).unwrap().is_empty());
+                let known = parser.known_usage();
+                assert_eq!(known.input, 11);
+                assert_eq!(known.cache_read, 6);
+                assert_eq!(known.output, 9);
+                let parsed = parser.finish().unwrap();
+                assert_eq!(parsed.usage.total_tokens(), 26);
+                assert_eq!(parsed.unknown_events, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn openai_rejects_non_object_non_null_usage() {
+        for usage in [
+            serde_json::json!([]),
+            serde_json::json!("invalid-usage"),
+            serde_json::json!(42),
+            serde_json::json!(true),
+        ] {
+            let mut parser =
+                ProviderStreamParser::new(RequestContract::OpenAiChatCompletions, false);
+            let error = parser
+                .push_frame(SseFrame {
+                    event: None,
+                    data: Some(serde_json::json!({"choices":[],"usage":usage}).to_string()),
+                })
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("usage must be an object"), "{error}");
+            assert!(!error.contains("invalid-usage"), "{error}");
+        }
+    }
+
+    #[test]
     fn openai_rejects_malformed_json_incomplete_identity_and_bad_arguments() {
         let contract = RequestContract::OpenAiChatCompletions;
         let mut parser = ProviderStreamParser::new(contract, false);
@@ -2368,7 +2577,7 @@ mod tests {
     }
 
     #[test]
-    fn openai_reasoning_content_is_local_opt_in_and_strict_when_enabled() {
+    fn openai_reasoning_content_is_opt_in_and_strict_when_enabled() {
         let contract = RequestContract::OpenAiChatCompletions;
         let frame = || {
             SseFrame {
@@ -2411,6 +2620,171 @@ mod tests {
             error.contains("delta.reasoning_content exceeded 4194304 bytes"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn responses_opaque_reasoning_has_an_aggregate_cap_without_double_counting() {
+        let mut parser = ProviderStreamParser::new(RequestContract::OpenAiResponses, false);
+        let item = serde_json::json!({"type":"response.output_item.done", "item": {
+            "type":"reasoning", "id":"rs_first", "encrypted_content":"x".repeat(2_200_000), "summary":[]
+        }});
+        for _ in 0..2 {
+            parser
+                .push_frame(SseFrame {
+                    event: None,
+                    data: Some(item.to_string()),
+                })
+                .unwrap();
+        }
+        let second = serde_json::json!({"type":"response.output_item.done", "item": {
+            "type":"reasoning", "id":"rs_second", "encrypted_content":"y".repeat(2_200_000), "summary":[]
+        }});
+        let error = parser
+            .push_frame(SseFrame {
+                event: None,
+                data: Some(second.to_string()),
+            })
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("opaque reasoning items exceeded buffer cap")
+        );
+        let ProviderState::ChatGpt(state) = &parser.state else {
+            unreachable!()
+        };
+        assert_eq!(state.reasoning_items.len(), 1);
+        assert!(state.reasoning_item_bytes < REASONING_BUFFER_CAP);
+    }
+
+    #[test]
+    fn responses_large_terminal_frames_preserve_text_usage_and_reasoning() {
+        let encrypted = "x".repeat(300_000);
+        let terminal = serde_json::json!({
+            "type": "response.completed",
+            "response": {
+                "status": "completed",
+                "usage": {"input_tokens": 17, "output_tokens": 9},
+                "output": [{"type": "reasoning", "id": "rs_large",
+                    "encrypted_content": encrypted, "summary": []}]
+            }
+        });
+        let wire = format!(
+            "data: {{\"type\":\"response.output_text.delta\",\"delta\":\"visible answer\"}}\n\nevent: response.completed\ndata: {terminal}\n\n"
+        );
+        assert!(wire.len() > 256_000);
+        assert!(SseDecoder::new(256_000).push(wire.as_bytes()).is_err());
+        for contract in [
+            RequestContract::ChatGptResponses,
+            RequestContract::OpenAiResponses,
+        ] {
+            for chunk_size in [4093, wire.len()] {
+                let mut decoder = SseDecoder::new(sse_event_cap(contract));
+                let mut parser = ProviderStreamParser::new(contract, false);
+                let mut updates = Vec::new();
+                for chunk in wire.as_bytes().chunks(chunk_size) {
+                    for frame in decoder.push(chunk).unwrap() {
+                        updates.extend(parser.push_frame(frame).unwrap());
+                    }
+                }
+                for frame in decoder.finish().unwrap() {
+                    updates.extend(parser.push_frame(frame).unwrap());
+                }
+                let parsed = parser.finish().unwrap();
+                assert_eq!(parsed.stop_reason.as_deref(), Some("completed"));
+                assert_eq!(parsed.usage.input, 17);
+                assert_eq!(parsed.usage.output, 9);
+                assert_eq!(
+                    updates,
+                    vec![StreamUpdate::TextDelta("visible answer".into())]
+                );
+                assert!(parsed.blocks.iter().any(|block| matches!(block,
+                    Block::Text { text } if text == "visible answer")));
+                let reasoning = parsed.blocks.iter().find_map(|block| match block {
+                    Block::ResponsesReasoning { item } => Some(item),
+                    _ => None,
+                });
+                if contract == RequestContract::OpenAiResponses {
+                    assert_eq!(reasoning.unwrap()["encrypted_content"], encrypted);
+                } else {
+                    assert!(reasoning.is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn responses_event_caps_still_reject_oversized_frames_and_tool_arguments() {
+        for contract in [
+            RequestContract::AnthropicMessages,
+            RequestContract::OpenAiChatCompletions,
+            RequestContract::ChatGptResponses,
+            RequestContract::OpenAiResponses,
+        ] {
+            let cap = sse_event_cap(contract);
+            assert_eq!(
+                cap,
+                if contract.is_responses() {
+                    4 * 1024 * 1024
+                } else {
+                    256_000
+                }
+            );
+            let mut decoder = SseDecoder::new(cap);
+            assert!(
+                decoder
+                    .push(&vec![b'x'; cap + 5])
+                    .unwrap_err()
+                    .to_string()
+                    .contains(&format!("event exceeded {cap} bytes"))
+            );
+        }
+        let oversized =
+            serde_json::json!({"content":"x".repeat(TOOL_ARGUMENT_BUFFER_CAP)}).to_string();
+        for contract in [
+            RequestContract::ChatGptResponses,
+            RequestContract::OpenAiResponses,
+        ] {
+            let mut parser = ProviderStreamParser::new(contract, false);
+            let added = serde_json::json!({"type":"response.output_item.added", "item": {
+                "type":"function_call", "id":"fc_initial", "call_id":"call_initial",
+                "name":"write_file", "arguments":oversized}});
+            assert!(
+                parser
+                    .push_frame(SseFrame {
+                        event: None,
+                        data: Some(added.to_string())
+                    })
+                    .unwrap_err()
+                    .to_string()
+                    .contains("tool arguments exceeded buffer cap")
+            );
+            assert!(
+                parse_tool_arguments(contract, "finalize", "oversized", &oversized)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("tool arguments exceeded buffer cap")
+            );
+            let wire = format!(
+                "data: {}\n\ndata: {}\n\n",
+                serde_json::json!({"type":"response.output_item.added", "item": {
+                    "type":"function_call", "id":"fc_large", "call_id":"call_large",
+                    "name":"write_file", "arguments":""}}),
+                serde_json::json!({"type":"response.function_call_arguments.done",
+                    "item_id":"fc_large", "arguments":"x".repeat(TOOL_ARGUMENT_BUFFER_CAP + 1)})
+            );
+            let mut decoder = SseDecoder::new(sse_event_cap(contract));
+            let mut parser = ProviderStreamParser::new(contract, false);
+            let mut frames = decoder.push(wire.as_bytes()).unwrap().into_iter();
+            parser.push_frame(frames.next().unwrap()).unwrap();
+            assert!(
+                parser
+                    .push_frame(frames.next().unwrap())
+                    .unwrap_err()
+                    .to_string()
+                    .contains("tool arguments exceeded buffer cap")
+            );
+        }
     }
 
     #[test]

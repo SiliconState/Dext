@@ -9,6 +9,7 @@ pub struct SseFrame {
 pub struct SseDecoder {
     buffer: Vec<u8>,
     cap: usize,
+    scanned: usize,
 }
 
 impl SseDecoder {
@@ -16,6 +17,7 @@ impl SseDecoder {
         Self {
             buffer: Vec::new(),
             cap,
+            scanned: 0,
         }
     }
 
@@ -31,7 +33,7 @@ impl SseDecoder {
             self.buffer.extend_from_slice(&chunk[..take]);
             chunk = &chunk[take..];
             frames.extend(self.drain_complete_frames()?);
-            if self.buffer.len() == buffer_limit && find_delimiter(&self.buffer).is_none() {
+            if self.buffer.len() == buffer_limit {
                 return Err(frame_too_large(self.cap));
             }
         }
@@ -55,13 +57,21 @@ impl SseDecoder {
 
     fn drain_complete_frames(&mut self) -> Result<Vec<SseFrame>> {
         let mut frames = Vec::new();
-        while let Some((end, delimiter_len)) = find_delimiter(&self.buffer) {
-            if end > self.cap {
+        let mut consumed = 0;
+        // Retain overlap for LF/CRLF delimiters split across transport chunks.
+        let mut scan_from = self.scanned.saturating_sub(3);
+        while let Some((end, delimiter_len)) = find_delimiter(&self.buffer, scan_from) {
+            if end - consumed > self.cap {
                 return Err(frame_too_large(self.cap));
             }
-            let raw = self.buffer.drain(..end + delimiter_len).collect::<Vec<_>>();
-            frames.push(parse_frame(&raw[..end])?);
+            frames.push(parse_frame(&self.buffer[consumed..end])?);
+            consumed = end + delimiter_len;
+            scan_from = consumed;
         }
+        if consumed > 0 {
+            self.buffer.drain(..consumed);
+        }
+        self.scanned = self.buffer.len();
         Ok(frames)
     }
 }
@@ -93,29 +103,28 @@ fn parse_frame(raw: &[u8]) -> Result<SseFrame> {
     })
 }
 
-fn find_delimiter(buf: &[u8]) -> Option<(usize, usize)> {
-    let mut line_start = 0usize;
-    while line_start < buf.len() {
-        let (first_end, first_len) = find_line_ending(buf, line_start)?;
-        let next_start = first_end + first_len;
-        if let Some((second_end, second_len)) = find_line_ending(buf, next_start)
-            && second_end == next_start
-        {
-            return Some((first_end, first_len + second_len));
+fn find_delimiter(buf: &[u8], mut from: usize) -> Option<(usize, usize)> {
+    while let Some(offset) = buf[from..].iter().position(|byte| *byte == b'\n') {
+        let newline = from + offset;
+        let next = newline + 1;
+        let terminal = if buf.get(next) == Some(&b'\n') {
+            Some(next)
+        } else if buf.get(next) == Some(&b'\r') && buf.get(next + 1) == Some(&b'\n') {
+            Some(next + 1)
+        } else {
+            None
+        };
+        if let Some(terminal) = terminal {
+            let end = if newline > 0 && buf[newline - 1] == b'\r' {
+                newline - 1
+            } else {
+                newline
+            };
+            return Some((end, terminal + 1 - end));
         }
-        line_start = next_start;
+        from = next;
     }
     None
-}
-
-fn find_line_ending(buf: &[u8], from: usize) -> Option<(usize, usize)> {
-    let offset = buf[from..].iter().position(|byte| *byte == b'\n')?;
-    let newline = from + offset;
-    if newline > from && buf[newline - 1] == b'\r' {
-        Some((newline - 1, 2))
-    } else {
-        Some((newline, 1))
-    }
 }
 
 #[cfg(test)]
@@ -139,6 +148,57 @@ mod tests {
             .expect_err("oversized frame should fail");
         assert!(error.to_string().contains("event exceeded 8 bytes"));
         assert!(decoder.buffer.len() <= 12);
+    }
+
+    #[test]
+    fn fragmented_mixed_delimiters_match_coalesced_frames() {
+        let wire =
+            b": comment\r\ndata: a\r\n\r\ndata: b\n\r\nevent: done\r\ndata: c\r\n\ndata: tail";
+        let mut whole = SseDecoder::new(64);
+        let mut expected = whole.push(wire).unwrap();
+        expected.extend(whole.finish().unwrap());
+        for chunk_size in 1..=wire.len() {
+            let mut decoder = SseDecoder::new(64);
+            let mut actual = Vec::new();
+            for chunk in wire.chunks(chunk_size) {
+                actual.extend(decoder.push(chunk).unwrap());
+                assert_eq!(decoder.scanned, decoder.buffer.len());
+            }
+            actual.extend(decoder.finish().unwrap());
+            assert_eq!(actual, expected, "chunk_size={chunk_size}");
+        }
+    }
+
+    #[test]
+    fn large_bytewise_frame_advances_scan_without_restarting() {
+        let mut decoder = SseDecoder::new(300_006);
+        for byte in b"data: ".iter().chain(std::iter::repeat_n(&b'x', 300_000)) {
+            let previous = decoder.scanned;
+            assert!(decoder.push(std::slice::from_ref(byte)).unwrap().is_empty());
+            assert_eq!(decoder.scanned, previous + 1);
+        }
+        let frames = decoder.push(b"\r\n\r\n").unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].data.as_ref().unwrap().len(), 300_000);
+        assert!(decoder.buffer.is_empty());
+        assert_eq!(decoder.scanned, 0);
+    }
+
+    #[test]
+    fn coalesced_frames_enforce_each_event_cap() {
+        let mut decoder = SseDecoder::new(7);
+        assert!(decoder.push(b"data: a\n\ndata: bb\n\n").is_err());
+        for delimiter in ["\n\n", "\r\n\r\n", "\n\r\n", "\r\n\n"] {
+            let wire = format!("data: x{delimiter}");
+            for cut in 0..=wire.len() {
+                let mut decoder = SseDecoder::new(7);
+                let mut frames = decoder.push(&wire.as_bytes()[..cut]).unwrap();
+                frames.extend(decoder.push(&wire.as_bytes()[cut..]).unwrap());
+                frames.extend(decoder.finish().unwrap());
+                assert_eq!(frames.len(), 1, "delimiter={delimiter:?} cut={cut}");
+                assert_eq!(frames[0].data.as_deref(), Some("x"));
+            }
+        }
     }
 
     #[test]

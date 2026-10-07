@@ -61,9 +61,15 @@ fn test_process_state_dir() -> PathBuf {
         let temp_root = std::env::temp_dir();
         let dir = temp_root.join(format!("dext-test-home-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create test state home");
-        dir
+        std::fs::canonicalize(&dir).expect("canonical test state home")
     })
     .clone()
+}
+
+#[test]
+fn shared_test_state_home_is_canonical() {
+    let dir = test_process_state_dir();
+    assert_eq!(dir, std::fs::canonicalize(&dir).unwrap());
 }
 
 fn canonicalize_with_missing_ancestors(path: &Path) -> std::result::Result<PathBuf, String> {
@@ -767,12 +773,16 @@ pub(crate) struct SessionLockOperationGuard {
 
 impl SessionLockOperationGuard {
     pub(crate) fn acquire() -> Result<Self> {
+        Self::acquire_at(&dext_state_dir().join(SESSION_LOCK_OPERATION_FILE))
+    }
+
+    pub(crate) fn acquire_at(path: &Path) -> Result<Self> {
         let process_guard = session_lock_process_guard()
             .lock()
             .map_err(|_| anyhow::anyhow!("session lock operation mutex poisoned"))?;
-        let state_dir = dext_state_dir();
-        std::fs::create_dir_all(&state_dir)?;
-        let path = state_dir.join(SESSION_LOCK_OPERATION_FILE);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         let deadline = std::time::Instant::now() + SESSION_LOCK_OPERATION_WAIT;
         let file = loop {
             let mut options = std::fs::OpenOptions::new();
@@ -787,7 +797,7 @@ impl SessionLockOperationGuard {
                 use std::os::windows::fs::OpenOptionsExt as _;
                 options.share_mode(0).custom_flags(0x0020_0000);
             }
-            match options.open(&path) {
+            match options.open(path) {
                 Ok(file) => break file,
                 Err(error)
                     if cfg!(windows)
@@ -1390,6 +1400,14 @@ pub(crate) fn parse_session_header(line: &str) -> Result<SessionHeader> {
         compact_threshold_percent: meta["compact_threshold_percent"]
             .as_u64()
             .and_then(|v| u8::try_from(v).ok()),
+        background_compact: match object.get("background_compact") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(value) => Some(
+                value
+                    .as_bool()
+                    .context("background_compact must be a boolean")?,
+            ),
+        },
         approval_profile: meta["approval_profile"]
             .as_str()
             .and_then(crate::ApprovalProfile::parse)

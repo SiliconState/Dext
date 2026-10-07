@@ -171,7 +171,7 @@ pub(crate) struct ResolvedModelSpec {
     pub(crate) source: &'static str,
 }
 
-const PROVIDER_CATALOG_VERSION: u32 = 3;
+const PROVIDER_CATALOG_VERSION: u32 = 4;
 const STRUCTURED_PROVIDER_CATALOG_VERSION: u32 = 2;
 const AUTH_STORE_VERSION: u32 = 1;
 const STATE_INSPECTION_MAX_BYTES: u64 = 1024 * 1024;
@@ -547,6 +547,27 @@ pub(crate) fn is_claude_opus_5_5_model(model: &str) -> bool {
     model_has_family_fragment(model, &["opus-5-5", "opus-5.5", "opus5.5"])
 }
 
+fn canonical_deepseek_model(model: &str) -> Option<&'static str> {
+    match model.trim().to_ascii_lowercase().as_str() {
+        "deepseek-chat"
+        | "deepseek-flash"
+        | "deepseek-v4-flash"
+        | "deepseek-v4-flash-vision-exp" => Some("deepseek-flash"),
+        "deepseek-reasoner" | "deepseek-v4-pro" => Some("deepseek-v4-pro"),
+        _ => None,
+    }
+}
+
+pub(crate) fn deepseek_model_pricing(model: &str) -> Option<ModelPricing> {
+    match model.trim().to_ascii_lowercase().as_str() {
+        "deepseek-flash" | "deepseek-v4-flash" | "deepseek-v4-flash-vision-exp" => {
+            Some(model_pricing(0.3, 1.2, 0.006, 0.0))
+        }
+        "deepseek-v4-pro" => Some(model_pricing(1.32, 3.96, 0.044, 0.0)),
+        _ => None,
+    }
+}
+
 fn builtin_model_pricing(provider_id: &str, model: &str) -> Option<ModelPricing> {
     let model = model.to_ascii_lowercase();
     match canonical_provider_id(provider_id).as_str() {
@@ -555,8 +576,7 @@ fn builtin_model_pricing(provider_id: &str, model: &str) -> Option<ModelPricing>
             Some(model_pricing(0.15, 0.5, 0.03, 0.0))
         }
         "glm" => Some(model_pricing(1.0, 5.0, 0.1, 1.25)),
-        "deepseek" if model.contains("reasoner") => Some(model_pricing(0.55, 2.19, 0.14, 0.55)),
-        "deepseek" if model.contains("chat") => Some(model_pricing(0.27, 1.1, 0.07, 0.27)),
+        "deepseek" => deepseek_model_pricing(&model),
         "anthropic" if is_claude_fable_5_1_model(&model) => {
             Some(model_pricing(10.0, 50.0, 0.25, 12.5))
         }
@@ -670,9 +690,6 @@ fn hydrate_builtin_model_specs(profiles: &mut [ProviderProfile]) {
             if matches!(provider_id.as_str(), "openai" | "chatgpt")
                 && (normalized.starts_with("gpt-4.1") || normalized.starts_with("gpt-4o"))
             {
-                spec.capabilities.reasoning = Some(false);
-            }
-            if provider_id == "deepseek" && normalized.contains("chat") {
                 spec.capabilities.reasoning = Some(false);
             }
             profile.model_specs.insert(normalized, spec);
@@ -1045,20 +1062,37 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
             display_name: "DeepSeek".to_string(),
             api_provider: ApiProvider::OpenAi,
             base_url: "https://api.deepseek.com".to_string(),
-            default_model: "deepseek-chat".to_string(),
-            models: vec!["deepseek-chat".to_string(), "deepseek-reasoner".to_string()],
+            default_model: "deepseek-flash".to_string(),
+            models: vec!["deepseek-flash".to_string(), "deepseek-v4-pro".to_string()],
             env_vars: vec!["DEEPSEEK_API_KEY".to_string()],
             requires_api_key: true,
             login_url: Some("https://platform.deepseek.com/api_keys".to_string()),
             oauth_flow: None,
-            notes: Some("Uses DeepSeek's OpenAI-compatible API.".to_string()),
-            context_window: Some(128_000),
+            notes: Some("DeepSeek V4.1 Flash / V4 Pro: 1M context, up to 393,216 output tokens, low/high/max thinking and tool calls. Catalog costs use conservative peak rates; off-peak billing is half. Retired model selections migrate to current names.".to_string()),
+            context_window: Some(1_000_000),
             model_context_windows: HashMap::new(),
             model_effort_levels: HashMap::new(),
             request_contract: Some(RequestContract::OpenAiChatCompletions),
-            model_aliases: HashMap::new(),
+            model_aliases: HashMap::from([
+                ("deepseek-chat".to_string(), "deepseek-flash".to_string()),
+                ("deepseek-reasoner".to_string(), "deepseek-v4-pro".to_string()),
+                ("deepseek-v4-flash".to_string(), "deepseek-flash".to_string()),
+                ("deepseek-v4-flash-vision-exp".to_string(), "deepseek-flash".to_string()),
+            ]),
             model_defaults: ModelSpec::default(),
-            model_specs: HashMap::new(),
+            model_specs: ["deepseek-flash", "deepseek-v4-pro"]
+                .into_iter()
+                .map(|model| (model.to_string(), ModelSpec {
+                    context_window: Some(1_000_000),
+                    max_output_tokens: Some(393_216),
+                    effort_levels: ["low", "high", "max"].into_iter().map(str::to_string).collect(),
+                    capabilities: ModelCapabilities {
+                        tools: Some(true), reasoning: Some(true),
+                        image_input: Some(model == "deepseek-flash"), prompt_cache: Some(true),
+                    },
+                    ..ModelSpec::default()
+                }))
+                .collect(),
         },
         ProviderProfile {
             id: "local".to_string(),
@@ -1094,12 +1128,27 @@ fn local_llama_cache() -> &'static Mutex<HashMap<String, u64>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+pub(crate) fn is_deepseek_provider(
+    provider_id: &str,
+    api_provider: ApiProvider,
+    base_url: &str,
+) -> bool {
+    api_provider == ApiProvider::OpenAi
+        && (canonical_provider_id(provider_id) == "deepseek"
+            || reqwest::Url::parse(base_url.trim()).is_ok_and(|url| {
+                url.host_str()
+                    .is_some_and(|host| host.eq_ignore_ascii_case("api.deepseek.com"))
+            }))
+}
+
 pub(crate) fn is_local_llama_provider(
     provider_id: &str,
     api_provider: ApiProvider,
     base_url: &str,
 ) -> bool {
-    if api_provider != ApiProvider::OpenAi {
+    if api_provider != ApiProvider::OpenAi
+        || is_deepseek_provider(provider_id, api_provider, base_url)
+    {
         return false;
     }
     if canonical_provider_id(provider_id) == "local" {
@@ -1255,6 +1304,21 @@ pub(crate) fn refresh_local_llama_context_window(
     Some(tokens)
 }
 
+fn ordered_model_entries<T>(
+    profile: &ProviderProfile,
+    entries: HashMap<String, T>,
+) -> Vec<(String, T)> {
+    let mut entries = entries.into_iter().collect::<Vec<_>>();
+    if profile.id == "deepseek" {
+        // Alias metadata fills omissions; exact canonical keys win conflicts.
+        entries.sort_by_cached_key(|(model, _)| {
+            let canonical = normalize_provider_model_value(profile, model);
+            (model == &canonical, model.clone())
+        });
+    }
+    entries
+}
+
 pub(crate) fn normalize_provider_profile(mut profile: ProviderProfile) -> Option<ProviderProfile> {
     profile.id = canonical_provider_id(&profile.id);
     if profile.id.trim().is_empty() {
@@ -1287,6 +1351,10 @@ pub(crate) fn normalize_provider_profile(mut profile: ProviderProfile) -> Option
         let target = if request_contract_for_profile(&profile) == RequestContract::ChatGptResponses
         {
             normalize_chatgpt_model_slug(&target)
+        } else if profile.id == "deepseek" {
+            canonical_deepseek_model(&target)
+                .unwrap_or(target.trim())
+                .to_string()
         } else {
             target.trim().to_string()
         };
@@ -1316,7 +1384,8 @@ pub(crate) fn normalize_provider_profile(mut profile: ProviderProfile) -> Option
     profile.models = models;
 
     let mut normalized_context_windows = HashMap::new();
-    for (model, window) in std::mem::take(&mut profile.model_context_windows) {
+    let entries = std::mem::take(&mut profile.model_context_windows);
+    for (model, window) in ordered_model_entries(&profile, entries) {
         if window == 0 {
             continue;
         }
@@ -1328,7 +1397,8 @@ pub(crate) fn normalize_provider_profile(mut profile: ProviderProfile) -> Option
     profile.model_context_windows = normalized_context_windows;
 
     let mut normalized_effort_levels = HashMap::new();
-    for (model, levels) in std::mem::take(&mut profile.model_effort_levels) {
+    let entries = std::mem::take(&mut profile.model_effort_levels);
+    for (model, levels) in ordered_model_entries(&profile, entries) {
         let key = normalize_provider_model_value(&profile, &model).to_ascii_lowercase();
         if key.is_empty() {
             continue;
@@ -1348,10 +1418,16 @@ pub(crate) fn normalize_provider_profile(mut profile: ProviderProfile) -> Option
 
     profile.model_defaults = normalize_model_spec(profile.model_defaults);
     let mut normalized_model_specs = HashMap::new();
-    for (model, spec) in std::mem::take(&mut profile.model_specs) {
+    let entries = std::mem::take(&mut profile.model_specs);
+    for (model, spec) in ordered_model_entries(&profile, entries) {
         let key = normalize_provider_model_value(&profile, &model).to_ascii_lowercase();
         if !key.is_empty() {
-            normalized_model_specs.insert(key, normalize_model_spec(spec));
+            let spec = normalize_model_spec(spec);
+            if profile.id == "deepseek" {
+                merge_model_spec(normalized_model_specs.entry(key).or_default(), spec);
+            } else {
+                normalized_model_specs.insert(key, spec);
+            }
         }
     }
     profile.model_specs = normalized_model_specs;
@@ -1390,7 +1466,7 @@ fn refresh_retired_builtin_pricing(provider_id: &str, model: &str, spec: &mut Mo
 
 fn merge_provider_profile_with_migrations(
     mut builtin: ProviderProfile,
-    stored: ProviderProfile,
+    mut stored: ProviderProfile,
     refresh_retired_generated_prices: bool,
 ) -> ProviderProfile {
     let builtin_id = canonical_provider_id(&builtin.id);
@@ -1405,11 +1481,38 @@ fn merge_provider_profile_with_migrations(
     for (alias, target) in stored.model_aliases {
         builtin.model_aliases.insert(alias, target);
     }
+    if builtin_id == "deepseek" {
+        for (model, window) in &stored.model_context_windows {
+            if *window > 0 {
+                let key = normalize_provider_model_value(&builtin, model).to_ascii_lowercase();
+                stored
+                    .model_specs
+                    .entry(key)
+                    .or_default()
+                    .context_window
+                    .get_or_insert(*window);
+            }
+        }
+        for (model, levels) in &stored.model_effort_levels {
+            if !levels.is_empty() {
+                let key = normalize_provider_model_value(&builtin, model).to_ascii_lowercase();
+                let spec = stored.model_specs.entry(key).or_default();
+                if spec.effort_levels.is_empty() {
+                    spec.effort_levels = levels.clone();
+                }
+            }
+        }
+    }
     merge_model_spec(&mut builtin.model_defaults, stored.model_defaults);
     for (model, mut spec) in stored.model_specs {
         if refresh_retired_generated_prices {
             refresh_retired_builtin_pricing(&builtin_id, &model, &mut spec);
         }
+        let model = if builtin_id == "deepseek" {
+            normalize_provider_model_value(&builtin, &model).to_ascii_lowercase()
+        } else {
+            model
+        };
         merge_model_spec(builtin.model_specs.entry(model).or_default(), spec);
     }
 
@@ -1467,6 +1570,8 @@ fn merge_provider_profile_with_migrations(
         .map(|model| {
             if chatgpt_route {
                 normalize_chatgpt_model_slug(&model)
+            } else if builtin_id == "deepseek" {
+                normalize_provider_model_value(&builtin, &model)
             } else {
                 model.trim().to_string()
             }
@@ -1479,7 +1584,8 @@ fn merge_provider_profile_with_migrations(
                     .starts_with(&format!("{builtin_id}-"))
                 || !builtin_owned.contains(&model.to_ascii_lowercase())
         })
-        .filter(|model| seen_models.insert(model.to_ascii_lowercase()));
+        .filter(|model| seen_models.insert(model.to_ascii_lowercase()))
+        .collect::<Vec<_>>();
     builtin.models.extend(extra_models);
 
     if !builtin
@@ -1516,7 +1622,8 @@ fn validate_kimi_profile_provenance(catalog: &ProviderCatalog) -> Result<()> {
 pub(crate) fn normalize_provider_catalog(mut catalog: ProviderCatalog) -> Result<ProviderCatalog> {
     validate_kimi_profile_provenance(&catalog)?;
     let legacy_catalog = catalog.version < STRUCTURED_PROVIDER_CATALOG_VERSION;
-    let refresh_retired_generated_prices = catalog.version < PROVIDER_CATALOG_VERSION;
+    let refresh_retired_generated_prices = catalog.version < 3;
+    let refresh_deepseek = catalog.version < 4;
     let mut stored_by_id: HashMap<String, ProviderProfile> = HashMap::new();
     let mut providers: Vec<ProviderProfile> = Vec::new();
     let builtin_ids: HashSet<String> = built_in_provider_profiles()
@@ -1525,6 +1632,43 @@ pub(crate) fn normalize_provider_catalog(mut catalog: ProviderCatalog) -> Result
         .collect();
 
     for mut profile in catalog.providers.drain(..) {
+        if refresh_deepseek && canonical_provider_id(&profile.id) == "deepseek" {
+            if profile.context_window == Some(128_000) {
+                profile.context_window = None;
+            }
+            if profile.model_defaults.max_output_tokens == Some(8_192) {
+                profile.model_defaults.max_output_tokens = None;
+            }
+            for (model, spec) in &mut profile.model_specs {
+                let model = model.trim().to_ascii_lowercase();
+                if matches!(model.as_str(), "deepseek-chat" | "deepseek-reasoner") {
+                    if spec.context_window == Some(128_000) {
+                        spec.context_window = None;
+                    }
+                    if spec.max_output_tokens == Some(8_192) {
+                        spec.max_output_tokens = None;
+                    }
+                    if model == "deepseek-chat" && spec.capabilities.reasoning == Some(false) {
+                        spec.capabilities.reasoning = None;
+                    }
+                    let retired = if model == "deepseek-chat" {
+                        model_pricing(0.27, 1.1, 0.07, 0.27)
+                    } else {
+                        model_pricing(0.55, 2.19, 0.14, 0.55)
+                    };
+                    if spec.pricing.as_ref() == Some(&retired) {
+                        spec.pricing = None;
+                    }
+                }
+            }
+            profile.model_context_windows.retain(|model, window| {
+                !(*window == 128_000
+                    && matches!(
+                        model.trim().to_ascii_lowercase().as_str(),
+                        "deepseek-chat" | "deepseek-reasoner"
+                    ))
+            });
+        }
         if legacy_catalog {
             profile.request_contract = None;
             profile.model_aliases.clear();
@@ -2569,9 +2713,18 @@ pub(crate) fn normalize_provider_model_value(profile: &ProviderProfile, model: &
     if let Some(target) = profile.model_aliases.get(&alias_key) {
         return if chatgpt_contract {
             normalize_chatgpt_model_slug(target)
+        } else if canonical_provider_id(&profile.id) == "deepseek" {
+            canonical_deepseek_model(target)
+                .unwrap_or(target.trim())
+                .to_string()
         } else {
             target.trim().to_string()
         };
+    }
+    if canonical_provider_id(&profile.id) == "deepseek"
+        && let Some(model) = canonical_deepseek_model(&normalized_input)
+    {
+        return model.to_string();
     }
     if chatgpt_contract {
         return normalized_input;

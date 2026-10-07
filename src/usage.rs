@@ -464,13 +464,9 @@ pub(crate) fn anthropic_pricing(model: &str) -> Option<UsagePricing> {
 }
 
 pub(crate) fn deepseek_pricing(model: &str) -> Option<UsagePricing> {
-    if model.contains("reasoner") {
-        Some(UsagePricing::new(0.55, 2.19, 0.14, 0.55))
-    } else if model.contains("chat") {
-        Some(UsagePricing::new(0.27, 1.1, 0.07, 0.27))
-    } else {
-        None
-    }
+    crate::provider::deepseek_model_pricing(model)
+        .as_ref()
+        .map(UsagePricing::from)
 }
 
 pub(crate) fn usage_pricing_from_env(default: UsagePricing) -> UsagePricing {

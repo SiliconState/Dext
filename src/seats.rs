@@ -240,9 +240,14 @@ fn ensure_owner_safe_dir(path: &Path) -> Result<()> {
                     std::fs::DirBuilder::new()
                 }
             };
-            builder
-                .create(path)
-                .with_context(|| format!("creating seat state ancestor {}", path.display()))
+            match builder.create(path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    ensure_owner_safe_dir(path)
+                }
+                Err(error) => Err(error)
+                    .with_context(|| format!("creating seat state ancestor {}", path.display())),
+            }
         }
         Err(error) => Err(error.into()),
     }
@@ -271,6 +276,53 @@ fn ensure_seat_ancestors(root: &Path) -> Result<()> {
     ensure_owner_safe_dir(state)?;
     ensure_owner_safe_dir(projects)?;
     ensure_owner_safe_dir(&project)
+}
+
+pub(crate) fn hook_memo_dir(root: &Path, session: &str, call_id: &str) -> Result<PathBuf> {
+    validate_session_id(session)?;
+    if call_id.trim().is_empty() || call_id.len() > 1024 {
+        anyhow::bail!("hook call id is empty or too long");
+    }
+    ensure_seat_ancestors(root)?;
+    let sessions = crate::session::latest_sessions_dir(root);
+    ensure_owner_safe_dir(&sessions)?;
+    let session = sessions.join(session);
+    ensure_private_dir(&session)?;
+    let memos = session.join("hook-memo");
+    ensure_private_dir(&memos)?;
+    let call = memos.join(crate::sha256_hex_str(call_id));
+    ensure_private_dir(&call)?;
+    Ok(call)
+}
+
+pub(crate) fn hook_memo_value(
+    dir: &Path,
+    key: &str,
+    value: Option<&[u8]>,
+) -> Result<Option<Vec<u8>>> {
+    validate_no_symlink_components(dir)?;
+    ensure_private_dir(dir)?;
+    let _guard =
+        crate::session::SessionLockOperationGuard::acquire_at(&dir.join("memo.operation.lock"))?;
+    if key.is_empty() || key.len() > 256 || value.is_some_and(|value| value.len() > 4096) {
+        anyhow::bail!("hook memo key/value exceeds its bound (256/4096 bytes)");
+    }
+    let path = dir.join(crate::sha256_hex_str(key));
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => validate_private_file(&path, &metadata)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let Some(value) = value else {
+                return Ok(None);
+            };
+            crate::session::atomic_write_secret(&path, value)?;
+            #[cfg(unix)]
+            std::fs::File::open(dir)?.sync_all()?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    crate::session::read_regular_file_bytes_with_limit(&path, 4096, None, "hook memo")
+        .map(|(bytes, _)| Some(bytes))
+        .map_err(anyhow::Error::msg)
 }
 
 fn validate_seat_ancestors_if_exists(root: &Path) -> Result<bool> {
@@ -327,9 +379,17 @@ fn ensure_private_dir(path: &Path) -> Result<()> {
                     std::fs::DirBuilder::new()
                 }
             };
-            builder
-                .create(path)
-                .with_context(|| format!("creating seat state directory {}", path.display()))?;
+            match builder.create(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    ensure_private_dir(path)?;
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("creating seat state directory {}", path.display())
+                    });
+                }
+            }
         }
         Err(error) => return Err(error.into()),
     }
@@ -500,6 +560,65 @@ pub(crate) fn update_metadata(
         .max(record.created_at);
     save(root, &record)?;
     Ok(record)
+}
+
+pub(crate) fn save_new_fork(
+    root: &Path,
+    header: &SessionHeader,
+    history: &[crate::Message],
+) -> Result<()> {
+    let seat = header.seat.as_ref().context("fork has no target seat")?;
+    let session = header
+        .session_id
+        .as_deref()
+        .context("fork has no session id")?;
+    validate_seat_ref(seat)?;
+    validate_session_id(session)?;
+    let _guard = crate::session::SessionLockOperationGuard::acquire()?;
+    if load(root, &seat.id)?.is_some()
+        || seat_record_path(root, &seat.id)?
+            .parent()
+            .context("seat parent")?
+            .try_exists()?
+    {
+        anyhow::bail!("fork target seat '{}' already exists", seat.id);
+    }
+    ensure_seat_ancestors(root)?;
+    let sessions = crate::session::latest_sessions_dir(root);
+    ensure_owner_safe_dir(&sessions)?;
+    let session_dir = sessions.join(session);
+    if session_dir.try_exists()? {
+        anyhow::bail!("fork session id already exists");
+    }
+    let mut bytes = Vec::new();
+    use std::io::Write as _;
+    let header_bytes = serde_json::to_vec(header)?;
+    if header_bytes.len() > crate::session::SESSION_HEADER_MAX_BYTES {
+        anyhow::bail!("fork header exceeds its byte limit");
+    }
+    bytes.extend_from_slice(&header_bytes);
+    bytes.push(b'\n');
+    for message in history {
+        writeln!(&mut bytes, "{}", serde_json::to_string(message)?)?;
+    }
+    ensure_private_dir(&session_dir)?;
+    let result = (|| {
+        crate::session::atomic_write_secret(
+            &crate::session::session_latest_session_path(root, session),
+            &bytes,
+        )?;
+        crate::tool_journal::initialize_empty(root, session)?;
+        let mut record = new_record(&seat.id);
+        record.last_session_id = Some(session.into());
+        save(root, &record)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(&session_dir);
+        if let Some(seat_dir) = seat_record_path(root, &seat.id)?.parent() {
+            let _ = std::fs::remove_dir(seat_dir);
+        }
+    }
+    result
 }
 
 pub(crate) fn record_session(root: &Path, seat: &SeatRef, session_id: &str) -> Result<()> {

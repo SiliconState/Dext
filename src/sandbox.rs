@@ -296,7 +296,7 @@ pub(crate) fn std_command(
     profile: SandboxProfile,
     root: &Path,
 ) -> std::io::Result<SandboxedStdCommand> {
-    std_command_inner(program.as_ref(), profile, root, false)
+    std_command_inner(program.as_ref(), profile, root, false, &[])
 }
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
@@ -305,7 +305,17 @@ pub(crate) fn std_command_offline(
     profile: SandboxProfile,
     root: &Path,
 ) -> std::io::Result<SandboxedStdCommand> {
-    std_command_inner(program.as_ref(), profile, root, true)
+    std_command_inner(program.as_ref(), profile, root, true, &[])
+}
+
+pub(crate) fn hook_command(
+    program: impl AsRef<OsStr>,
+    profile: SandboxProfile,
+    root: &Path,
+    memo: Option<&Path>,
+) -> std::io::Result<SandboxedStdCommand> {
+    let writes = memo.map(Path::to_path_buf).into_iter().collect::<Vec<_>>();
+    std_command_inner(program.as_ref(), profile, root, false, &writes)
 }
 
 fn std_command_inner(
@@ -313,6 +323,7 @@ fn std_command_inner(
     profile: SandboxProfile,
     root: &Path,
     offline: bool,
+    extra_writes: &[PathBuf],
 ) -> std::io::Result<SandboxedStdCommand> {
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     if offline {
@@ -355,7 +366,7 @@ fn std_command_inner(
             .as_ref()
             .map(|scratch| scratch.path.as_path())
             .ok_or_else(|| std::io::Error::other("confined command has no private scratch"))?;
-        let profile_text = macos::profile_text(profile, root, scratch_path, offline)
+        let profile_text = macos::profile_text(profile, root, scratch_path, offline, extra_writes)
             .ok_or_else(|| std::io::Error::other("could not build macOS sandbox profile"))?;
         let mut command = std::process::Command::new("/usr/bin/sandbox-exec");
         command.arg("-p").arg(profile_text).arg(program);
@@ -379,7 +390,13 @@ fn std_command_inner(
                 .as_ref()
                 .map(|scratch| scratch.path.as_path())
                 .ok_or_else(|| std::io::Error::other("confined command has no private scratch"))?;
-            linux::install_landlock_pre_exec_std(&mut command, profile, root, scratch_path);
+            linux::install_landlock_pre_exec_std(
+                &mut command,
+                profile,
+                root,
+                scratch_path,
+                extra_writes,
+            );
         }
         if offline {
             linux::install_offline_pre_exec_std(&mut command);
@@ -392,7 +409,7 @@ fn std_command_inner(
             .env("TMP", &scratch.path)
             .env("TEMP", &scratch.path);
     }
-    let _ = (profile, root, offline);
+    let _ = (profile, root, offline, extra_writes);
     Ok(SandboxedStdCommand { command, scratch })
 }
 
@@ -418,7 +435,7 @@ pub(crate) fn tokio_command(
             .as_ref()
             .map(|scratch| scratch.path.as_path())
             .ok_or_else(|| std::io::Error::other("confined command has no private scratch"))?;
-        let profile_text = macos::profile_text(profile, root, scratch_path, false)
+        let profile_text = macos::profile_text(profile, root, scratch_path, false, &[])
             .ok_or_else(|| std::io::Error::other("could not build macOS sandbox profile"))?;
         let mut command = tokio::process::Command::new("/usr/bin/sandbox-exec");
         command.arg("-p").arg(profile_text).arg(program);
@@ -503,7 +520,7 @@ mod linux {
     use landlock::{
         ABI, AccessFs, Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus, path_beneath_rules,
     };
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     /// Query the kernel's supported Landlock ABI without restricting anything.
     /// Returns None if Landlock is unavailable.
@@ -529,8 +546,12 @@ mod linux {
         profile: SandboxProfile,
         root: &Path,
         scratch: &Path,
+        extra_writes: &[PathBuf],
     ) -> Option<landlock::RulesetCreated> {
-        let writable = writable_roots(profile, root, scratch);
+        let mut writable = writable_roots(profile, root, scratch);
+        writable.extend(super::canonical_explicit_roots(
+            extra_writes.iter().cloned(),
+        ));
         let abi = ABI::from(landlock_abi()? as i32);
         let write_access = AccessFs::from_write(abi);
         let created = Ruleset::default()
@@ -645,13 +666,14 @@ mod linux {
         profile: SandboxProfile,
         root: &Path,
         scratch: &Path,
+        extra_writes: &[PathBuf],
     ) {
         use std::os::unix::process::CommandExt as _;
 
         if landlock_abi().is_none() {
             return;
         }
-        let Some(ruleset) = build_ruleset(profile, root, scratch) else {
+        let Some(ruleset) = build_ruleset(profile, root, scratch, extra_writes) else {
             unsafe {
                 cmd.pre_exec(|| Err(std::io::Error::from_raw_os_error(libc::EPERM)));
             }
@@ -685,7 +707,7 @@ mod linux {
         // Once a Landlock-capable kernel is detected, a requested confined
         // profile must not silently run unconfined because rule construction or
         // restriction failed.
-        let Some(ruleset) = build_ruleset(profile, root, scratch) else {
+        let Some(ruleset) = build_ruleset(profile, root, scratch, &[]) else {
             unsafe {
                 cmd.pre_exec(|| Err(std::io::Error::from_raw_os_error(libc::EPERM)));
             }
@@ -726,13 +748,17 @@ mod macos {
         root: &Path,
         scratch: &Path,
         offline: bool,
+        extra_writes: &[std::path::PathBuf],
     ) -> Option<String> {
         let mut text = "(version 1)\n(allow default)\n(deny file-write*)\n".to_string();
         if offline {
             text.push_str("(deny network*)\n");
         }
         let mut allows = String::new();
-        for path in writable_roots(profile, root, scratch) {
+        let paths = writable_roots(profile, root, scratch).into_iter().chain(
+            super::canonical_explicit_roots(extra_writes.iter().cloned()),
+        );
+        for path in paths {
             let mut aliases = vec![path.clone()];
             if let Ok(relative) = path.strip_prefix("/private") {
                 let alias = Path::new("/").join(relative);

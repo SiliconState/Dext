@@ -71,6 +71,22 @@ pub(crate) fn journal_path(root: &Path, session_id: &str) -> PathBuf {
     crate::session::session_state_dir(root, session_id).join(TOOL_JOURNAL_FILE)
 }
 
+pub(crate) fn initialize_empty(root: &Path, session_id: &str) -> Result<()> {
+    validate_session_id(session_id)?;
+    let path = journal_path(root, session_id);
+    if path.try_exists()? {
+        anyhow::bail!("fork tool journal already exists");
+    }
+    write_path(
+        &path,
+        &ToolJournal {
+            version: TOOL_JOURNAL_VERSION,
+            session_id: session_id.into(),
+            entries: Vec::new(),
+        },
+    )
+}
+
 pub(crate) fn start(root: &Path, session_id: &str, spec: StartSpec<'_>) -> Result<String> {
     validate_session_id(session_id)?;
     validate_identity(spec.turn_id, "turn id")?;

@@ -535,10 +535,19 @@ impl Agent {
                         let pre_env = [
                             ("DEXT_TOOL_NAME", name.as_str()),
                             ("DEXT_TOOL_INPUT", input_redacted.as_str()),
+                            ("DEXT_TOOL_CALL_ID", id.as_str()),
+                            (
+                                "DEXT_SESSION_ID",
+                                if self.session_enabled {
+                                    self.session_id.as_str()
+                                } else {
+                                    ""
+                                },
+                            ),
                         ];
                         let mut blocked: Option<String> = None;
                         if hooks_approved {
-                            for (out, code) in self.hooks.fire(
+                            for (out, code, _) in self.hooks.fire(
                                 "pre_tool",
                                 &name,
                                 &pre_env,
@@ -1013,6 +1022,8 @@ impl Agent {
                     builtin_git_cred_used.insert(idx);
                 }
                 let prepared_mutation = plans[idx].prepared_mutation.take();
+                let mut call_env = self.pack_hook_env.clone();
+                call_env.push(("DEXT_TOOL_CALL_ID".into(), plans[idx].tool_use_id.clone()));
                 let r = if matches!(plans[idx].plan, Plan::Runtime) {
                     self.execute_pack_runtime_tool(&n, &inp, &turn_id, iterations)
                         .await
@@ -1030,7 +1041,7 @@ impl Agent {
                         self.sandbox_profile,
                         hooks_approved,
                         live_output,
-                        self.pack_hook_env.clone(),
+                        call_env,
                         context_mode,
                     )
                     .await
@@ -1169,9 +1180,18 @@ impl Agent {
                 ("DEXT_TOOL_NAME", name.as_str()),
                 ("DEXT_TOOL_INPUT", post_tool_input.as_str()),
                 ("DEXT_TOOL_RESULT", post_tool_result.as_str()),
+                ("DEXT_TOOL_CALL_ID", tool_use_id.as_str()),
+                (
+                    "DEXT_SESSION_ID",
+                    if self.session_enabled {
+                        self.session_id.as_str()
+                    } else {
+                        ""
+                    },
+                ),
             ];
             if hooks_approved {
-                for (out, _code) in self.hooks.fire(
+                for (out, _code, _) in self.hooks.fire(
                     "post_tool",
                     &name,
                     &post_env,

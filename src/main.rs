@@ -1,5 +1,7 @@
 mod claude_subscription;
+mod compaction;
 mod crash;
+mod diagram;
 mod events;
 mod git_checkpoints;
 mod image;
@@ -150,7 +152,6 @@ const LATEST_LOG_ARCHIVE_MAX: u32 = 16;
 const SLASH_LIST_LIMIT: usize = 50;
 const SLASH_TEXT_CAP: usize = 8_000;
 const SESSION_STATE_LOCK_NAME: &str = "session.lock.json";
-const STREAM_EVENT_BUFFER_CAP: usize = 256_000;
 const TOOL_SUMMARY_CHAR_CAP: usize = 180;
 const TOOL_UI_CONTENT_CAP: usize = 8_000;
 const SUDO_ASKPASS_ENV: &str = "DEXT_SUDO_ASKPASS";
@@ -467,6 +468,7 @@ impl std::fmt::Display for ProviderTransportError {
 
 impl std::error::Error for ProviderTransportError {}
 
+#[cfg(test)]
 async fn send_provider_request(
     request: reqwest::RequestBuilder,
     timeout: std::time::Duration,
@@ -1608,6 +1610,7 @@ enum CompactSlash {
     Status,
     Auto,
     SetPercent(u8),
+    Background(Option<bool>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1687,19 +1690,29 @@ const NDJSON_MAX_FRAME_BYTES: usize = 256 * 1024;
 const NDJSON_MAX_PENDING: usize = 32;
 
 fn reserve_ndjson_pending(pending: &AtomicUsize, slots: usize) -> bool {
-    pending
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
-            count
-                .checked_add(slots)
-                .filter(|next| *next <= NDJSON_MAX_PENDING)
-        })
-        .is_ok()
+    let mut count = pending.load(Ordering::SeqCst);
+    loop {
+        let Some(next) = count
+            .checked_add(slots)
+            .filter(|next| *next <= NDJSON_MAX_PENDING)
+        else {
+            return false;
+        };
+        match pending.compare_exchange(count, next, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return true,
+            Err(current) => count = current,
+        }
+    }
 }
 
 fn release_ndjson_pending(pending: &AtomicUsize) {
-    let _ = pending.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
-        Some(count.saturating_sub(1))
-    });
+    let mut count = pending.load(Ordering::SeqCst);
+    while count > 0 {
+        match pending.compare_exchange(count, count - 1, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return,
+            Err(current) => count = current,
+        }
+    }
 }
 
 /// Reservations precede publication and are released by the actual consumer.
@@ -1991,6 +2004,7 @@ impl EventSink for ConsoleSink {
             }
             AgentEvent::ExternalTelemetry { .. } => {}
             AgentEvent::TurnDiagnostics { .. } => {}
+            AgentEvent::BackgroundCompactionSetting { .. } => {}
             AgentEvent::ThinkingEffortChanged { .. } => {}
             AgentEvent::ReasoningModeChanged { .. } => {}
             AgentEvent::ApprovalProfileChanged { .. } => {}
@@ -2016,11 +2030,17 @@ impl EventSink for ConsoleSink {
                     dim(&format!("[usage: {}]", usage.line()), self.pretty)
                 );
             }
+            AgentEvent::BackgroundCompaction { phase, .. } => {
+                if !matches!(phase.as_str(), "running" | "ready") {
+                    eprintln!("[background compaction: {phase}]");
+                }
+            }
             AgentEvent::CompactStart => {}
             AgentEvent::CompactEnd {
                 before,
                 after,
                 summary,
+                ..
             } => {
                 if !summary.trim().is_empty() {
                     println!("{summary}");
@@ -3393,6 +3413,8 @@ struct OaiRequest<'a> {
     stream_options: Option<OaiStreamOptions>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<DeepSeekThinking>,
     /// llama.cpp GBNF extension. Only ever set for the local llama.cpp
     /// provider (cloud OpenAI rejects unknown fields), and only when the
     /// user opts in — see `llama_tool_call_grammar`.
@@ -3400,6 +3422,11 @@ struct OaiRequest<'a> {
     grammar: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     chat_template_kwargs: Option<OaiChatTemplateKwargs>,
+}
+
+#[derive(Serialize)]
+struct DeepSeekThinking {
+    r#type: &'static str,
 }
 
 #[derive(Serialize)]
@@ -9177,6 +9204,9 @@ async fn execute_bash_async_prepared(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    command
+        .env_remove("DEXT_TOOL_CALL_ID")
+        .env_remove("DEXT_SESSION_ID");
     for (key, value) in extra_env {
         command.env(key, value);
     }
@@ -9897,6 +9927,8 @@ async fn execute_builtin_call_for_context(
             _ => None,
         };
         let mut extra_env = pack_env;
+        extra_env.retain(|(name, _)| name != "DEXT_SESSION_ID");
+        extra_env.push(("DEXT_SESSION_ID".into(), session_id.unwrap_or_default()));
         if let Some(runtime) = git_cred_runtime.as_ref() {
             extra_env.extend(runtime.env.clone());
         }
@@ -10403,6 +10435,7 @@ fn summarize_call(name: &str, input: &Value) -> String {
 
 #[derive(Debug, Default, PartialEq, Eq)]
 struct ToolJournalRecovery {
+    replay_safe: usize,
     not_started: usize,
     uncertain: usize,
     recovered_terminal: usize,
@@ -10410,13 +10443,14 @@ struct ToolJournalRecovery {
 
 impl ToolJournalRecovery {
     fn total(&self) -> usize {
-        self.not_started + self.uncertain + self.recovered_terminal
+        self.replay_safe + self.not_started + self.uncertain + self.recovered_terminal
     }
 
     fn warning(&self) -> String {
         format!(
-            "[resume recovery] reconciled {} pending tool call(s): {} not started, {} uncertain, {} terminal with original output unavailable; no call was replayed",
+            "[resume recovery] reconciled {} pending tool call(s): {} replay safe, {} not started, {} uncertain, {} terminal with original output unavailable; no call was replayed",
             self.total(),
+            self.replay_safe,
             self.not_started,
             self.uncertain,
             self.recovered_terminal
@@ -10465,6 +10499,15 @@ fn reconcile_pending_tool_calls(
                 && entry.input_sha256 == input_sha256
         });
         let (content, status) = match matched.map(|entry| entry.status) {
+            _ if tools::is_replay_safe_tool(&tool_name) => {
+                recovery.replay_safe += 1;
+                (
+                    format!(
+                        "[resume recovery] {tool_name} was interrupted; it is safe to call again. Dext did not replay it."
+                    ),
+                    "replay_safe".to_string(),
+                )
+            }
             None => {
                 recovery.not_started += 1;
                 (
@@ -10643,6 +10686,7 @@ const DEFAULT_SYSTEM: &str = "You are dext, a terse coding CLI agent running loc
 - Bash calls are atomic: backgrounding/nohup/disown cannot persist; setsid is unsupported. Use an OS supervisor with a dext- unit for requested persistent services. Inspect stderr, validate external sources before scaling, and ask on auth failure.
 - Verify narrowly after changes. Final answers are terse: changes, tests, gaps.
 - Tables: one grouped table for related data; one physical line per row; plain cells without emoji, bold, unescaped `|`, or line breaks.
+- Diagrams: fenced mermaid; labels <24; flowchart, sequenceDiagram (no notes/loops), stateDiagram-v2.
 - Invoke requested packs directly. Reusable packs are user-global unless explicitly project-local.";
 
 const FRUGAL_TOOL_PROTOCOL_NOTE: &str = "Frugal workflow: never try to prefill the TUI input/composer. For nontrivial work, define small steps by required input and observable output; run independent reads in parallel, reuse verified results, and repair only the failed step.";
@@ -11084,11 +11128,22 @@ struct Hooks {
     post_tool: Vec<Hook>,
     #[serde(default)]
     user_prompt: Vec<Hook>,
+    #[serde(default)]
+    pre_request: Vec<Hook>,
+    #[serde(default)]
+    post_compact: Vec<Hook>,
+    #[serde(default)]
+    turn_end: Vec<Hook>,
 }
 
 impl Hooks {
     fn is_empty(&self) -> bool {
-        self.pre_tool.is_empty() && self.post_tool.is_empty() && self.user_prompt.is_empty()
+        self.pre_tool.is_empty()
+            && self.post_tool.is_empty()
+            && self.user_prompt.is_empty()
+            && self.pre_request.is_empty()
+            && self.post_compact.is_empty()
+            && self.turn_end.is_empty()
     }
 
     fn load(root: &Path) -> Self {
@@ -11112,6 +11167,9 @@ impl Hooks {
         self.pre_tool.extend(other.pre_tool);
         self.post_tool.extend(other.post_tool);
         self.user_prompt.extend(other.user_prompt);
+        self.pre_request.extend(other.pre_request);
+        self.post_compact.extend(other.post_compact);
+        self.turn_end.extend(other.turn_end);
     }
 
     fn fire(
@@ -11122,11 +11180,14 @@ impl Hooks {
         extra_env: &[(String, String)],
         root: &Path,
         sandbox_profile: SandboxProfile,
-    ) -> Vec<(String, i32)> {
+    ) -> Vec<(String, i32, String)> {
         let hooks: &[Hook] = match phase {
             "pre_tool" => &self.pre_tool,
             "post_tool" => &self.post_tool,
             "user_prompt" => &self.user_prompt,
+            "pre_request" => &self.pre_request,
+            "post_compact" => &self.post_compact,
+            "turn_end" => &self.turn_end,
             _ => return Vec::new(),
         };
         let mut out = Vec::new();
@@ -11139,10 +11200,33 @@ impl Hooks {
             }
             let bash = bash_executable_path();
             let write_scope = project_scope_root(root);
-            let sandboxed = match sandbox::std_command(&bash, sandbox_profile, &write_scope) {
+            let memo = env
+                .iter()
+                .find_map(|(name, value)| {
+                    (*name == "DEXT_SESSION_ID" && !value.is_empty()).then_some(*value)
+                })
+                .zip(
+                    env.iter()
+                        .find_map(|(name, value)| (*name == "DEXT_TOOL_CALL_ID").then_some(*value)),
+                )
+                .map(|(session, call)| seats::hook_memo_dir(root, session, call))
+                .transpose();
+            let memo = match memo {
+                Ok(memo) => memo,
+                Err(error) => {
+                    out.push((format!("prepare hook memo: {error:#}"), -1, String::new()));
+                    continue;
+                }
+            };
+            let sandboxed = match sandbox::hook_command(
+                &bash,
+                sandbox_profile,
+                &write_scope,
+                memo.as_deref(),
+            ) {
                 Ok(command) => command,
                 Err(error) => {
-                    out.push((format!("prepare hook sandbox: {error}"), -1));
+                    out.push((format!("prepare hook sandbox: {error}"), -1, String::new()));
                     continue;
                 }
             };
@@ -11152,11 +11236,29 @@ impl Hooks {
                 .arg("-c")
                 .arg(&h.command)
                 .current_dir(root);
+            cmd.env_remove("DEXT_SESSION_ID")
+                .env_remove("DEXT_TOOL_CALL_ID")
+                .env_remove("DEXT_HOOK_MEMO_DIR")
+                .env_remove("DEXT_HOOK_MEMO_BIN");
+            for (k, v) in extra_env {
+                if !matches!(
+                    k.as_str(),
+                    "DEXT_SESSION_ID"
+                        | "DEXT_TOOL_CALL_ID"
+                        | "DEXT_HOOK_MEMO_DIR"
+                        | "DEXT_HOOK_MEMO_BIN"
+                ) {
+                    cmd.env(k, v);
+                }
+            }
             for (k, v) in env {
                 cmd.env(k, v);
             }
-            for (k, v) in extra_env {
-                cmd.env(k, v);
+            if let Some(memo) = memo.as_ref() {
+                cmd.env("DEXT_HOOK_MEMO_DIR", memo);
+                if let Ok(executable) = std::env::current_exe() {
+                    cmd.env("DEXT_HOOK_MEMO_BIN", executable);
+                }
             }
             scrub_credentials_from_std_command_unconditionally(&mut cmd);
             match run_sync_command_limited_with_scratch(
@@ -11168,14 +11270,19 @@ impl Hooks {
                 scratch,
             ) {
                 Ok((stdout, stderr, code)) => {
+                    let stdout = stdout.render("hook stdout");
                     let combined = merge_process_output_with_status(
-                        stdout.render("hook stdout"),
+                        stdout.clone(),
                         stderr.render("hook stderr"),
                         code,
                     );
-                    out.push((combined, code));
+                    let continuing = phase == "turn_end" && code == 2 && !stdout.trim().is_empty();
+                    out.push((combined, code, stdout));
+                    if continuing {
+                        break;
+                    }
                 }
-                Err(e) => out.push((e, -1)),
+                Err(e) => out.push((e, -1, String::new())),
             }
         }
         out
@@ -11601,6 +11708,10 @@ const HELP_GROUPS: &[(&str, &[(&str, &str)])] = &[
                 "/compact [status|auto|N]",
                 "summarize older history or set the auto-compaction threshold",
             ),
+            (
+                "/compact background [on|off|status]",
+                "saved per-session background setting; regular compaction remains available",
+            ),
             ("/usage", "cumulative token usage this session"),
             ("/status", "runtime diagnostics (provider, auth, model)"),
             ("/tokens", "approximate tokens per message + top hogs"),
@@ -11894,6 +12005,8 @@ struct SessionHeader {
     compact_threshold_chars: Option<usize>,
     #[serde(default)]
     compact_threshold_percent: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    background_compact: Option<bool>,
     #[serde(default = "legacy_approval_profile")]
     approval_profile: ApprovalProfile,
     #[serde(default)]
@@ -11945,6 +12058,7 @@ impl Default for SessionHeader {
             reasoning_mode: ReasoningMode::default(),
             compact_threshold_chars: None,
             compact_threshold_percent: None,
+            background_compact: None,
             approval_profile: ApprovalProfile::default(),
             approval_policy_source: ApprovalPolicySource::default(),
             sandbox_profile: SandboxProfile::default(),
@@ -12579,6 +12693,26 @@ fn parse_compact_slash(line: &str) -> Option<Result<CompactSlash, &'static str>>
     }
     if arg.eq_ignore_ascii_case("auto") {
         return Some(Ok(CompactSlash::Auto));
+    }
+
+    let words = arg.split_whitespace().collect::<Vec<_>>();
+    if words
+        .first()
+        .is_some_and(|word| word.eq_ignore_ascii_case("background"))
+    {
+        return Some(match words.as_slice() {
+            [_] => Ok(CompactSlash::Background(None)),
+            [_, value] if value.eq_ignore_ascii_case("status") => {
+                Ok(CompactSlash::Background(None))
+            }
+            [_, value] if value.eq_ignore_ascii_case("on") => {
+                Ok(CompactSlash::Background(Some(true)))
+            }
+            [_, value] if value.eq_ignore_ascii_case("off") => {
+                Ok(CompactSlash::Background(Some(false)))
+            }
+            _ => Err("usage: /compact background [on|off|status]"),
+        });
     }
 
     let numeric = arg.strip_suffix('%').unwrap_or(arg).trim();
@@ -13796,6 +13930,7 @@ struct Agent {
     session_model_pins: HashMap<String, String>,
     partial_stream_text: Option<String>,
     quiet_stream_events: bool,
+    background: compaction::BackgroundState,
     compact_threshold_chars: Option<usize>,
     compact_threshold_percent: Option<u8>,
     context_window_tokens: u64,
@@ -14019,6 +14154,10 @@ impl Agent {
             session_model_pins: HashMap::new(),
             partial_stream_text: None,
             quiet_stream_events: false,
+            background: compaction::BackgroundState {
+                enabled: compaction::background_default(),
+                ..Default::default()
+            },
             compact_threshold_chars: compact_threshold_percent
                 .map(|percent| compact_threshold_chars_for_window(context_window_tokens, percent)),
             compact_threshold_percent,
@@ -14259,6 +14398,9 @@ impl Agent {
         previous_model: &str,
         previous_route: &str,
     ) -> bool {
+        if previous_route != self.provider_route_identity() {
+            self.invalidate_background("provider_route");
+        }
         if self.history.is_empty() || previous_route == self.provider_route_identity() {
             return false;
         }
@@ -14355,6 +14497,44 @@ impl Agent {
             && self.resolved_model_spec().is_none_or(|spec| spec.reasoning)
     }
 
+    fn deepseek_chat_enabled(&self) -> bool {
+        self.request_contract() == RequestContract::OpenAiChatCompletions
+            && provider::is_deepseek_provider(
+                &self.provider_id,
+                self.route_api_provider(),
+                &self.base_url,
+            )
+    }
+
+    fn reasoning_route_start(&self) -> usize {
+        self.history.iter().rposition(|message| {
+            message.role == "user" && message.content.iter().any(|block| {
+                matches!(block, Block::Text { text } if text.starts_with(PROVIDER_ROUTE_CONTINUATION_PREFIX))
+            })
+        }).map_or(0, |index| index + 1)
+    }
+
+    fn chat_reasoning_replay_start(&self) -> Option<usize> {
+        let has_tools = self.model_supports_tools()
+            && (!self.tools.is_empty()
+                || self
+                    .active_pack_runtime
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.all_tools().next().is_some()));
+        if self.deepseek_chat_enabled() && has_tools {
+            Some(self.reasoning_route_start())
+        } else if self.local_llama_reasoning_enabled() {
+            Some(
+                self.history
+                    .iter()
+                    .rposition(is_fresh_user_prompt_message)
+                    .unwrap_or(0),
+            )
+        } else {
+            None
+        }
+    }
+
     fn model_supports_tools(&self) -> bool {
         self.resolved_model_spec().is_none_or(|spec| spec.tools)
     }
@@ -14426,6 +14606,21 @@ impl Agent {
     /// a value they understand.
     fn oai_chat_reasoning_effort(&self, effort: ThinkingEffort) -> Option<String> {
         let resolved_spec = self.resolved_model_spec();
+        if self.deepseek_chat_enabled() {
+            let mapped = match effort {
+                ThinkingEffort::Off => return None,
+                ThinkingEffort::Minimal | ThinkingEffort::Low => ThinkingEffort::Low,
+                ThinkingEffort::Medium | ThinkingEffort::High | ThinkingEffort::XHigh => {
+                    ThinkingEffort::High
+                }
+                ThinkingEffort::Max => ThinkingEffort::Max,
+            };
+            return resolved_spec
+                .as_ref()
+                .filter(|spec| !spec.effort_levels.is_empty())
+                .and_then(|spec| map_effort_to_provider_levels(&spec.effort_levels, mapped))
+                .or_else(|| Some(mapped.as_str().to_string()));
+        }
         resolved_spec
             .as_ref()
             .filter(|spec| !spec.effort_levels.is_empty())
@@ -14727,6 +14922,9 @@ impl Agent {
         source: ApprovalPolicySource,
     ) -> usize {
         let profile_changed = self.approval_profile != profile;
+        if profile_changed {
+            self.invalidate_background("approval_policy");
+        }
         self.approval_policy_source = source;
         self.approval_profile = profile;
         let privileged: Vec<String> = self
@@ -14760,6 +14958,7 @@ impl Agent {
 
     fn set_sandbox_profile(&mut self, profile: SandboxProfile) {
         if self.sandbox_profile != profile {
+            self.invalidate_background("sandbox_policy");
             self.allowed.remove(HOOKS_APPROVAL_NAME);
             self.approved_pack_runtime = None;
             self.deactivate_pack_runtime();
@@ -14768,6 +14967,7 @@ impl Agent {
     }
 
     fn set_budget_cap(&mut self, cap: Option<BudgetCap>) {
+        self.invalidate_background("budget");
         self.budget_cap = cap;
         self.budget_exhausted = false;
     }
@@ -14785,6 +14985,7 @@ impl Agent {
     }
 
     fn note_runtime_model_change(&mut self, model: &str) -> Option<u64> {
+        self.invalidate_background("model");
         self.model = model.to_string();
         let provider_id = self.provider_id.clone();
         self.pin_model_for_provider(&provider_id, model);
@@ -15034,12 +15235,14 @@ impl Agent {
     }
 
     fn set_compact_threshold_auto(&mut self) {
+        self.invalidate_background("threshold");
         self.compact_threshold_chars = None;
         self.compact_threshold_percent = None;
         let _ = save_compact_threshold_percent_setting(None);
     }
 
     fn set_compact_threshold_percent(&mut self, percent: u8) -> usize {
+        self.invalidate_background("threshold");
         let percent = percent.clamp(1, 100);
         self.compact_threshold_chars = Some(compact_threshold_chars_for_window(
             self.context_window_tokens(),
@@ -15054,6 +15257,7 @@ impl Agent {
         if self.thinking_effort == effort {
             return false;
         }
+        self.invalidate_background("effort");
         self.thinking_effort = effort;
         true
     }
@@ -15062,16 +15266,19 @@ impl Agent {
         if self.reasoning_mode == mode {
             return false;
         }
+        self.invalidate_background("reasoning_mode");
         self.reasoning_mode = mode;
         true
     }
 
     fn cycle_reasoning_mode(&mut self) -> ReasoningMode {
+        self.invalidate_background("reasoning_mode");
         self.reasoning_mode = self.reasoning_mode.cycle();
         self.reasoning_mode
     }
 
     fn cycle_thinking_effort(&mut self, step: i8) -> ThinkingEffort {
+        self.invalidate_background("effort");
         self.thinking_effort = self.thinking_effort.cycle(step);
         self.thinking_effort
     }
@@ -15155,6 +15362,7 @@ impl Agent {
     fn adopt_session_id(&mut self, session_id: String) -> Result<()> {
         let lock = SessionStateLock::acquire(&self.sandbox_root, &session_id)
             .with_context(|| format!("resuming session state '{session_id}'"))?;
+        self.retire_background_session("session_identity")?;
         self.session_id = session_id;
         self.state_lock = Some(Arc::new(lock));
         self.refresh_state_paths();
@@ -15186,6 +15394,7 @@ impl Agent {
         };
         git_checkpoints::normalize_existing_checkpoint_storage(&root)
             .map_err(anyhow::Error::msg)?;
+        self.retire_background_session("sandbox")?;
 
         let root_changed = self.sandbox_root != root;
         let project_changed = project_key(&self.sandbox_root) != project_key(&root);
@@ -16662,6 +16871,9 @@ impl Agent {
     }
 
     fn set_context_mode_automatic(&mut self, mode: ContextMode) {
+        if self.context_mode != mode {
+            self.invalidate_background("context_mode");
+        }
         self.context_mode = mode;
     }
 
@@ -16730,7 +16942,7 @@ impl Agent {
             .iter()
             .rposition(is_fresh_user_prompt_message)
             .unwrap_or(0);
-        let preserve_local_reasoning = self.local_llama_reasoning_enabled();
+        let reasoning_replay_start = self.chat_reasoning_replay_start();
         let valid_ids = Self::tool_use_ids_in_messages(history);
         let interrupt = Some(self.interrupt.as_ref());
         let current_image_target = self.image_disclosure_target();
@@ -16866,9 +17078,9 @@ impl Agent {
                     } else {
                         None
                     };
-                    let reasoning_content = (preserve_local_reasoning
-                        && message_index >= current_turn_start)
-                        .then(|| {
+                    let reasoning_content = reasoning_replay_start
+                        .filter(|start| message_index >= *start)
+                        .map(|_| {
                             m.content
                                 .iter()
                                 .filter_map(|block| match block {
@@ -16877,8 +17089,7 @@ impl Agent {
                                     }
                                     _ => None,
                                 })
-                                .collect::<Vec<_>>()
-                                .join("\n")
+                                .collect::<String>()
                         })
                         .filter(|reasoning| !reasoning.is_empty());
                     let content = if texts.is_empty() {
@@ -17239,6 +17450,11 @@ impl Agent {
                     &tool_names,
                     env_flag_default(LLAMA_TOOL_GRAMMAR_ENV, false),
                 );
+                let max_output_tokens = if self.deepseek_chat_enabled() {
+                    max_output_tokens.min(393_216)
+                } else {
+                    max_output_tokens
+                };
                 let (max_tokens, max_completion_tokens) =
                     oai_output_token_caps(&self.provider_id, &self.model, max_output_tokens);
                 let body = OaiRequest {
@@ -17250,6 +17466,13 @@ impl Agent {
                     stream: true,
                     stream_options,
                     reasoning_effort,
+                    thinking: self.deepseek_chat_enabled().then_some(DeepSeekThinking {
+                        r#type: if effort == ThinkingEffort::Off {
+                            "disabled"
+                        } else {
+                            "enabled"
+                        },
+                    }),
                     grammar,
                     chat_template_kwargs: local_llama.then_some(OaiChatTemplateKwargs {
                         enable_thinking: effort != ThinkingEffort::Off,
@@ -17453,6 +17676,7 @@ impl Agent {
             reasoning_mode: self.reasoning_mode,
             compact_threshold_chars: self.compact_threshold_override(),
             compact_threshold_percent: self.compact_threshold_override_percent(),
+            background_compact: Some(self.background.enabled),
             approval_profile: self.approval_profile,
             approval_policy_source: self.approval_policy_source,
             sandbox_profile: self.sandbox_profile,
@@ -17588,6 +17812,8 @@ impl Agent {
                 | "after_pack_runtime_idle"
                 | "after_pack_runtime_continue"
                 | "after_pack_runtime_continue_cancel"
+                | "after_turn_end_continue"
+                | "after_pre_request_hooks"
         );
         if !critical
             && let Some(last) = self.last_checkpoint_at
@@ -17644,11 +17870,12 @@ impl Agent {
             system,
             allowed: _saved_allowed,
             sandbox,
-            usage,
+            mut usage,
             thinking_effort,
             reasoning_mode,
             compact_threshold_chars,
             compact_threshold_percent,
+            background_compact,
             approval_profile: _saved_approval_profile,
             approval_policy_source: _saved_approval_policy_source,
             sandbox_profile: _saved_sandbox_profile,
@@ -17682,6 +17909,11 @@ impl Agent {
                     .with_context(|| format!("restoring saved sandbox {saved_sandbox}"))
             })
             .transpose()?;
+        if let Some(root) = &restored_sandbox
+            && !std::fs::metadata(root)?.is_dir()
+        {
+            anyhow::bail!("sandbox root is not a directory: {}", root.display());
+        }
         if seat.is_some() && restored_sandbox.is_none() {
             anyhow::bail!("seated session is missing project sandbox provenance");
         }
@@ -17785,6 +18017,18 @@ impl Agent {
             }
         }
 
+        let reloading_current = (self.background.job.is_some()
+            || self.background.retirement_usage_pending)
+            && std::fs::canonicalize(path).is_ok_and(|source| {
+                std::fs::canonicalize(&self.latest_session_path)
+                    .is_ok_and(|current| source == current)
+            })
+            && saved_session_id.as_deref() == Some(self.session_id.as_str())
+            && runtime_root == self.sandbox_root;
+        self.retire_background_session("session_load")?;
+        if reloading_current {
+            usage = self.session_usage;
+        }
         if let Some(restored) = restored_sandbox {
             self.set_sandbox_root(restored)?;
         }
@@ -17820,12 +18064,21 @@ impl Agent {
             && provider_id == saved_provider_id
             && self.api_provider == provenance.api_provider
         {
-            self.model = model;
+            self.model = if self.deepseek_chat_enabled() {
+                self.provider_profile
+                    .as_ref()
+                    .map_or(model.clone(), |profile| {
+                        normalize_provider_model_value(profile, &model)
+                    })
+            } else {
+                model
+            };
         }
         self.refresh_context_window();
         self.system = system;
         self.allowed.clear();
         self.session_usage = usage;
+        self.background.enabled = background_compact.unwrap_or_else(compaction::background_default);
         self.thinking_effort = thinking_effort;
         self.reasoning_mode = reasoning_mode;
         self.compact_threshold_percent =
@@ -17910,6 +18163,7 @@ impl Agent {
                 self.last_checkpoint_signature = Some((self.history.len(), self.history_chars()));
             }
         }
+        self.emit_background_compaction_setting();
         Ok(path.to_path_buf())
     }
 
@@ -17929,6 +18183,7 @@ impl Agent {
     }
 
     fn rewrite_latest_tool_results_as_text_fallback(&mut self) -> bool {
+        self.invalidate_background("tool_result_rewrite");
         let Some(last) = self.history.last_mut() else {
             return false;
         };
@@ -17974,12 +18229,7 @@ impl Agent {
     }
 
     fn history_chars(&self) -> usize {
-        let current_turn_start = self
-            .history
-            .iter()
-            .rposition(is_fresh_user_prompt_message)
-            .unwrap_or(0);
-        let preserve_current_thinking = self.local_llama_reasoning_enabled();
+        let reasoning_replay_start = self.chat_reasoning_replay_start();
         self.history
             .iter()
             .enumerate()
@@ -17989,13 +18239,12 @@ impl Agent {
                     .map(|b| match b {
                         Block::Text { text } | Block::PartialStream { text } => text.len(),
                         Block::Thinking { text, .. }
-                            if preserve_current_thinking && message_index >= current_turn_start =>
+                            if reasoning_replay_start
+                                .is_some_and(|start| message_index >= start) =>
                         {
                             text.len()
                         }
-                        // Prior-turn thinking is stripped at serialization time,
-                        // so only local reasoning replayed in the active tool loop
-                        // contributes to request-size compaction.
+                        // Count exactly the Chat reasoning eligible for wire replay.
                         Block::Thinking { .. } | Block::RedactedThinking { .. } => 0,
                         Block::ResponsesReasoning { item } => json_byte_len(item),
                         Block::ToolUse { input, .. } => json_byte_len(input),
@@ -18191,10 +18440,24 @@ impl Agent {
 
         let mut summary_msgs: Vec<Message> = Vec::new();
         let mut preserved_tool_msgs: Vec<Message> = Vec::new();
+        let reasoning_replay_start = self
+            .deepseek_chat_enabled()
+            .then(|| self.reasoning_route_start());
 
         for (idx, msg) in old.iter().enumerate() {
             if keep_set.contains(&idx) {
-                preserved_tool_msgs.push(msg.clone());
+                let mut preserved = msg.clone();
+                if reasoning_replay_start.is_some_and(|start| idx < start) {
+                    preserved.content.retain(|block| {
+                        !matches!(
+                            block,
+                            Block::Thinking { .. }
+                                | Block::RedactedThinking { .. }
+                                | Block::ResponsesReasoning { .. }
+                        )
+                    });
+                }
+                preserved_tool_msgs.push(preserved);
                 continue;
             }
 
@@ -18308,36 +18571,135 @@ impl Agent {
         }
     }
 
-    async fn send_responses_summary_request(
+    fn prepare_summary_request(
         &self,
-        contract: RequestContract,
-        body: &Value,
-    ) -> Result<reqwest::Response> {
-        let url = provider_request_url(&self.base_url, contract);
-        let bytes = serde_json::to_vec(body).map_err(|error| anyhow::anyhow!(error))?;
-        let req = apply_provider_headers(
-            self.provider_post(&url)?
-                .header("content-type", "application/json")
-                .header("accept", "text/event-stream")
-                .body(bytes),
+        old: &[Message],
+        evidence: &str,
+    ) -> Result<compaction::SummaryRequest> {
+        let transcript = render_transcript_for_summary(old, self.context_mode);
+        let user_text = self
+            .privacy
+            .redact_text(&compaction_user_text_with_evidence(&transcript, evidence))
+            .text;
+        let model = self.compact_summary_model();
+        let contract = self.request_contract_for_model(&model);
+        let effort = contract
+            .is_responses()
+            .then(|| self.responses_reasoning_effort_for_model(&model, ThinkingEffort::Low))
+            .flatten();
+        let thinking = effort.is_some()
+            || glm_forced_thinking_effort(&self.provider_id, &model, ThinkingEffort::Low).is_some()
+            || anthropic_required_adaptive_effort(&self.provider_id, &model, ThinkingEffort::Low)
+                .is_some();
+        let max_tokens = compact_summary_max_tokens(self.thinking_effort, thinking);
+        let bytes = if contract.is_responses() {
+            serde_json::to_vec(&build_responses_summary_body(
+                contract,
+                &model,
+                &user_text,
+                effort.as_deref(),
+                self.reasoning_mode_for_model(&model),
+                max_tokens,
+            ))?
+        } else if contract == RequestContract::OpenAiChatCompletions {
+            let (max_tokens, max_completion_tokens) =
+                oai_output_token_caps(&self.provider_id, &model, max_tokens);
+            serde_json::to_vec(&OaiRequest {
+                model: &model,
+                max_tokens,
+                max_completion_tokens,
+                messages: vec![
+                    OaiMessage {
+                        role: "system".into(),
+                        content: Some(Value::String(COMPACT_SYSTEM.into())),
+                        reasoning_content: None,
+                        tool_calls: None,
+                        tool_call_id: None,
+                    },
+                    OaiMessage {
+                        role: "user".into(),
+                        content: Some(Value::String(user_text.clone())),
+                        reasoning_content: None,
+                        tool_calls: None,
+                        tool_call_id: None,
+                    },
+                ],
+                tools: Vec::new(),
+                stream: false,
+                stream_options: None,
+                reasoning_effort: None,
+                thinking: self
+                    .deepseek_chat_enabled()
+                    .then_some(DeepSeekThinking { r#type: "disabled" }),
+                grammar: None,
+                chat_template_kwargs: compact_summary_chat_template_kwargs(
+                    &self.provider_id,
+                    self.route_api_provider(),
+                    &self.base_url,
+                ),
+            })?
+        } else {
+            self.build_anthropic_summary_request(&model, &user_text, max_tokens)?
+        };
+        if bytes.len() > PROVIDER_JSON_BODY_CAP {
+            anyhow::bail!("summary request exceeded byte limit");
+        }
+        let mut builder = self
+            .provider_post(provider_request_url(&self.base_url, contract))?
+            .header("content-type", "application/json")
+            .body(bytes);
+        if contract.is_responses() {
+            builder = builder.header("accept", "text/event-stream");
+        }
+        let subscription =
+            contract == RequestContract::AnthropicMessages && self.anthropic_subscription_active();
+        let request = apply_provider_headers(
+            builder,
             contract,
             &self.api_key,
             self.provider_profile
                 .as_ref()
                 .is_some_and(|profile| is_official_kimi_profile(profile, &self.base_url)),
+            subscription,
             false,
-            false,
-            None,
-        )?;
-        let resp = send_provider_request(req, self.first_byte_timeout()).await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = read_provider_error_body(resp, self.stream_idle_timeout())
-                .await
-                .unwrap_or_else(|error| format!("[provider error body unavailable: {error}]"));
-            anyhow::bail!("summary {}", http_status_error(status, &text));
-        }
-        Ok(resp)
+            subscription.then_some(self.claude_session_id.as_str()),
+        )?
+        .build()?;
+        let pricing = self
+            .provider_profile
+            .as_ref()
+            .and_then(|profile| resolve_model_spec(profile, &model).pricing)
+            .as_ref()
+            .map_or_else(
+                || {
+                    usage_pricing_for(
+                        &self.provider_id,
+                        contract.api_provider(),
+                        &self.base_url,
+                        &model,
+                    )
+                },
+                |pricing| usage_pricing_from_env(UsagePricing::from(pricing)),
+            );
+        let override_wire_cost = provider_cost_estimate_overrides_wire_cost(
+            &self.provider_id,
+            contract.api_provider(),
+            &model,
+        );
+        Ok(compaction::SummaryRequest {
+            client: self.http_client().clone(),
+            request,
+            contract,
+            first_byte: self.first_byte_timeout(),
+            idle: self.stream_idle_timeout(),
+            provider: self.provider_id.clone(),
+            model,
+            pricing,
+            pricing_override: pricing_env_override_is_set(),
+            override_wire_cost,
+            input_tokens: (user_text.len() as u64).div_ceil(4).max(1),
+            speculative: false,
+        })
     }
 
     async fn one_shot_summary(
@@ -18345,270 +18707,39 @@ impl Agent {
         old: &[Message],
         evidence: &str,
     ) -> Result<(String, Usage)> {
-        // Responses-contract summaries reuse the shared streaming reader, which
-        // forwards deltas/blocks to the UI sink. Mute those events so every
-        // provider presents the summary exactly once through CompactEnd
-        // instead of some providers leaking it as live assistant output.
-        self.quiet_stream_events = true;
-        let result = self.one_shot_summary_request(old, evidence).await;
-        self.quiet_stream_events = false;
-        result
-    }
-
-    async fn one_shot_summary_request(
-        &mut self,
-        old: &[Message],
-        evidence: &str,
-    ) -> Result<(String, Usage)> {
-        let transcript = render_transcript_for_summary(old, self.context_mode);
-        let user_text = compaction_user_text_with_evidence(&transcript, evidence);
-        let summary_model = self.compact_summary_model();
-
-        #[derive(PartialEq, Eq)]
-        enum SummaryParse {
-            Anthropic,
-            OpenAi,
-            Responses(RequestContract),
-        }
-
-        let summary_contract = self.request_contract_for_model(&summary_model);
-        let is_responses_summary = summary_contract.is_responses();
-        let summary_reasoning_effort = is_responses_summary
-            .then(|| self.responses_reasoning_effort_for_model(&summary_model, ThinkingEffort::Low))
-            .flatten();
-        let summary_reasoning_enabled = summary_reasoning_effort.is_some()
-            || glm_forced_thinking_effort(&self.provider_id, &summary_model, ThinkingEffort::Low)
-                .is_some()
-            || anthropic_required_adaptive_effort(
-                &self.provider_id,
-                &summary_model,
-                ThinkingEffort::Low,
-            )
-            .is_some();
-        let summary_max_tokens =
-            compact_summary_max_tokens(self.thinking_effort, summary_reasoning_enabled);
-        let summary_reasoning_mode = self.reasoning_mode_for_model(&summary_model);
-        let make_responses_summary_body = || {
-            build_responses_summary_body(
-                summary_contract,
-                &summary_model,
-                &user_text,
-                summary_reasoning_effort.as_deref(),
-                summary_reasoning_mode,
-                summary_max_tokens,
-            )
+        let request = self.prepare_summary_request(old, evidence)?;
+        let mut worker = compaction::SummaryWorker::spawn(request, None);
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(25));
+        let result = loop {
+            if self.interrupt.load(Ordering::SeqCst) {
+                worker.cancel.store(true, Ordering::SeqCst);
+            }
+            tokio::select! {
+                result = &mut worker.task => break result.context("summary worker join")?,
+                _ = tick.tick() => {}
+            }
         };
-        let (mut resp, parse_mode): (reqwest::Response, SummaryParse) = if is_responses_summary {
-            let body = make_responses_summary_body();
-            (
-                self.send_responses_summary_request(summary_contract, &body)
-                    .await?,
-                SummaryParse::Responses(summary_contract),
-            )
-        } else if summary_contract == RequestContract::OpenAiChatCompletions {
-            let reasoning_effort = None;
-            let messages = vec![
-                OaiMessage {
-                    role: "system".to_string(),
-                    content: Some(Value::String(COMPACT_SYSTEM.to_string())),
-                    reasoning_content: None,
-                    tool_calls: None,
-                    tool_call_id: None,
-                },
-                OaiMessage {
-                    role: "user".to_string(),
-                    content: Some(Value::String(user_text.clone())),
-                    reasoning_content: None,
-                    tool_calls: None,
-                    tool_call_id: None,
-                },
-            ];
-            let (max_tokens, max_completion_tokens) =
-                oai_output_token_caps(&self.provider_id, &summary_model, summary_max_tokens);
-            let body = OaiRequest {
-                model: &summary_model,
-                max_tokens,
-                max_completion_tokens,
-                messages,
-                tools: Vec::new(),
-                stream: false,
-                stream_options: None,
-                reasoning_effort,
-                grammar: None,
-                chat_template_kwargs: compact_summary_chat_template_kwargs(
-                    &self.provider_id,
-                    self.route_api_provider(),
-                    &self.base_url,
-                ),
-            };
-            let mut req = self
-                .provider_post(provider_request_url(&self.base_url, summary_contract))?
-                .header("content-type", "application/json")
-                .json(&body);
-            if !self.api_key.trim().is_empty() {
-                req = req.header("authorization", format!("Bearer {}", self.api_key));
-            }
-            (
-                send_provider_request(req, self.first_byte_timeout()).await?,
-                SummaryParse::OpenAi,
-            )
-        } else {
-            let anthropic_subscription = self.anthropic_subscription_active();
-            let bytes = self.build_anthropic_summary_request(
-                &summary_model,
-                &user_text,
-                summary_max_tokens,
-            )?;
-            let req = apply_provider_headers(
-                self.provider_post(provider_request_url(&self.base_url, summary_contract))?
-                    .header("content-type", "application/json")
-                    .body(bytes),
-                summary_contract,
-                &self.api_key,
-                self.provider_profile
-                    .as_ref()
-                    .is_some_and(|profile| is_official_kimi_profile(profile, &self.base_url)),
-                anthropic_subscription,
-                false,
-                anthropic_subscription.then_some(self.claude_session_id.as_str()),
-            )?;
-            (
-                send_provider_request(req, self.first_byte_timeout()).await?,
-                SummaryParse::Anthropic,
-            )
-        };
-
-        let status = resp.status();
-        if !status.is_success() {
-            let text = read_provider_error_body(resp, self.stream_idle_timeout())
-                .await
-                .unwrap_or_else(|error| format!("[provider error body unavailable: {error}]"));
-            anyhow::bail!("summary {}", http_status_error(status, &text));
+        let accounting = worker.accounting.lock().unwrap_or_else(|e| e.into_inner());
+        for (attempt, wait_secs, reason) in &accounting.retries {
+            self.sink.emit(AgentEvent::HttpRetry {
+                attempt: *attempt,
+                wait_secs: *wait_secs,
+                reason: reason.clone(),
+            });
         }
-
-        let responses_contract = match parse_mode {
-            SummaryParse::Responses(contract) => Some(contract),
-            _ => None,
-        };
-        if let Some(responses_contract) = responses_contract {
-            let mut attempt = 0u32;
-            let mut summary_usage = Usage::default();
-            loop {
-                attempt += 1;
-                match self.read_stream_responses(resp, responses_contract).await {
-                    Ok(ParsedProviderStream {
-                        blocks,
-                        stop_reason,
-                        mut usage,
-                        ..
-                    }) => {
-                        let fallback_input =
-                            ((user_text.len() as u64).saturating_add(3) / 4).max(1);
-                        Self::fill_missing_usage_metrics(&mut usage, fallback_input, &blocks);
-                        self.finalize_usage_metrics_for_model(&mut usage, &summary_model);
-                        summary_usage.add(usage);
-                        if let Some(reason) =
-                            chatgpt_incomplete_reason(responses_contract, stop_reason.as_deref())
-                        {
-                            let incomplete = format!("summary response was incomplete ({reason})");
-                            if reason == "content_filter" {
-                                anyhow::bail!(incomplete);
-                            }
-                            if attempt >= MAX_STREAM_ATTEMPTS {
-                                anyhow::bail!(
-                                    "{incomplete} after {attempt} attempts; provider kept truncating compaction summaries"
-                                );
-                            }
-                            self.append_latest_log(
-                                "summary_stream_retry",
-                                &format!(
-                                    "attempt={attempt} kind=incomplete reason={reason} wait=0s"
-                                ),
-                            );
-                            self.sink.emit(AgentEvent::HttpRetry {
-                                attempt,
-                                wait_secs: 0,
-                                reason: format!("incomplete summary response ({reason})"),
-                            });
-                            let body = make_responses_summary_body();
-                            resp = self
-                                .send_responses_summary_request(responses_contract, &body)
-                                .await?;
-                            continue;
-                        }
-                        let text = blocks
-                            .into_iter()
-                            .filter_map(|b| match b {
-                                Block::Text { text } | Block::PartialStream { text } => Some(text),
-                                _ => None,
-                            })
-                            .collect::<Vec<_>>()
-                            .join("");
-                        if text.trim().is_empty() {
-                            anyhow::bail!("summary response had no text blocks");
-                        }
-                        return Ok((text, summary_usage));
-                    }
-                    Err(e) => {
-                        let body = stream_error_body(&e);
-                        let plan = orchestrator::classify_stream_error(&body);
-                        if plan.retry && attempt < MAX_STREAM_ATTEMPTS {
-                            let wait = jittered_backoff_secs(1u64 << (attempt - 1));
-                            self.append_latest_log(
-                                "summary_stream_retry",
-                                &format!(
-                                    "attempt={attempt} kind={} wait={wait}s body={body}",
-                                    plan.label()
-                                ),
-                            );
-                            self.sink.emit(AgentEvent::HttpRetry {
-                                attempt,
-                                wait_secs: wait,
-                                reason: format!("{} summary stream error", plan.label()),
-                            });
-                            let _ = self.interrupt_aware_sleep(wait).await;
-                            let body = make_responses_summary_body();
-                            resp = self
-                                .send_responses_summary_request(responses_contract, &body)
-                                .await?;
-                            continue;
-                        }
-                        anyhow::bail!(body);
-                    }
-                }
-            }
+        let mut usage = accounting.usage;
+        usage.add(accounting.inflight);
+        if accounting.unknown || accounting.inflight_open {
+            self.append_latest_log("summary_usage_unknown", "blocking_summary");
         }
-
-        let json = read_provider_json_body(resp, self.stream_idle_timeout()).await?;
-        match parse_mode {
-            SummaryParse::Responses(_) => unreachable!("handled above"),
-            SummaryParse::OpenAi => {
-                let text = openai_summary_text_from_response(&json)?;
-                let mut usage = Usage::parse_openai(&json["usage"]);
-                self.finalize_usage_metrics_for_model(&mut usage, &summary_model);
-                Ok((text, usage))
-            }
-            SummaryParse::Anthropic => {
-                let text = json["content"]
-                    .as_array()
-                    .and_then(|arr| {
-                        arr.iter().find_map(|b| {
-                            if b["type"] == "text" {
-                                b["text"].as_str().map(String::from)
-                            } else {
-                                None
-                            }
-                        })
-                    })
-                    .unwrap_or_default();
-                if text.trim().is_empty() {
-                    anyhow::bail!("summary response had no text");
-                }
-                let mut usage = Usage::parse(&json["usage"]);
-                self.finalize_usage_metrics_for_model(&mut usage, &summary_model);
-                Ok((text, usage))
-            }
+        if result.is_err() {
+            self.session_usage.add(usage);
+            self.sink.emit(AgentEvent::UsageUpdate {
+                turn: Usage::default(),
+                session: self.session_usage,
+            });
         }
+        Ok((result?, usage))
     }
 
     #[cfg(test)]
@@ -18626,13 +18757,18 @@ impl Agent {
         threshold_chars: usize,
         checkpoint_label: &str,
     ) -> bool {
+        let applied = self
+            .service_background(self.history_chars() > threshold_chars)
+            .await;
         if self.history_chars() <= threshold_chars {
-            return false;
+            return applied;
         }
         let before_len = self.history.len();
         let before_chars = self.history_chars();
         let compacted = match self.compact().await {
-            Ok(()) => self.history.len() != before_len || self.history_chars() < before_chars,
+            Ok(()) => {
+                applied || self.history.len() != before_len || self.history_chars() < before_chars
+            }
             Err(_) => {
                 self.sink
                     .emit(AgentEvent::Info("[continuing without compaction]".into()));
@@ -18668,6 +18804,8 @@ impl Agent {
     }
 
     async fn compact(&mut self) -> Result<()> {
+        self.settle_background("blocking_or_manual").await;
+        self.background.history_epoch = self.background.history_epoch.wrapping_add(1);
         let Some(split) = self.find_compact_split() else {
             self.sink
                 .emit(AgentEvent::Info("[compact: nothing to compact yet]".into()));
@@ -18675,7 +18813,10 @@ impl Agent {
         };
         self.sink.emit(AgentEvent::CompactStart);
         let before = self.history.len();
-        let result = self.compact_after_start(split, before).await;
+        let result = self
+            .compact_after_start(split, before)
+            .await
+            .map_err(|error| anyhow::anyhow!(self.privacy.redact_text(&format!("{error:#}")).text));
         if let Err(e) = &result {
             let message = format!("{e:#}");
             self.append_latest_log("compact_failed", &message);
@@ -18702,10 +18843,13 @@ impl Agent {
         } else {
             match self.one_shot_summary(&summary_input, &evidence).await {
                 Ok(v) => v,
-                Err(e) if !evidence.trim().is_empty() => {
-                    let msg = format!(
-                        "summary model failed; using deterministic compaction evidence: {e:#}"
-                    );
+                Err(e) if !self.interrupt.load(Ordering::SeqCst) && !evidence.trim().is_empty() => {
+                    let msg = self
+                        .privacy
+                        .redact_text(&format!(
+                            "summary model failed; using deterministic compaction evidence: {e:#}"
+                        ))
+                        .text;
                     self.append_latest_log("compact_summary_fallback", &msg);
                     self.sink
                         .emit(AgentEvent::Warn(format!("[compact fallback] {msg}")));
@@ -18719,9 +18863,22 @@ impl Agent {
         };
         self.session_usage.add(usage);
         self.ensure_session_usage_cost();
+        let summary = self.privacy.redact_text(&summary).text;
 
-        self.history =
+        let candidate =
             build_compacted_history(&summary, preserved_tool_msgs, &self.history[split..]);
+        if !Self::history_pairs_closed(&candidate) {
+            anyhow::bail!("compacted history contains unpaired tool calls");
+        }
+        let old = std::mem::replace(&mut self.history, candidate);
+        if self.session_enabled
+            && let Err(error) = self.save_latest_session()
+        {
+            self.history = old;
+            return Err(error).context("persisting compacted history before application");
+        }
+        self.last_checkpoint_at = Some(std::time::Instant::now());
+        self.last_checkpoint_signature = Some((self.history.len(), self.history_chars()));
 
         let compacted_chars = self.history_chars();
         let compacted_tokens = self.estimated_context_tokens_from_history();
@@ -18734,11 +18891,38 @@ impl Agent {
         self.sink.emit(AgentEvent::CompactEnd {
             before,
             after,
-            summary,
+            summary: summary.clone(),
+            job_id: None,
+            background: false,
         });
         self.append_latest_log("compact_complete", &format!("{before} -> {after} messages"));
-        self.checkpoint_latest_session("after_compact");
+        self.post_compact_hooks(&summary);
         Ok(())
+    }
+
+    fn post_compact_hooks(&mut self, summary: &str) {
+        if !self.hooks.post_compact.is_empty() && hooks_approved(self) {
+            let hook_summary = self.privacy.redact_text(summary).text;
+            let hook_env = [
+                ("DEXT_SESSION_ID", self.session_id.as_str()),
+                ("DEXT_COMPACT_SUMMARY", hook_summary.as_str()),
+            ];
+            for (out, code, _) in self.hooks.fire(
+                "post_compact",
+                "",
+                &hook_env,
+                &self.pack_hook_env,
+                &self.sandbox_root,
+                self.sandbox_profile(),
+            ) {
+                if !out.trim().is_empty() || code != 0 {
+                    self.sink.emit(AgentEvent::Info(format!(
+                        "[hook:post_compact exit={code}] {}",
+                        self.privacy.redact_text(out.trim()).text
+                    )));
+                }
+            }
+        }
     }
 
     async fn chat(&mut self, user_input: String) -> Result<()> {
@@ -18757,6 +18941,7 @@ impl Agent {
         self.append_latest_log("chat_start", &format!("chars={}", user_input.len()));
         let result = self.chat_inner(user_input, explicit_pack).await;
         if result.is_err() {
+            self.settle_background("turn_error_or_interrupt").await;
             let interrupted = self.interrupt.load(Ordering::SeqCst);
             if interrupted {
                 self.sink.emit(AgentEvent::Interrupted);
@@ -18833,7 +19018,7 @@ impl Agent {
         }
         let hook_env = [("DEXT_USER_INPUT", user_input.as_str())];
         if hooks_approved {
-            for (out, _code) in self.hooks.fire(
+            for (out, _code, _) in self.hooks.fire(
                 "user_prompt",
                 "",
                 &hook_env,
@@ -18898,6 +19083,7 @@ impl Agent {
         let mut action_contract_no_mutation_turns: u32 = 0;
         let mut implementation_fallback_emitted = false;
         let mut last_retry_reason: Option<String> = None;
+        let mut hook_continuations = 0u32;
         let mut workaround_fired_this_turn = false;
 
         self.set_work_phase(turn_state.phase().label());
@@ -18976,6 +19162,57 @@ impl Agent {
                 continue;
             }
 
+            if hooks_approved && !self.hooks.pre_request.is_empty() {
+                let hook_env = [
+                    ("DEXT_SESSION_ID", self.session_id.as_str()),
+                    ("DEXT_TURN_ID", turn_id.as_str()),
+                ];
+                for (out, code, _) in self.hooks.fire(
+                    "pre_request",
+                    "",
+                    &hook_env,
+                    &self.pack_hook_env,
+                    &self.sandbox_root,
+                    self.sandbox_profile(),
+                ) {
+                    if code != 0 {
+                        anyhow::bail!(
+                            "pre_request hook blocked (exit {code}): {}",
+                            self.privacy.redact_text(&out).text
+                        );
+                    }
+                    if !out.trim().is_empty() {
+                        self.history.push(Message {
+                            role: "user".into(),
+                            content: vec![Block::Text {
+                                text: format!(
+                                    "[hook:pre_request]\n{}",
+                                    self.privacy.redact_text(out.trim()).text
+                                ),
+                            }],
+                        });
+                    }
+                }
+                self.checkpoint_latest_session("after_pre_request_hooks");
+            }
+            compacted_this_turn |= self.service_background(false).await;
+            if self.history_chars() > self.active_compact_threshold_chars() {
+                compacted_this_turn |= self
+                    .compact_if_over_threshold(
+                        self.active_compact_threshold_chars(),
+                        "before_headroom_request",
+                    )
+                    .await;
+                if self.history_chars() > self.active_compact_threshold_chars() {
+                    anyhow::bail!("context headroom exhausted after bounded compaction");
+                }
+            }
+            if self.background.enabled
+                && let Err(error) = self.start_background(&turn_id)
+            {
+                self.append_latest_log("background_prepare_failed", &error.to_string());
+                self.background.cooldown = Some(std::time::Instant::now());
+            }
             let chatgpt_session_id = self.request_contract().is_responses().then(|| {
                 format!(
                     "dext-{}-{}",
@@ -19593,6 +19830,53 @@ impl Agent {
                         continue;
                     }
                 }
+                if hooks_approved
+                    && !self.hooks.turn_end.is_empty()
+                    && !self.interrupt.load(Ordering::SeqCst)
+                {
+                    let hook_env = [
+                        ("DEXT_SESSION_ID", self.session_id.as_str()),
+                        ("DEXT_TURN_ID", turn_id.as_str()),
+                    ];
+                    let results = self.hooks.fire(
+                        "turn_end",
+                        "",
+                        &hook_env,
+                        &self.pack_hook_env,
+                        &self.sandbox_root,
+                        self.sandbox_profile(),
+                    );
+                    if let Some((_, _, prompt)) = results
+                        .iter()
+                        .find(|(_, code, stdout)| *code == 2 && !stdout.trim().is_empty())
+                    {
+                        if hook_continuations < 8 {
+                            hook_continuations += 1;
+                            self.history.push(Message {
+                                role: "user".into(),
+                                content: vec![Block::Text {
+                                    text: format!(
+                                        "[hook:turn_end]\n{}",
+                                        self.privacy.redact_text(prompt.trim()).text
+                                    ),
+                                }],
+                            });
+                            self.checkpoint_latest_session("after_turn_end_continue");
+                            continue;
+                        }
+                        self.sink.emit(AgentEvent::Warn(
+                            "turn_end hook continuation limit (8) reached".into(),
+                        ));
+                    }
+                    for (out, code, _) in results {
+                        if code != 0 && code != 2 {
+                            self.sink.emit(AgentEvent::Warn(format!(
+                                "turn_end hook failed (exit {code}): {}",
+                                self.privacy.redact_text(&out).text
+                            )));
+                        }
+                    }
+                }
                 self.append_latest_log(
                     "chat_response_complete",
                     "assistant replied without tool calls",
@@ -19772,6 +20056,7 @@ impl Agent {
         {
             compacted_this_turn = true;
         }
+        compacted_this_turn |= self.service_background(false).await;
         self.sink.emit(AgentEvent::TurnDiagnostics {
             provider: self.provider_id.clone(),
             api_family: api_family_label(self.request_contract()).to_string(),
@@ -19850,11 +20135,12 @@ impl Agent {
                 self.route_api_provider(),
                 &self.base_url,
             );
-        let local_reasoning_enabled = contract == RequestContract::OpenAiChatCompletions
-            && self.local_llama_reasoning_enabled();
-        let mut decoder = streaming::SseDecoder::new(STREAM_EVENT_BUFFER_CAP);
+        let chat_reasoning_enabled = contract == RequestContract::OpenAiChatCompletions
+            && (self.local_llama_reasoning_enabled() || self.deepseek_chat_enabled())
+            && self.resolved_model_spec().is_none_or(|spec| spec.reasoning);
+        let mut decoder = streaming::SseDecoder::new(streaming::sse_event_cap(contract));
         let mut parser = streaming::ProviderStreamParser::new(contract, preserve_timing_cache)
-            .capture_openai_reasoning(local_reasoning_enabled);
+            .capture_openai_reasoning(chat_reasoning_enabled);
         let mut stream = resp.bytes_stream();
         let idle_timeout = self.stream_idle_timeout();
 
@@ -19896,7 +20182,7 @@ impl Agent {
             for block in &parsed.blocks {
                 match block {
                     Block::Thinking { text, .. }
-                        if contract.is_responses() || local_reasoning_enabled =>
+                        if contract.is_responses() || chat_reasoning_enabled =>
                     {
                         self.sink
                             .emit(AgentEvent::ThinkingBlockComplete(text.clone()));
@@ -22291,7 +22577,7 @@ fn hooks_approved(agent: &mut Agent) -> bool {
     }
     let input = json!({
         "operation": "run project, active-pack, or repository Git hooks for this turn",
-        "phases": ["user_prompt", "pre_tool", "post_tool", "git_commit hooks"],
+        "phases": ["user_prompt", "pre_tool", "post_tool", "pre_request", "post_compact", "turn_end", "git_commit hooks"],
         "risk": format!(
             "executes hook programs selected by project, pack, or Git configuration; credentials are removed, output and runtime are bounded, and the current {} sandbox profile applies",
             agent.sandbox_profile().as_str()
@@ -22375,6 +22661,9 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
     let mut parts = line[1..].splitn(2, char::is_whitespace);
     let cmd = parts.next().unwrap_or("");
     let arg = parts.next().unwrap_or("").trim();
+    if matches!(cmd, "privacy" | "system") && !matches!(arg, "" | "status") {
+        agent.invalidate_background("configuration");
+    }
 
     let mut out = String::new();
     let w = &mut out;
@@ -22530,6 +22819,7 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                     return Some(true);
                 }
             }
+            agent.invalidate_background("clear");
             agent.history.clear();
             agent.clear_pending_login();
             let _ = writeln!(w, "cleared {n} messages");
@@ -23138,6 +23428,17 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                         );
                     }
                 }
+                let _ = writeln!(w, "{}", agent.background_compaction_status());
+            }
+            "background" | "background status" => {
+                agent.emit_background_compaction_setting();
+                let _ = writeln!(w, "{}", agent.background_compaction_status());
+            }
+            "background on" | "background off" => {
+                let _ = writeln!(
+                    w,
+                    "background compaction changes are handled before generic slash dispatch"
+                );
             }
             "auto" => {
                 agent.set_compact_threshold_auto();
@@ -23200,6 +23501,7 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             let _ = writeln!(w, "schemas: {}", agent.wire_tool_profile().as_str());
             let _ = writeln!(w, "toolset: {}", agent.tool_context_profile().as_str());
             let _ = writeln!(w, "compact threshold: {}", agent.compact_threshold_chars());
+            let _ = writeln!(w, "{}", agent.background_compaction_status());
             let _ = writeln!(w, "approval profile: {}", agent.approval_profile().as_str());
             let _ = writeln!(
                 w,
@@ -23463,10 +23765,13 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             }
             let _ = writeln!(
                 w,
-                "pre_tool: {}, post_tool: {}, user_prompt: {}",
+                "pre_tool: {}, post_tool: {}, user_prompt: {}, pre_request: {}, post_compact: {}, turn_end: {}",
                 agent.hooks.pre_tool.len(),
                 agent.hooks.post_tool.len(),
-                agent.hooks.user_prompt.len()
+                agent.hooks.user_prompt.len(),
+                agent.hooks.pre_request.len(),
+                agent.hooks.post_compact.len(),
+                agent.hooks.turn_end.len()
             );
         }
         "undo" => {
@@ -24398,11 +24703,14 @@ pub(crate) struct CliOptions {
     pub(crate) ndjson: bool,
     pub(crate) cd: Option<PathBuf>,
     pub(crate) fork: bool,
+    pub(crate) fork_to: Option<String>,
+    pub(crate) fork_at: Option<usize>,
     pub(crate) budget_cap: Option<BudgetCap>,
     pub(crate) sandbox_profile: Option<SandboxProfile>,
     pub(crate) thinking_effort: Option<ThinkingEffort>,
     pub(crate) reasoning_mode: Option<ReasoningMode>,
     pub(crate) context_mode: Option<ContextMode>,
+    pub(crate) background_compact: Option<bool>,
     pub(crate) tool_context_profile: Option<ToolContextProfile>,
     pub(crate) tool_profile: Option<ToolProfile>,
     pub(crate) preview_mode: Option<MutationPreviewMode>,
@@ -24424,11 +24732,14 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
     let mut output = OutputMode::Text;
     let mut cd: Option<PathBuf> = None;
     let mut fork = false;
+    let mut fork_to = None;
+    let mut fork_at = None;
     let mut budget_cap: Option<BudgetCap> = None;
     let mut sandbox_profile: Option<SandboxProfile> = None;
     let mut thinking_effort: Option<ThinkingEffort> = None;
     let mut reasoning_mode: Option<ReasoningMode> = None;
     let mut context_mode: Option<ContextMode> = None;
+    let mut background_compact = None;
     let mut tool_context_profile: Option<ToolContextProfile> = None;
     let mut tool_profile: Option<ToolProfile> = None;
     let mut preview_mode: Option<MutationPreviewMode> = None;
@@ -24439,13 +24750,58 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
         let arg = &argv[i];
         match arg.as_str() {
             "-p" | "--print" => print = true,
-            "--resume" => resume_latest = true,
+            "--resume" => {
+                resume_latest = true;
+                if argv
+                    .iter()
+                    .any(|arg| arg == "--fork-to" || arg.starts_with("--fork-to="))
+                    && let Some(selector) = argv.get(i + 1).filter(|arg| !arg.starts_with('-'))
+                {
+                    resume_selector = Some(selector.clone());
+                    i += 1;
+                }
+            }
             "--no-session" => no_session = true,
             "--no-tui" => no_tui = true,
             "--eval" => eval = true,
             "--trust" => approval_policy_override = Some(ApprovalProfile::Always),
             "--no-trust" => approval_policy_override = Some(ApprovalProfile::Ask),
             "--fork" => fork = true,
+            "--fork-to" => {
+                i += 1;
+                let seat = argv.get(i).context("--fork-to requires a new seat id")?;
+                seats::validate_seat_id(seat)?;
+                if fork_to.replace(seat.clone()).is_some() {
+                    anyhow::bail!("--fork-to specified more than once");
+                }
+            }
+            "--at" => {
+                i += 1;
+                let count = argv
+                    .get(i)
+                    .context("--at requires a message count")?
+                    .parse::<usize>()
+                    .context("--at must be a nonnegative message count")?;
+                if fork_at.replace(count).is_some() {
+                    anyhow::bail!("--at specified more than once");
+                }
+            }
+            _ if arg.starts_with("--fork-to=") => {
+                let seat = arg.trim_start_matches("--fork-to=");
+                seats::validate_seat_id(seat)?;
+                if fork_to.replace(seat.to_string()).is_some() {
+                    anyhow::bail!("--fork-to specified more than once");
+                }
+            }
+            _ if arg.starts_with("--at=") => {
+                let count = arg
+                    .trim_start_matches("--at=")
+                    .parse::<usize>()
+                    .context("--at must be a nonnegative message count")?;
+                if fork_at.replace(count).is_some() {
+                    anyhow::bail!("--at specified more than once");
+                }
+            }
             "--frugal" => {
                 context_mode = Some(ContextMode::Frugal);
                 if thinking_effort.is_none() {
@@ -24453,6 +24809,28 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
                 }
             }
             "--tiny" => anyhow::bail!("unknown option '--tiny'; use --frugal"),
+            "--background-compact" => {
+                i += 1;
+                let value = argv
+                    .get(i)
+                    .context("--background-compact requires on|off")?;
+                if background_compact
+                    .replace(compaction::parse_background_choice(value)?)
+                    .is_some()
+                {
+                    anyhow::bail!("--background-compact specified more than once");
+                }
+            }
+            _ if arg.starts_with("--background-compact=") => {
+                if background_compact
+                    .replace(compaction::parse_background_choice(
+                        arg.trim_start_matches("--background-compact="),
+                    )?)
+                    .is_some()
+                {
+                    anyhow::bail!("--background-compact specified more than once");
+                }
+            }
             "--context-mode" => {
                 i += 1;
                 let value = argv
@@ -24759,6 +25137,22 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
             eval_filter = positional.pop();
         }
     }
+    if fork_at.is_some() && fork_to.is_none() {
+        anyhow::bail!("--at requires --fork-to");
+    }
+    if fork_to.is_some()
+        && (fork
+            || no_session
+            || ndjson
+            || print
+            || eval
+            || pack.is_some()
+            || !positional.is_empty())
+    {
+        anyhow::bail!(
+            "--fork-to conflicts with --fork, --no-session, --input ndjson, -p, --eval, --pack, and prompts"
+        );
+    }
     Ok(CliOptions {
         argv,
         positional,
@@ -24774,17 +25168,148 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
         ndjson,
         cd,
         fork,
+        fork_to,
+        fork_at,
         budget_cap,
         sandbox_profile,
         thinking_effort,
         reasoning_mode,
         context_mode,
+        background_compact,
         tool_context_profile,
         tool_profile,
         preview_mode,
         pack,
         seat,
     })
+}
+
+fn kept_fork_boundary(history: &[Message], requested: usize) -> Result<usize> {
+    if requested > history.len() {
+        anyhow::bail!("--at {requested} exceeds {} source messages", history.len());
+    }
+    fn adjust(balance: &mut i64, unpaired: &mut usize, delta: i64) {
+        if *balance != 0 {
+            *unpaired -= 1;
+        }
+        *balance += delta;
+        if *balance != 0 {
+            *unpaired += 1;
+        }
+    }
+    let mut balances = HashMap::<&str, (i64, i64)>::new();
+    let mut suffix_unpaired = 0;
+    for block in history.iter().flat_map(|message| &message.content) {
+        let (id, delta) = match block {
+            Block::ToolUse { id, .. } => (id.as_str(), 1),
+            Block::ToolResult { tool_use_id, .. } => (tool_use_id.as_str(), -1),
+            _ => continue,
+        };
+        adjust(
+            &mut balances.entry(id).or_default().1,
+            &mut suffix_unpaired,
+            delta,
+        );
+    }
+    let mut prefix_unpaired = 0;
+    let mut safe = 0;
+    for (index, message) in history.iter().take(requested).enumerate() {
+        for block in &message.content {
+            let (id, delta) = match block {
+                Block::ToolUse { id, .. } => (id.as_str(), 1),
+                Block::ToolResult { tool_use_id, .. } => (tool_use_id.as_str(), -1),
+                _ => continue,
+            };
+            let (prefix, suffix) = balances.get_mut(id).expect("counted tool identity");
+            adjust(prefix, &mut prefix_unpaired, delta);
+            adjust(suffix, &mut suffix_unpaired, -delta);
+        }
+        let cut = index + 1;
+        if prefix_unpaired == 0
+            && (cut == history.len()
+                || (suffix_unpaired == 0 && !Agent::message_has_tool_results(&history[cut])))
+        {
+            safe = cut;
+        }
+    }
+    Ok(safe)
+}
+
+fn keep_session_fork(opts: &CliOptions) -> Result<Value> {
+    let root = opts
+        .cd
+        .clone()
+        .unwrap_or(std::env::current_dir()?)
+        .canonicalize()
+        .context("resolving fork project")?;
+    let target = opts.fork_to.as_deref().context("missing fork target")?;
+    let source = if let Some(selector) = opts.resume_selector.as_deref() {
+        let selector_path = expand_user_path(selector);
+        if selector_path.is_relative() && root.join(&selector_path).exists() {
+            root.join(selector_path)
+        } else {
+            resolve_session_selector(&root, selector)?
+        }
+    } else if let Some(seat) = opts.seat.as_deref() {
+        seats::latest_session_path(&root, seat)?
+    } else {
+        latest_session_path(&root)
+    };
+    let (bytes, _) =
+        session::read_regular_file_bytes_with_limit(&source, 32 * 1024 * 1024, None, "fork source")
+            .map_err(anyhow::Error::msg)?;
+    let mut reader = io::BufReader::new(bytes.as_slice());
+    let header_line = read_session_header_line(&mut reader, &source)?;
+    let source_version = persisted_session_source_version(header_line.trim_end())?;
+    let mut header = parse_session_header(header_line.trim_end())?;
+    if let Some(expected) = opts.seat.as_deref()
+        && header.seat.as_ref().is_some_and(|seat| seat.id != expected)
+    {
+        anyhow::bail!("source belongs to a different seat than '{expected}'");
+    }
+    let saved_root = header
+        .sandbox
+        .as_deref()
+        .context("fork source is missing project sandbox provenance")?;
+    if project_key(&PathBuf::from(saved_root).canonicalize()?) != project_key(&root) {
+        anyhow::bail!("fork source belongs to a different project");
+    }
+    let source_id = header
+        .session_id
+        .clone()
+        .context("fork source is missing a valid session id")?;
+    let mut history = reader
+        .lines()
+        .filter_map(|line| match line {
+            Ok(line) if line.trim().is_empty() => None,
+            other => Some(other.map_err(anyhow::Error::from).and_then(|line| {
+                serde_json::from_str::<Message>(&line).map_err(anyhow::Error::from)
+            })),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    validate_persisted_image_references(&history, source_version)?;
+    let at = kept_fork_boundary(&history, opts.fork_at.unwrap_or(history.len()))?;
+    history.truncate(at);
+    let session_id = new_session_id();
+    header.session_id = Some(session_id.clone());
+    header.seat = Some(SeatRef {
+        id: target.into(),
+        label: None,
+    });
+    header.allowed.clear();
+    header.auto_approved_tools.clear();
+    header.active_pack_runtimes.clear();
+    header.work_ledger = WorkLedger::default();
+    header.usage = Usage::default();
+    header.sandbox = Some(root.to_string_lossy().into_owned());
+    header.version = source_version.max(SEAT_FORMAT_VERSION);
+    header.background_compact = Some(opts.background_compact.unwrap_or_else(|| {
+        header
+            .background_compact
+            .unwrap_or_else(compaction::background_default)
+    }));
+    seats::save_new_fork(&root, &header, &history)?;
+    Ok(json!({"seat":target,"session_id":session_id,"source_session_id":source_id,"at":at}))
 }
 
 fn env_flag_default(name: &str, default: bool) -> bool {
@@ -25051,6 +25576,23 @@ async fn agent_main() -> Result<()> {
     }));
 
     let mut argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.first().is_some_and(|arg| arg == "hook-memo") {
+        if !(2..=3).contains(&argv.len()) {
+            anyhow::bail!("usage: dext hook-memo KEY [VALUE]");
+        }
+        let dir = std::env::var_os("DEXT_HOOK_MEMO_DIR")
+            .map(PathBuf::from)
+            .context("hook-memo requires DEXT_HOOK_MEMO_DIR")?;
+        let value = argv
+            .get(2)
+            .map(|value| PrivacyPolicy::from_env().redact_text(value).text);
+        if let Some(value) =
+            seats::hook_memo_value(&dir, &argv[1], value.as_deref().map(str::as_bytes))?
+        {
+            io::stdout().write_all(&value)?;
+        }
+        return Ok(());
+    }
     if argv.iter().any(|a| a == "-V" || a == "--version") {
         println!("dext {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
@@ -25223,6 +25765,9 @@ async fn agent_main() -> Result<()> {
         println!(
             "       dext --fork           resume into an unsaved branch without side-effect crash recovery"
         );
+        println!(
+            "       dext --fork-to SEAT [--at N] [--resume SELECTOR]  save a pair-safe fork and exit"
+        );
         println!("       dext --cd DIR         use DIR as sandbox/cwd");
         println!("       dext --output json|stream-json  emit machine-readable output");
         println!(
@@ -25244,6 +25789,9 @@ async fn agent_main() -> Result<()> {
             "       dext --frugal        minimize prompt/tool/history context for lower token cost"
         );
         println!("       dext --context-mode standard|frugal");
+        println!(
+            "       dext --background-compact on|off  override this session's background compaction (default on)"
+        );
         println!("       dext --toolset default|full  choose provider-visible tool count profile");
         println!("       dext --tool-context-profile default|full  alias for --toolset");
         println!(
@@ -25260,11 +25808,25 @@ async fn agent_main() -> Result<()> {
         println!("       dext undo --apply <id>   non-interactive apply");
         println!("       dext                  interactive REPL (or reads stdin if piped)");
         println!(
-            "env:   DEXT_PROVIDER, DEXT_PROFILE, DEXT_MODEL, DEXT_MODEL_<PROVIDER>, DEXT_MODEL_FORCE=1, DEXT_BASE_URL, DEXT_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, CHATGPT_ACCESS_TOKEN, ZAI_API_KEY, ANTHROPIC_BASE_URL, OPENAI_BASE_URL, DEXT_SYSTEM, DEXT_EXTERNAL_TIMEOUT_SECS, DEXT_BASH_TIMEOUT_SECS, DEXT_HOOK_TIMEOUT_SECS, DEXT_SESSIONS_DIR, DEXT_LOGS_DIR, DEXT_LOG_ARCHIVES (0-16 rotated archives of latest.log; default 0 keeps truncation-only), DEXT_APPROVAL=ask|auto-read|auto-write|never|always, DEXT_TRUST=1 as an alias for approval=always, DEXT_PRIVACY=0 to disable output redaction or DEXT_PRIVACY=strict to block sensitive-looking native read paths, DEXT_INHERIT_TOOL_CREDENTIALS=1 to explicitly pass provider API credentials to tool subprocesses, DEXT_NO_TUI=1, DEXT_THINKING_EFFORT=off|minimal|low|medium|high|xhigh|max, DEXT_REASONING_MODE=standard|pro, DEXT_CONTEXT_MODE=standard|frugal, DEXT_TOOLSET=default|full, DEXT_TOOL_PROFILE=lean|full, DEXT_MUTATION_PREVIEW=off|simple|git, DEXT_BUDGET_CAP, DEXT_SANDBOX_PROFILE, DEXT_SHELVES_DIR"
+            "env:   DEXT_PROVIDER, DEXT_PROFILE, DEXT_MODEL, DEXT_MODEL_<PROVIDER>, DEXT_MODEL_FORCE=1, DEXT_BASE_URL, DEXT_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, CHATGPT_ACCESS_TOKEN, ZAI_API_KEY, ANTHROPIC_BASE_URL, OPENAI_BASE_URL, DEXT_SYSTEM, DEXT_EXTERNAL_TIMEOUT_SECS, DEXT_BASH_TIMEOUT_SECS, DEXT_HOOK_TIMEOUT_SECS, DEXT_SESSIONS_DIR, DEXT_LOGS_DIR, DEXT_LOG_ARCHIVES (0-16 rotated archives of latest.log; default 0 keeps truncation-only), DEXT_APPROVAL=ask|auto-read|auto-write|never|always, DEXT_TRUST=1 as an alias for approval=always, DEXT_PRIVACY=0 to disable output redaction or DEXT_PRIVACY=strict to block sensitive-looking native read paths, DEXT_INHERIT_TOOL_CREDENTIALS=1 to explicitly pass provider API credentials to tool subprocesses, DEXT_NO_TUI=1, DEXT_THINKING_EFFORT=off|minimal|low|medium|high|xhigh|max, DEXT_REASONING_MODE=standard|pro, DEXT_CONTEXT_MODE=standard|frugal, DEXT_BACKGROUND_COMPACT=0|1 (startup default; default 1, saved session and CLI override it), DEXT_TOOLSET=default|full, DEXT_TOOL_PROFILE=lean|full, DEXT_MUTATION_PREVIEW=off|simple|git, DEXT_BUDGET_CAP, DEXT_SANDBOX_PROFILE, DEXT_SHELVES_DIR"
         );
         return Ok(());
     }
     let opts = parse_cli_options(argv.clone())?;
+    if opts.fork_to.is_some() {
+        let result = keep_session_fork(&opts)?;
+        if opts.output.is_json() {
+            println!("{}", json!({"event": "session_fork", "data": result}));
+        } else {
+            println!(
+                "forked seat={} session_id={} at={}",
+                result["seat"].as_str().unwrap_or_default(),
+                result["session_id"].as_str().unwrap_or_default(),
+                result["at"]
+            );
+        }
+        return Ok(());
+    }
     let sandbox_profile =
         resolve_sandbox_profile_from_env(opts.sandbox_profile).map_err(anyhow::Error::msg)?;
     if opts.eval {
@@ -25445,6 +26007,7 @@ async fn agent_main() -> Result<()> {
             }
         }
     }
+    agent.apply_background_compaction_override(opts.background_compact)?;
     if !opts.output.is_json() {
         eprintln!(
             "[approval] profile {} (source {})",
@@ -25526,6 +26089,8 @@ async fn agent_main() -> Result<()> {
 
     if let Some(task) = one_shot_task {
         let result = agent.chat(task).await;
+        agent.service_background(false).await;
+        agent.settle_background("one_shot_exit").await;
         autosave_latest(&mut agent);
         return match result {
             Ok(()) => {
@@ -25680,6 +26245,7 @@ async fn agent_main() -> Result<()> {
                 "sandbox": agent.sandbox_root.display().to_string(),
                 "thinking_effort": agent.thinking_effort,
                 "approval": agent.approval_profile,
+                "background_compact": agent.background.enabled,
                 "frames": ["user", "steer", "control", "interrupt", "permission", "ui.capabilities", "ui.response", "close"],
                 "ui_protocol": 1,
             }
@@ -25711,7 +26277,15 @@ async fn agent_main() -> Result<()> {
             stdout.flush()?;
         }
 
-        let input = match input_rx.recv().await {
+        let received = tokio::select! {
+            line = input_rx.recv() => line,
+            _ = agent.background_wakeup() => {
+                agent.service_background(false).await;
+                autosave_latest(&mut agent);
+                continue;
+            }
+        };
+        let input = match received {
             Some(line) => line,
             None => {
                 if !quiet {
@@ -25796,6 +26370,8 @@ async fn agent_main() -> Result<()> {
                             );
                         }
                     }
+                    let message = agent.background_compaction_status();
+                    note(&mut agent, message);
                 }
                 Ok(CompactSlash::Auto) => {
                     agent.set_compact_threshold_auto();
@@ -25812,6 +26388,14 @@ async fn agent_main() -> Result<()> {
                         &mut agent,
                         format!("compact threshold set to {percent}% -> {chars} chars"),
                     );
+                }
+                Ok(CompactSlash::Background(choice)) => {
+                    match agent.configure_background_compaction(choice).await {
+                        Ok(message) => note(&mut agent, message),
+                        Err(error) => agent.sink.emit(AgentEvent::Error(format!(
+                            "[background compaction] {error:#}"
+                        ))),
+                    }
                 }
                 Err(msg) => note(&mut agent, msg.to_string()),
             }
@@ -25879,6 +26463,8 @@ async fn agent_main() -> Result<()> {
         autosave_latest(&mut agent);
     }
 
+    agent.service_background(false).await;
+    agent.settle_background("shutdown").await;
     autosave_latest(&mut agent);
     Ok(())
 }
