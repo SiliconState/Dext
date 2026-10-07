@@ -466,7 +466,17 @@ pub(crate) fn replace_file_atomically(from: &Path, to: &Path) -> io::Result<()> 
         )
     };
     if ok == 0 {
-        Err(io::Error::last_os_error())
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(5) {
+            if std::fs::symlink_metadata(to)?.permissions().readonly() {
+                return Err(error);
+            }
+            // Rust's handle-based rename supports readers that share deletion;
+            // the legacy MoveFileEx path rejects an open destination instead.
+            std::fs::rename(from, to)
+        } else {
+            Err(error)
+        }
     } else {
         Ok(())
     }

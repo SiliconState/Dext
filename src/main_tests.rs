@@ -285,6 +285,139 @@ impl EventSink for FixedPermissionSink {
     fn local_auth_prompt(&mut self, _tool: &str, _message: &str) {}
 }
 
+fn accept_test_connection(
+    listener: &TcpListener,
+    timeout: Duration,
+) -> std::io::Result<std::net::TcpStream> {
+    listener.set_nonblocking(true)?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                stream.set_nonblocking(false)?;
+                stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+                stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+                return Ok(stream);
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "test server received no connection",
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[test]
+fn test_connection_accept_has_a_deadline() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let started = std::time::Instant::now();
+    let error = accept_test_connection(&listener, Duration::from_millis(25)).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+#[cfg(windows)]
+#[test]
+fn atomic_state_replace_preserves_old_readers_and_refuses_delete_locks() -> Result<()> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    let root = temp_test_dir("atomic-state-readers");
+    let _cleanup = RemoveDirOnDrop(root.clone());
+    let path = root.join("state.json");
+    for secret in [false, true] {
+        std::fs::write(&path, "old")?;
+        let mut reader = std::fs::File::open(&path)?;
+        if secret {
+            atomic_write_secret(&path, b"new")?;
+        } else {
+            atomic_write_bytes(&path, b"new")?;
+        }
+        assert_eq!(std::fs::read_to_string(&path)?, "new");
+        let mut old = String::new();
+        reader.read_to_string(&mut old)?;
+        assert_eq!(old, "old");
+        drop(reader);
+
+        let locked = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x1 | 0x2)
+            .open(&path)?;
+        let result = if secret {
+            atomic_write_secret(&path, b"must not publish")
+        } else {
+            atomic_write_bytes(&path, b"must not publish")
+        };
+        assert!(result.is_err(), "delete-sharing denial must remain fatal");
+        assert_eq!(std::fs::read_to_string(&path)?, "new");
+        assert_eq!(
+            std::fs::read_dir(&root)?.count(),
+            1,
+            "failed write left a temp file"
+        );
+        drop(locked);
+
+        let original_permissions = std::fs::metadata(&path)?.permissions();
+        let mut permissions = original_permissions.clone();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&path, permissions)?;
+        let result = if secret {
+            atomic_write_secret(&path, b"must not replace read-only state")
+        } else {
+            atomic_write_bytes(&path, b"must not replace read-only state")
+        };
+        assert!(
+            result.is_err(),
+            "read-only destinations must remain protected"
+        );
+        assert_eq!(std::fs::read_to_string(&path)?, "new");
+        assert_eq!(std::fs::read_dir(&root)?.count(), 1);
+        std::fs::set_permissions(&path, original_permissions)?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+#[test]
+fn prepared_mutation_replaces_shared_reader_but_refuses_delete_lock() -> Result<()> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    let root = temp_test_dir("mutation-shared-reader");
+    let _cleanup = RemoveDirOnDrop(root.clone());
+    let path = root.join("note.txt");
+    std::fs::write(&path, "old")?;
+    let mut reader = std::fs::File::open(&path)?;
+    let prepared = mutation_preview::prepare_write_file(&root, "note.txt", "new")
+        .map_err(anyhow::Error::msg)?;
+    mutation_preview::apply_prepared_mutation(&root, &prepared).map_err(anyhow::Error::msg)?;
+    assert_eq!(std::fs::read_to_string(&path)?, "new");
+    let mut old = String::new();
+    reader.read_to_string(&mut old)?;
+    assert_eq!(old, "old");
+    drop(reader);
+
+    let locked = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0x1 | 0x2)
+        .open(&path)?;
+    let prepared = mutation_preview::prepare_write_file(&root, "note.txt", "must not publish")
+        .map_err(anyhow::Error::msg)?;
+    assert!(mutation_preview::apply_prepared_mutation(&root, &prepared).is_err());
+    assert_eq!(std::fs::read_to_string(&path)?, "new");
+    assert_eq!(
+        std::fs::read_dir(&root)?.count(),
+        1,
+        "failed mutation left a temp file"
+    );
+    drop(locked);
+    Ok(())
+}
+
 fn spawn_openai_tool_call_server(
     tool_call_id: &str,
     tool_name: &str,
@@ -307,7 +440,8 @@ fn spawn_openai_tool_call_server(
     });
     let body = format!("data: {chunk}\n\ndata: [DONE]\n\n");
     let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept tool-call request");
+        let mut stream = accept_test_connection(&listener, Duration::from_secs(30))
+            .expect("accept tool-call request");
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(2)))
             .expect("set tool-call request timeout");
@@ -6656,7 +6790,8 @@ async fn non_aborting_runtime_control_keeps_pending_provider_response() {
             let _ = std::io::Write::write_all(stream, response.as_bytes());
         }
 
-        let (mut stream, _) = listener.accept().expect("accept first request");
+        let mut stream = accept_test_connection(&listener, Duration::from_secs(30))
+            .expect("accept first request");
         server_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(200)));
         let mut request = [0u8; 4096];
@@ -9526,7 +9661,7 @@ async fn background_compaction_overlaps_foreground_request_and_idle_apply() -> R
         let mut release_rx = Some(release_rx);
         let mut summary_thread = None;
         for _ in 0..2 {
-            let (mut stream, _) = listener.accept().unwrap();
+            let mut stream = accept_test_connection(&listener, Duration::from_secs(30)).unwrap();
             stream
                 .set_read_timeout(Some(std::time::Duration::from_secs(5)))
                 .unwrap();
@@ -11737,7 +11872,17 @@ fn tool_round_allows_verification_only_batches_without_cache_shortcuts() {
 
     assert_eq!(agent.work_ledger.verification.len(), 3);
     for record in &agent.work_ledger.verification[1..] {
-        assert_eq!(record.status, "passed");
+        let results = agent
+            .history
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter_map(|block| match block {
+                Block::ToolResult { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(record.status, "passed", "{}:\n{results}", record.command);
         assert_eq!(record.workspace_fingerprint, fingerprint);
     }
     let _ = std::fs::remove_dir_all(root);
@@ -13529,7 +13674,8 @@ async fn provider_bug_fallback_rebuilds_request_body_before_retry() {
 
         let mut bodies = Vec::new();
         for response_index in 0..3 {
-            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut stream =
+                accept_test_connection(&listener, Duration::from_secs(30)).expect("accept request");
             bodies.push(read_request_body(&mut stream));
             let (status, content_type, body) = match response_index {
                 0 => (
@@ -14727,7 +14873,7 @@ async fn provider_responses_large_terminal_frame_completes_over_http() -> Result
         let address = listener.local_addr()?;
         let body = body.clone();
         let server = std::thread::spawn(move || -> Result<()> {
-            let (mut stream, _) = listener.accept()?;
+            let mut stream = accept_test_connection(&listener, Duration::from_secs(30))?;
             stream.set_nonblocking(false)?;
             stream.set_read_timeout(Some(Duration::from_secs(5)))?;
             stream.set_write_timeout(Some(Duration::from_secs(5)))?;
@@ -14903,7 +15049,8 @@ async fn provider_body_reader_enforces_idle_timeout_after_headers() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
     let addr = listener.local_addr().expect("server address");
     let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept request");
+        let mut stream =
+            accept_test_connection(&listener, Duration::from_secs(30)).expect("accept request");
         let mut request = Vec::new();
         let mut buffer = [0u8; 1024];
         while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
@@ -14936,7 +15083,8 @@ async fn provider_body_reader_stops_at_cap_without_buffering_the_rest() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
     let addr = listener.local_addr().expect("server address");
     let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept request");
+        let mut stream =
+            accept_test_connection(&listener, Duration::from_secs(30)).expect("accept request");
         let mut request = Vec::new();
         let mut buffer = [0u8; 1024];
         while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
@@ -16673,6 +16821,53 @@ fn http_dns_validates_addresses_beyond_retention_prefix() {
 #[allow(clippy::await_holding_lock)]
 async fn builtin_http_client_ignores_proxy_environment() {
     let _guard = env_lock();
+    const CHILD_ENV: &str = "DEXT_TEST_HTTP_PROXY_CHILD";
+    if std::env::var_os(CHILD_ENV).is_none() {
+        let root = temp_test_dir("http-proxy-child");
+        let _cleanup = RemoveDirOnDrop(root.clone());
+        let mut command = Command::new(std::env::current_exe().expect("test executable"));
+        command
+            .args([
+                "--exact",
+                "main_tests::builtin_http_client_ignores_proxy_environment",
+                "--nocapture",
+            ])
+            .current_dir(&root)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", &root)
+            .env("USERPROFILE", &root)
+            .env("DEXT_HOME", root.join("state"))
+            .env(CHILD_ENV, "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        if let Some(system_root) = std::env::var_os("SystemRoot") {
+            command.env("SystemRoot", system_root);
+        }
+        let mut child = command.spawn().expect("isolated proxy regression");
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            match child.try_wait().expect("poll isolated proxy regression") {
+                Some(_) => break,
+                None if std::time::Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("isolated proxy regression exceeded 30 seconds");
+                }
+                None => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        let output = child.wait_with_output().expect("isolated proxy output");
+        assert!(
+            output.status.success(),
+            "isolated proxy regression failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    // Provider clients read proxy variables without this test's environment lock.
+    // Mutate them only in a child that runs this single test, including on panic.
     let env_names = [
         "HTTP_PROXY",
         "http_proxy",
@@ -16705,9 +16900,19 @@ async fn builtin_http_client_ignores_proxy_environment() {
     let stop = Arc::new(AtomicBool::new(false));
     let spawn_server = |listener: TcpListener, body: &'static str, stop: Arc<AtomicBool>| {
         std::thread::spawn(move || {
-            while !stop.load(Ordering::SeqCst) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            while !stop.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        stream
+                            .set_nonblocking(false)
+                            .expect("blocking accepted stream");
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(5)))
+                            .expect("read timeout");
+                        stream
+                            .set_write_timeout(Some(Duration::from_secs(5)))
+                            .expect("write timeout");
                         let mut request = [0u8; 1024];
                         let _ = std::io::Read::read(&mut stream, &mut request);
                         let response = format!(
@@ -16731,15 +16936,16 @@ async fn builtin_http_client_ignores_proxy_environment() {
     let direct_server = spawn_server(direct, "direct", stop.clone());
     let proxy_server = spawn_server(proxy, "proxied", stop.clone());
 
-    let response = build_http_tool_client(true, HttpToolResolver::default())
-        .get(format!("http://127.0.0.1:{direct_port}/"))
-        .timeout(std::time::Duration::from_secs(3))
-        .send()
-        .await
-        .expect("direct HTTP request despite proxy environment")
-        .text()
-        .await
-        .expect("read direct response");
+    let response = async {
+        build_http_tool_client(true, HttpToolResolver::default())
+            .get(format!("http://127.0.0.1:{direct_port}/"))
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await?
+            .text()
+            .await
+    }
+    .await;
     stop.store(true, Ordering::SeqCst);
     let direct_used = direct_server.join().expect("direct server thread");
     let proxy_used = proxy_server.join().expect("proxy server thread");
@@ -16747,7 +16953,10 @@ async fn builtin_http_client_ignores_proxy_environment() {
     for (name, value) in old_env {
         restore_env_var(name, value);
     }
-    assert_eq!(response, "direct");
+    assert_eq!(
+        response.expect("direct HTTP request despite proxy environment"),
+        "direct"
+    );
     assert!(direct_used, "direct listener should receive the request");
     assert!(!proxy_used, "proxy environment must be ignored");
 }
@@ -16857,7 +17066,8 @@ fn builtin_http_tool_blocks_redirect_to_link_local_metadata() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
     let addr = listener.local_addr().expect("listener addr");
     let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept request");
+        let mut stream =
+            accept_test_connection(&listener, Duration::from_secs(30)).expect("accept request");
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(5)))
             .expect("set read timeout");
@@ -16913,7 +17123,8 @@ async fn builtin_http_tool_interrupts_while_waiting_for_response_headers() {
     let interrupt = Arc::new(AtomicBool::new(false));
     let server_interrupt = interrupt.clone();
     let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept stalled request");
+        let mut stream = accept_test_connection(&listener, Duration::from_secs(30))
+            .expect("accept stalled request");
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .expect("set stalled request timeout");
@@ -16950,7 +17161,8 @@ async fn builtin_http_tool_refuses_oversized_declared_body_before_reading_it() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind oversized response server");
     let addr = listener.local_addr().expect("oversized response addr");
     let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept oversized request");
+        let mut stream = accept_test_connection(&listener, Duration::from_secs(30))
+            .expect("accept oversized request");
         let mut request = [0u8; 1024];
         let _ = stream.read(&mut request).expect("read oversized request");
         write!(
@@ -16987,7 +17199,8 @@ async fn builtin_http_tool_allows_oversized_head_representation_metadata() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind HEAD response server");
     let addr = listener.local_addr().expect("HEAD response addr");
     let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept HEAD request");
+        let mut stream = accept_test_connection(&listener, Duration::from_secs(30))
+            .expect("accept HEAD request");
         let mut request = [0u8; 1024];
         let read = stream.read(&mut request).expect("read HEAD request");
         let request = String::from_utf8_lossy(&request[..read]);
@@ -17033,7 +17246,8 @@ async fn builtin_http_tool_decompresses_gzip_inside_text_read_cap() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind gzip server");
     let addr = listener.local_addr().expect("gzip server addr");
     let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept gzip request");
+        let mut stream = accept_test_connection(&listener, Duration::from_secs(30))
+            .expect("accept gzip request");
         let mut request = [0u8; 1024];
         let read = stream.read(&mut request).expect("read gzip request");
         let headers = String::from_utf8_lossy(&request[..read]).to_ascii_lowercase();
@@ -17072,7 +17286,8 @@ async fn builtin_http_tool_text_mode_drops_chunked_body_at_source_cap() {
     let addr = listener.local_addr().expect("capped response addr");
     let (resume_tx, resume_rx) = std::sync::mpsc::channel();
     let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept capped request");
+        let mut stream = accept_test_connection(&listener, Duration::from_secs(30))
+            .expect("accept capped request");
         let mut request = [0u8; 1024];
         let _ = stream.read(&mut request).expect("read capped request");
         stream
@@ -17123,7 +17338,8 @@ async fn builtin_http_redirect_allows_plain_cross_origin_get_without_referer() {
     let origin_addr = origin.local_addr().expect("redirect origin addr");
 
     let origin_server = std::thread::spawn(move || {
-        let (mut stream, _) = origin.accept().expect("accept redirect origin request");
+        let mut stream = accept_test_connection(&origin, Duration::from_secs(30))
+            .expect("accept redirect origin request");
         let mut request = [0u8; 1024];
         let _ = stream.read(&mut request).expect("read origin request");
         write!(
@@ -17133,7 +17349,8 @@ async fn builtin_http_redirect_allows_plain_cross_origin_get_without_referer() {
         .expect("write origin redirect");
     });
     let destination_server = std::thread::spawn(move || {
-        let (mut stream, _) = destination.accept().expect("accept redirect destination");
+        let mut stream = accept_test_connection(&destination, Duration::from_secs(30))
+            .expect("accept redirect destination");
         let mut request = [0u8; 2048];
         let read = stream.read(&mut request).expect("read destination request");
         let headers = String::from_utf8_lossy(&request[..read]).to_ascii_lowercase();
@@ -17172,7 +17389,8 @@ async fn builtin_http_redirect_blocks_cross_origin_header_and_body_replay() {
     let origin_addr = origin.local_addr().expect("redirect origin addr");
 
     let origin_server = std::thread::spawn(move || {
-        let (mut stream, _) = origin.accept().expect("accept redirect origin request");
+        let mut stream = accept_test_connection(&origin, Duration::from_secs(30))
+            .expect("accept redirect origin request");
         let mut request = Vec::new();
         let mut buf = [0u8; 1024];
         while !request.windows(4).any(|window| window == b"\r\n\r\n") {
@@ -17254,7 +17472,8 @@ async fn builtin_http_tool_executes_without_xh_dependency() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
     let addr = listener.local_addr().expect("listener addr");
     let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept request");
+        let mut stream =
+            accept_test_connection(&listener, Duration::from_secs(30)).expect("accept request");
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(5)))
             .expect("set read timeout");
@@ -22133,7 +22352,8 @@ async fn hooks_continue_with_stdout_before_turn_end_and_gate_requests() -> Resul
     let server = std::thread::spawn(move || {
         let mut requests = Vec::new();
         for _ in 0..2 {
-            let (mut stream, _) = listener.accept().expect("accept hook request");
+            let mut stream = accept_test_connection(&listener, Duration::from_secs(30))
+                .expect("accept hook request");
             stream
                 .set_read_timeout(Some(std::time::Duration::from_secs(5)))
                 .unwrap();
@@ -22207,14 +22427,22 @@ async fn blocking_compaction_redacts_summary_before_history_events_and_save() ->
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let address = listener.local_addr()?;
         let server = std::thread::spawn(move || -> Result<()> {
-            let (mut stream, _) = listener.accept()?;
-            stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+            let mut stream = accept_test_connection(&listener, Duration::from_secs(15))?;
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
             let mut request = Vec::new();
             let mut buffer = [0; 4096];
             loop {
                 let count = stream.read(&mut buffer)?;
                 anyhow::ensure!(count > 0, "summary request ended before body");
+                anyhow::ensure!(
+                    std::time::Instant::now() < deadline,
+                    "summary request deadline"
+                );
                 request.extend_from_slice(&buffer[..count]);
+                anyhow::ensure!(
+                    request.len() <= 1024 * 1024,
+                    "summary fixture request exceeds cap"
+                );
                 if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
                     let headers = String::from_utf8_lossy(&request[..end]);
                     let length: usize = headers
@@ -22251,8 +22479,10 @@ async fn blocking_compaction_redacts_summary_before_history_events_and_save() ->
         agent.latest_log_path = root.join("latest.log");
         let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
         agent.set_sink(Box::new(ChannelSink { tx }));
-        agent.compact().await?;
-        server.join().expect("summary fixture thread")?;
+        let compact = tokio::time::timeout(Duration::from_secs(20), agent.compact()).await;
+        let served = server.join().expect("summary fixture thread");
+        served.context("summary fixture did not serve the expected request")?;
+        compact.context("blocking compaction exceeded fixture deadline")??;
         let history = serde_json::to_string(&agent.history)?;
         let saved = std::fs::read_to_string(&agent.latest_session_path)?;
         assert!(!history.contains("fixturevalue123456789"));
@@ -24462,7 +24692,8 @@ async fn local_llama_runtime_context_is_endpoint_scoped_not_model_global() -> Re
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let addr = listener.local_addr()?;
     let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept");
+        let mut stream =
+            accept_test_connection(&listener, Duration::from_secs(30)).expect("accept");
         let mut request = [0u8; 1024];
         let _ = stream.read(&mut request).expect("read request");
         let body = r#"{"default_generation_settings":{"n_ctx":30000}}"#;
@@ -24500,7 +24731,8 @@ fn local_llama_runtime_probe_updates_model_context_window() -> Result<()> {
     let addr = listener.local_addr()?;
     let server = std::thread::spawn(move || {
         for _ in 0..2 {
-            let (mut stream, _) = listener.accept().expect("accept");
+            let mut stream =
+                accept_test_connection(&listener, Duration::from_secs(30)).expect("accept");
             let mut request = [0u8; 1024];
             let n = stream.read(&mut request).expect("read request");
             let request = String::from_utf8_lossy(&request[..n]);
@@ -29491,9 +29723,24 @@ fn handle_slash_model_switches_provider_when_model_belongs_elsewhere() -> Result
             Some(("chatgpt".to_string(), "gpt-4o".to_string()))
         );
 
+        // Native readers may keep the old catalog open across atomic publication.
+        let mut previous_catalog = std::fs::File::open(provider_catalog_path())?;
         assert_eq!(handle_slash("/model glm 5.1", &mut agent), Some(true));
-        assert_eq!(agent.provider_id, "glm");
-        assert_eq!(agent.model, "glm-5.1");
+        let switch_output = drain_events(&mut rx)
+            .into_iter()
+            .filter_map(|event| match event {
+                AgentEvent::Slash(text) => Some(text),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(agent.provider_id, "glm", "{switch_output}");
+        assert_eq!(agent.model, "glm-5.1", "{switch_output}");
+        let mut previous_contents = String::new();
+        previous_catalog.read_to_string(&mut previous_contents)?;
+        let previous: Value = serde_json::from_str(&previous_contents)?;
+        assert_eq!(previous["active_provider"], "chatgpt");
+        assert_eq!(load_provider_catalog()?.active_provider, "glm");
         assert_eq!(
             agent
                 .history
@@ -31578,7 +31825,8 @@ async fn chatgpt_compact_summary_honors_summary_model_reasoning_capability() {
     let addr = listener.local_addr().expect("local addr");
     let (tx, rx) = std::sync::mpsc::channel();
     let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept request");
+        let mut stream =
+            accept_test_connection(&listener, Duration::from_secs(30)).expect("accept request");
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(5)))
             .expect("set read timeout");
@@ -31700,7 +31948,8 @@ async fn responses_compact_summary_retries_incomplete_text_and_accumulates_usage
             ),
         ];
         for body in responses {
-            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut stream =
+                accept_test_connection(&listener, Duration::from_secs(30)).expect("accept request");
             drain_request(&mut stream);
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -31863,7 +32112,8 @@ async fn chatgpt_incomplete_function_call_retries_with_lower_effort() {
         ];
         let mut bodies = Vec::new();
         for body in responses {
-            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut stream =
+                accept_test_connection(&listener, Duration::from_secs(30)).expect("accept request");
             bodies.push(read_request_body(&mut stream));
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -31995,7 +32245,8 @@ async fn anthropic_unfinished_tool_call_automatically_continues() {
         ];
         let mut bodies = Vec::new();
         for body in responses {
-            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut stream =
+                accept_test_connection(&listener, Duration::from_secs(30)).expect("accept request");
             bodies.push(read_request_body(&mut stream));
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -32110,7 +32361,8 @@ async fn openai_chat_length_truncated_tool_call_automatically_continues() {
         ];
         let mut bodies = Vec::new();
         for body in responses {
-            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut stream =
+                accept_test_connection(&listener, Duration::from_secs(30)).expect("accept request");
             bodies.push(read_request_body(&mut stream));
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -32356,7 +32608,8 @@ async fn local_llama_reasoning_content_reaches_sink_and_history_blocks() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
     let addr = listener.local_addr().expect("local addr");
     let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept");
+        let mut stream =
+            accept_test_connection(&listener, Duration::from_secs(30)).expect("accept");
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(2)))
             .expect("set request timeout");
@@ -32435,7 +32688,8 @@ async fn anthropic_stream_visible_thinking_reaches_sink_and_preserves_signed_rou
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
     let addr = listener.local_addr().expect("local addr");
     let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept");
+        let mut stream =
+            accept_test_connection(&listener, Duration::from_secs(30)).expect("accept");
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(2)))
             .expect("set request timeout");
@@ -32504,7 +32758,8 @@ async fn chatgpt_stream_reasoning_summary_is_rendered_and_stored_as_thinking() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
     let addr = listener.local_addr().expect("local addr");
     let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept");
+        let mut stream =
+            accept_test_connection(&listener, Duration::from_secs(30)).expect("accept");
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(2)))
             .expect("set request timeout");
@@ -33790,7 +34045,20 @@ fn packs_discovery_is_deterministic_and_dedupes_symlinked_shelf_roots() -> Resul
     #[cfg(unix)]
     std::os::unix::fs::symlink(&shelves_root, &alias)?;
     #[cfg(windows)]
-    std::os::windows::fs::symlink_dir(&shelves_root, &alias)?;
+    {
+        // Junctions exercise canonical directory aliases without requiring
+        // Developer Mode or the Windows symbolic-link privilege.
+        let output = Command::new("cmd.exe")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(&alias)
+            .arg(&shelves_root)
+            .output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "directory alias: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
     unsafe {
         std::env::set_var(
             "DEXT_SHELVES_DIR",
@@ -35468,7 +35736,8 @@ async fn frugal_local_compact_summary_calls_local_llm_and_disables_thinking() {
     let addr = listener.local_addr().expect("local addr");
     let (tx, rx) = std::sync::mpsc::channel();
     let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept request");
+        let mut stream =
+            accept_test_connection(&listener, Duration::from_secs(30)).expect("accept request");
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(5)))
             .expect("set read timeout");

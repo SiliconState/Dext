@@ -1,4 +1,6 @@
-use crate::session::{canonicalize_mutation_parent_path, canonicalize_mutation_path};
+use crate::session::{
+    canonicalize_mutation_parent_path, canonicalize_mutation_path, replace_file_atomically,
+};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
@@ -556,43 +558,6 @@ fn apply_preserved_permissions(
     #[cfg(not(unix))]
     let _ = (file, expected);
     Ok(())
-}
-
-#[cfg(windows)]
-fn replace_file_atomically(from: &Path, to: &Path) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
-    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
-    unsafe extern "system" {
-        fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
-    }
-    let from = from
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let to = to
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    if unsafe {
-        MoveFileExW(
-            from.as_ptr(),
-            to.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    } == 0
-    {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(not(windows))]
-fn replace_file_atomically(from: &Path, to: &Path) -> std::io::Result<()> {
-    std::fs::rename(from, to)
 }
 
 fn sync_parent_best_effort(parent: &Path) {
