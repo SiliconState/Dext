@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## v0.2.1 - 2026-10-07
+
+Patch release replacing the unpublished `v0.2.0`, whose release workflow stopped before publication; the `v0.2.0` tag is retained unchanged.
+
+### Fixed
+
+- The release workflow's packaged-binary smoke checks on Linux, macOS and Windows now expect the current empty-catalog `dext pack list` output (`Packs  0 found`) instead of the retired `Packs  none found` text, which had stopped every `v0.2.0` platform build before publication. Application code is unchanged from `v0.2.0`. A new `tests/release_smoke.rs` integration test runs the same version and empty-catalog checks against the built binary in an isolated home and asserts the workflow strings match, so this drift fails branch CI instead of a tagged release.
+
 ## v0.2.0 - 2026-10-06
 
 Second tagged release; the default `install.sh`/`install.ps1` paths now download these prebuilt archives. The changelog was not split at `v0.1.0`, so the entries below also include changes that first shipped in `v0.1.0`.

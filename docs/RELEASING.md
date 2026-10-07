@@ -59,7 +59,7 @@ The tag workflow must:
 - reject a lightweight tag, a tag commit not contained in `origin/main`, or a tag/version that differs from the `Cargo.toml` package version;
 - run the Linux quality gate: formatting, Clippy with warnings denied, Dext TUI integration tests, benchmark compilation, vulnerability auditing, and dependency-license checks;
 - build and test Linux x86_64 GNU, macOS x86_64, macOS arm64, and Windows x86_64 MSVC with `--release --locked`;
-- run each packaged binary with `--version`;
+- run each packaged binary with `--version` and, under an empty isolated `DEXT_HOME`, require `dext pack list` to report `Packs  0 found` (no bundled pack content); `tests/release_smoke.rs` mirrors both checks in ordinary CI and fails if the workflow's expected header drifts from the binary;
 - publish four archives, one CycloneDX JSON SBOM (`dext.cdx.json`), and one sorted, verified `SHA256SUMS` covering every asset;
 - generate and verify GitHub build-provenance attestations for every checksummed asset before creating the release.
 
