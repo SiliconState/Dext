@@ -322,6 +322,28 @@ fn test_connection_accept_has_a_deadline() {
     assert!(started.elapsed() < Duration::from_secs(5));
 }
 
+#[test]
+fn test_connection_accept_reads_a_delayed_client() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let address = listener.local_addr()?;
+    let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || -> Result<u8> {
+        let mut stream = accept_test_connection(&listener, Duration::from_secs(5))?;
+        accepted_tx.send(())?;
+        let mut byte = [0];
+        stream.read_exact(&mut byte)?;
+        Ok(byte[0])
+    });
+    let mut client = std::net::TcpStream::connect(address)?;
+    accepted_rx.recv_timeout(Duration::from_secs(5))?;
+    std::thread::sleep(Duration::from_millis(75));
+    let written = client.write_all(b"x");
+    let received = server.join().expect("delayed-client fixture");
+    written?;
+    assert_eq!(received?, b'x');
+    Ok(())
+}
+
 #[cfg(windows)]
 #[test]
 fn atomic_state_replace_preserves_old_readers_and_refuses_delete_locks() -> Result<()> {
@@ -6806,6 +6828,12 @@ async fn non_aborting_runtime_control_keeps_pending_provider_response() {
         while std::time::Instant::now() < deadline {
             match listener.accept() {
                 Ok((mut stream, _)) => {
+                    stream
+                        .set_nonblocking(false)
+                        .expect("blocking accepted stream");
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(1)))
+                        .expect("response timeout");
                     server_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(50)));
                     let mut request = [0u8; 4096];
@@ -14951,17 +14979,10 @@ async fn provider_total_timeout_bounds_headers_and_trickling_bodies() {
         let server = std::thread::spawn(move || {
             let deadline = Instant::now() + safety_timeout;
             ready_tx.send(()).unwrap();
-            let mut stream = loop {
-                match listener.accept() {
-                    Ok((stream, _)) => break stream,
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                        if Instant::now() >= deadline {
-                            return;
-                        }
-                        std::thread::sleep(Duration::from_millis(5));
-                    }
-                    Err(error) => panic!("accept: {error}"),
-                }
+            let mut stream = match accept_test_connection(&listener, safety_timeout) {
+                Ok(stream) => stream,
+                Err(error) if error.kind() == io::ErrorKind::TimedOut => return,
+                Err(error) => panic!("accept: {error}"),
             };
             stream
                 .set_read_timeout(Some(Duration::from_secs(3)))
@@ -15010,37 +15031,48 @@ async fn provider_total_timeout_bounds_headers_and_trickling_bodies() {
         });
         ready_rx.recv_timeout(safety_timeout).unwrap();
         let started = Instant::now();
-        let response = send_provider_request(request, safety_timeout).await;
-        let error = if mode == "headers" {
-            response.unwrap_err()
-        } else {
-            let response = response.expect("headers arrive before total timeout");
-            if mode == "sse" {
-                agent
-                    .read_provider_stream(response, RequestContract::OpenAiChatCompletions)
-                    .await
-                    .unwrap_err()
-            } else if mode == "error" {
-                assert_eq!(response.status().as_u16(), 500);
-                read_provider_error_body(response, safety_timeout)
-                    .await
-                    .unwrap_err()
+        let outcome: Result<()> = async {
+            let response = send_provider_request(request, safety_timeout).await;
+            let error = if mode == "headers" {
+                response
+                    .err()
+                    .context("stalled headers unexpectedly completed")?
             } else {
-                read_provider_json_body(response, safety_timeout)
-                    .await
-                    .unwrap_err()
+                let response = response.context("headers arrive before total timeout")?;
+                let error = if mode == "sse" {
+                    agent
+                        .read_provider_stream(response, RequestContract::OpenAiChatCompletions)
+                        .await
+                        .err()
+                } else if mode == "error" {
+                    anyhow::ensure!(response.status().as_u16() == 500, "fixture status");
+                    read_provider_error_body(response, safety_timeout)
+                        .await
+                        .err()
+                } else {
+                    read_provider_json_body(response, safety_timeout)
+                        .await
+                        .err()
+                };
+                error.context("trickling body unexpectedly completed")?
+            };
+            anyhow::ensure!(
+                error.to_string().contains("total request timeout"),
+                "{mode}: {error:#}"
+            );
+            anyhow::ensure!(
+                started.elapsed() < safety_timeout,
+                "{mode}: exceeded safety timeout"
+            );
+            if mode != "headers" {
+                anyhow::ensure!(chunks_sent.load(Ordering::SeqCst) > 1, "{mode}: no trickle");
             }
-        };
-        stop.store(true, Ordering::SeqCst);
-        assert!(
-            error.to_string().contains("total request timeout"),
-            "{mode}: {error:#}"
-        );
-        assert!(started.elapsed() < safety_timeout, "{mode}");
-        if mode != "headers" {
-            assert!(chunks_sent.load(Ordering::SeqCst) > 1, "{mode}: no trickle");
+            Ok(())
         }
-        server.join().unwrap();
+        .await;
+        stop.store(true, Ordering::SeqCst);
+        server.join().expect("reap total-timeout fixture");
+        outcome.unwrap_or_else(|error| panic!("{mode}: {error:#}"));
     }
 }
 
