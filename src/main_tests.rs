@@ -29234,8 +29234,17 @@ fn anthropic_login_starts_subscription_oauth_even_when_api_key_env_exists() -> R
             login.message
         );
         assert!(login.message.contains("code=true"), "{}", login.message);
+        let pending: Value =
+            serde_json::from_slice(&std::fs::read(crate::provider::pending_oauth_path())?)?;
+        let redirect = reqwest::Url::parse(pending["redirect_uri"].as_str().unwrap())?;
+        assert_eq!(redirect.host_str(), Some("localhost"));
+        assert_eq!(redirect.path(), "/callback");
+        assert!(redirect.port().is_some_and(|port| port != 0));
         assert!(
-            login.message.contains("localhost%3A53692%2Fcallback"),
+            login.message.contains(&format!(
+                "localhost%3A{}%2Fcallback",
+                redirect.port().unwrap()
+            )),
             "{}",
             login.message
         );
@@ -29243,10 +29252,10 @@ fn anthropic_login_starts_subscription_oauth_even_when_api_key_env_exists() -> R
         Ok(())
     })();
 
+    let _ = cancel_pending_oauth_login();
     restore_env_var("DEXT_HOME", old_dext_home);
     restore_env_var("ANTHROPIC_API_KEY", old_anthropic_key);
     restore_env_var("DEXT_SKIP_BROWSER_OPEN", old_skip_browser);
-    let _ = cancel_pending_oauth_login();
     let _ = std::fs::remove_dir_all(&root);
     result
 }

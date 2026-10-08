@@ -4135,12 +4135,13 @@ fn await_oauth_browser_result(
 ) -> Option<OAuthBrowserResult> {
     let deadline = std::time::Instant::now() + timeout;
     loop {
+        // Login queues its result before Drop cancels and joins the listener.
         if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
-            return None;
+            return receiver.try_recv().ok();
         }
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
-            return None;
+            return receiver.try_recv().ok();
         }
         match receiver.recv_timeout(remaining.min(Duration::from_millis(50))) {
             Ok(result) => return Some(result),
@@ -4426,6 +4427,104 @@ fn oauth_callback_host(oauth: &OAuthFlow) -> Result<String> {
     Ok(address.to_string())
 }
 
+fn parse_windows_oauth_unavailable_ports(output: &str) -> Vec<(u16, u16)> {
+    output
+        .lines()
+        .take(2048)
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let start = fields.next()?.parse::<u16>().ok()?;
+            let end = fields.next()?.parse::<u16>().ok()?;
+            if start == 0
+                || start > end
+                || fields.next().is_some_and(|field| field != "*")
+                || fields.next().is_some()
+            {
+                return None;
+            }
+            Some((start, end))
+        })
+        .collect()
+}
+
+fn wsl_oauth_unavailable_ports(host: &str) -> Vec<(u16, u16)> {
+    if !running_in_wsl() {
+        return Vec::new();
+    }
+    let family = if host.contains(':') { "ipv6" } else { "ipv4" };
+    let script = format!(
+        "$ErrorActionPreference='Stop'; netsh.exe interface {family} show excludedportrange protocol=tcp; \
+         if ($LASTEXITCODE -ne 0) {{ exit $LASTEXITCODE }}; \
+         Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | \
+         ForEach-Object {{ '{{0}} {{0}}' -f $_.LocalPort }}; exit 0"
+    );
+    let mut command = Command::new("powershell.exe");
+    command
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .stdin(std::process::Stdio::null());
+    // WSL can bind Windows-reserved/occupied ports that localhost forwarding cannot use.
+    let Ok(output) = crate::run_internal_command_limited(
+        command,
+        "WSL OAuth port availability",
+        Duration::from_secs(5),
+    ) else {
+        return Vec::new();
+    };
+    if !output.success() || output.stdout.len() > 64 * 1024 {
+        return Vec::new();
+    }
+    parse_windows_oauth_unavailable_ports(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn oauth_allows_dynamic_callback(oauth: &OAuthFlow) -> bool {
+    oauth.protocol == OAuthProtocol::AnthropicClaude
+        && oauth.authorize_url == "https://claude.ai/oauth/authorize"
+        && oauth.client_id == "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+}
+
+fn bind_oauth_callback(
+    host: &str,
+    redirect_uri: &str,
+    allow_dynamic_port: bool,
+    unavailable_ports: &[(u16, u16)],
+) -> Result<(std::net::TcpListener, String)> {
+    let preferred_port = oauth_callback_port(redirect_uri)?;
+    let unavailable = |port| {
+        unavailable_ports
+            .iter()
+            .any(|&(start, end)| start <= port && port <= end)
+    };
+    let preferred = if unavailable(preferred_port) {
+        Err(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "port is reserved or occupied on Windows and unavailable to WSL localhost forwarding",
+        ))
+    } else {
+        std::net::TcpListener::bind(oauth_bind_address(host, preferred_port))
+    };
+    let preferred_error = match preferred {
+        Ok(listener) => return Ok((listener, redirect_uri.to_string())),
+        Err(error) if !allow_dynamic_port => return Err(error.into()),
+        Err(error) => error,
+    };
+    // Only the reviewed Anthropic client permits variable loopback redirect ports.
+    for _ in 0..32 {
+        let listener = std::net::TcpListener::bind(oauth_bind_address(host, 0))?;
+        let port = listener.local_addr()?.port();
+        if unavailable(port) {
+            continue;
+        }
+        let mut redirect = reqwest::Url::parse(redirect_uri)?;
+        redirect
+            .set_port(Some(port))
+            .map_err(|()| anyhow::anyhow!("set OAuth callback port"))?;
+        return Ok((listener, redirect.to_string()));
+    }
+    anyhow::bail!(
+        "preferred port {preferred_port} unavailable: {preferred_error}; no usable loopback port after 32 attempts"
+    )
+}
+
 fn oauth_bind_address(host: &str, port: u16) -> String {
     if host.contains(':') {
         format!("[{host}]:{port}")
@@ -4437,13 +4536,21 @@ fn oauth_bind_address(host: &str, port: u16) -> String {
 fn oauth_callback_port(redirect_uri: &str) -> Result<u16> {
     let url = reqwest::Url::parse(redirect_uri)
         .with_context(|| format!("invalid OAuth redirect URI '{redirect_uri}'"))?;
-    if url.host_str() != Some("localhost") {
+    if url.scheme() != "http"
+        || url.host_str() != Some("localhost")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
         anyhow::bail!(
-            "OAuth redirect URI must target localhost for CLI flow, got '{redirect_uri}'"
+            "OAuth redirect URI must use plain HTTP localhost without credentials or a fragment, got '{redirect_uri}'"
         );
     }
     url.port_or_known_default()
-        .ok_or_else(|| anyhow::anyhow!("OAuth redirect URI has no port: {redirect_uri}"))
+        .filter(|port| *port != 0)
+        .ok_or_else(|| {
+            anyhow::anyhow!("OAuth redirect URI must have a nonzero port: {redirect_uri}")
+        })
 }
 
 pub(crate) fn oauth_originator() -> String {
@@ -4511,39 +4618,57 @@ fn run_oauth_login(oauth: &OAuthFlow, profile: &ProviderProfile) -> Result<Login
         generate_oauth_state()?
     };
 
-    let redirect_uri = oauth
+    let preferred_redirect_uri = oauth
         .redirect_uri
         .as_deref()
         .unwrap_or("http://localhost:1455/auth/callback");
     let callback_host = oauth_callback_host(oauth)?;
-    let callback_port = oauth_callback_port(redirect_uri)?;
-
-    let callback_path = reqwest::Url::parse(redirect_uri)
+    let preferred_port = oauth_callback_port(preferred_redirect_uri)?;
+    let callback_path = reqwest::Url::parse(preferred_redirect_uri)
         .context("parse OAuth callback URI")?
         .path()
         .to_string();
-    let bind_addr = oauth_bind_address(&callback_host, callback_port);
-    let (rx2, listener_warning) = match std::net::TcpListener::bind(&bind_addr) {
-        Ok(listener) => (
-            Some(spawn_oauth_code_listener(
-                listener,
-                state.clone(),
-                callback_path.clone(),
-            )?),
-            None,
-        ),
+    let allow_dynamic_port = oauth_allows_dynamic_callback(oauth);
+    let unavailable_ports = if allow_dynamic_port {
+        wsl_oauth_unavailable_ports(&callback_host)
+    } else {
+        Vec::new()
+    };
+    let (rx2, redirect_uri, listener_notice) = match bind_oauth_callback(
+        &callback_host,
+        preferred_redirect_uri,
+        allow_dynamic_port,
+        &unavailable_ports,
+    ) {
+        Ok((listener, redirect_uri)) => {
+            let selected_port = listener.local_addr()?.port();
+            let notice = (selected_port != preferred_port).then(|| format!(
+                "[info] preferred OAuth callback port {preferred_port} is unavailable; using loopback port {selected_port} for this login."
+            ));
+            (
+                Some(spawn_oauth_code_listener(
+                    listener,
+                    state.clone(),
+                    callback_path.clone(),
+                )?),
+                redirect_uri,
+                notice,
+            )
+        }
         Err(e) => (
             None,
+            preferred_redirect_uri.to_string(),
             Some(format!(
-                "could not bind OAuth callback listener on {bind_addr}: {e}. You must paste the callback URL or authorization code manually."
+                "[warn] could not bind OAuth callback listener on {}: {e}. You must paste the callback URL or authorization code manually.",
+                oauth_bind_address(&callback_host, preferred_port)
             )),
         ),
     };
-
+    let callback_port = oauth_callback_port(&redirect_uri)?;
     let authorize_url =
-        build_oauth_authorize_url(oauth, profile, redirect_uri, &state, &code_challenge)?;
+        build_oauth_authorize_url(oauth, profile, &redirect_uri, &state, &code_challenge)?;
 
-    save_pending_oauth(&profile.id, &code_verifier, &state, redirect_uri)?;
+    save_pending_oauth(&profile.id, &code_verifier, &state, &redirect_uri)?;
 
     let manual_code_description = if oauth.protocol == OAuthProtocol::AnthropicClaude {
         "the authorization code"
@@ -4555,16 +4680,16 @@ fn run_oauth_login(oauth: &OAuthFlow, profile: &ProviderProfile) -> Result<Login
 (http://localhost:{callback_port}{callback_path}?code=...) or just {manual_code_description} \
 directly into dext. /login cancel aborts."
     );
-    let listener_suffix = listener_warning
+    let listener_suffix = listener_notice
         .as_ref()
-        .map(|w| format!("\n[warn] {w}"))
+        .map(|notice| format!("\n{notice}"))
         .unwrap_or_default();
 
     match open_url_in_browser(&authorize_url) {
         Ok(msg) if msg.starts_with("disabled-by-") => {
             set_active_provider_in_catalog(&profile.id)?;
             let reason = if msg == "disabled-by-wsl" {
-                "browser open disabled on WSL by default for reliability. "
+                "browser open disabled by DEXT_DISABLE_WSL_BROWSER_OPEN. "
             } else {
                 "browser open disabled. "
             };
@@ -4626,7 +4751,7 @@ directly into dext. /login cancel aborts."
             );
         }
     };
-    let token_response = exchange_oauth_code(oauth, &code, &code_verifier, &state, redirect_uri);
+    let token_response = exchange_oauth_code(oauth, &code, &code_verifier, &state, &redirect_uri);
 
     match token_response {
         Ok(tokens) => {
@@ -4651,7 +4776,7 @@ directly into dext. /login cancel aborts."
                 clear_pending_oauth_if_matches(&profile.id, &code_verifier, &state);
                 Ok(LoginResult {
                     message: format!(
-                        "OAuth login successful for provider '{}'. Credentials stored.",
+                        "OAuth login successful for provider '{}'. Credentials stored.{listener_suffix}",
                         profile.id
                     ),
                     provider_id: profile.id.clone(),
@@ -6104,6 +6229,368 @@ mod tests {
             ApiProvider::Anthropic,
             "http://127.0.0.1:8080"
         ));
+    }
+
+    #[test]
+    fn oauth_browser_result_survives_listener_shutdown_or_deadline() {
+        for cancelled in [false, true] {
+            let cancelled = std::sync::atomic::AtomicBool::new(cancelled);
+            for result in [OAuthBrowserResult::Success, OAuthBrowserResult::Failure] {
+                let (sender, receiver) = std::sync::mpsc::channel();
+                sender.send(result).unwrap();
+                let received = await_oauth_browser_result(&receiver, &cancelled, Duration::ZERO);
+                assert!(matches!(
+                    (result, received),
+                    (
+                        OAuthBrowserResult::Success,
+                        Some(OAuthBrowserResult::Success)
+                    ) | (
+                        OAuthBrowserResult::Failure,
+                        Some(OAuthBrowserResult::Failure)
+                    )
+                ));
+            }
+            let (_sender, receiver) = std::sync::mpsc::channel();
+            assert!(await_oauth_browser_result(&receiver, &cancelled, Duration::ZERO).is_none());
+        }
+    }
+
+    #[test]
+    fn oauth_callback_rejects_unreachable_or_unsafe_redirects() {
+        for redirect in [
+            "http://localhost:0/callback",
+            "https://localhost:53692/callback",
+            "ftp://localhost:53692/callback",
+            "http://user@localhost:53692/callback",
+            "http://localhost:53692/callback#fragment",
+            "http://example.com:53692/callback",
+        ] {
+            assert!(oauth_callback_port(redirect).is_err(), "{redirect}");
+            assert!(bind_oauth_callback("127.0.0.1", redirect, true, &[]).is_err());
+        }
+        assert_eq!(
+            oauth_callback_port("http://localhost/callback").unwrap(),
+            80
+        );
+    }
+
+    #[test]
+    fn windows_oauth_ports_parse_ranges_and_listeners() {
+        let output = "Protocol tcp Port Exclusion Ranges\nStart Port End Port\n\
+                      ---------- --------\n5357 5357\n50000 50059 *\n53688 53787\n\
+                      * - Administered port exclusions.\n8788 8788\n\
+                      65536 65537\n10 9\n0 10\n123 456 unexpected\n123 456 * extra\n";
+        assert_eq!(
+            parse_windows_oauth_unavailable_ports(output),
+            vec![(5357, 5357), (50000, 50059), (53688, 53787), (8788, 8788)]
+        );
+    }
+
+    #[test]
+    fn oauth_callback_prefers_configured_port() -> Result<()> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        drop(listener);
+        let redirect = format!("http://localhost:{port}/callback");
+        let (listener, selected) = bind_oauth_callback("127.0.0.1", &redirect, true, &[])?;
+        assert_eq!(selected, redirect);
+        assert_eq!(listener.local_addr()?.port(), port);
+        Ok(())
+    }
+
+    #[test]
+    fn oauth_callback_falls_back_on_occupied_or_windows_unavailable_port() -> Result<()> {
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let preferred = occupied.local_addr()?.port();
+        let redirect = format!("http://localhost:{preferred}/callback");
+        let (fallback, selected) = bind_oauth_callback("127.0.0.1", &redirect, true, &[])?;
+        assert_ne!(fallback.local_addr()?.port(), preferred);
+        let parsed = reqwest::Url::parse(&selected)?;
+        assert_eq!(parsed.host_str(), Some("localhost"));
+        assert_eq!(parsed.path(), "/callback");
+        assert_eq!(parsed.port(), Some(fallback.local_addr()?.port()));
+        assert!(fallback.local_addr()?.ip().is_loopback());
+        assert!(bind_oauth_callback("127.0.0.1", &redirect, false, &[]).is_err());
+        drop(occupied);
+        let blocked = [(preferred, preferred)];
+        let (fallback, _) = bind_oauth_callback("127.0.0.1", &redirect, true, &blocked)?;
+        assert_ne!(fallback.local_addr()?.port(), preferred);
+        assert!(bind_oauth_callback("127.0.0.1", &redirect, false, &blocked).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn oauth_callback_completion_drop_keeps_success_and_releases_listener() -> Result<()> {
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let preferred = occupied.local_addr()?.port();
+        let redirect = format!("http://localhost:{preferred}/callback");
+        let (listener, selected) = bind_oauth_callback("127.0.0.1", &redirect, true, &[])?;
+        let address = listener.local_addr()?;
+        let callback = spawn_oauth_code_listener(
+            listener,
+            "expected-state".to_string(),
+            "/callback".to_string(),
+        )?;
+        let browser = std::thread::spawn(move || -> io::Result<String> {
+            let mut stream = std::net::TcpStream::connect(address)?;
+            stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+            stream.write_all(b"GET /callback?code=accepted-code&state=expected-state HTTP/1.1\r\nHost: localhost\r\n\r\n")?;
+            let mut response = String::new();
+            stream.read_to_string(&mut response)?;
+            Ok(response)
+        });
+        let received = callback.recv_timeout(Duration::from_secs(5))?;
+        received.browser_result.send(OAuthBrowserResult::Success)?;
+        drop(callback);
+        let page = browser
+            .join()
+            .map_err(|_| anyhow::anyhow!("browser panic"))??;
+        assert!(page.contains("200 OK"));
+        assert!(page.contains("You're signed in"));
+        assert_eq!(oauth_callback_port(&selected)?, address.port());
+        assert!(std::net::TcpStream::connect_timeout(&address, Duration::from_secs(1)).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn oauth_callback_fallback_is_bounded_and_provider_scoped() -> Result<()> {
+        assert!(
+            bind_oauth_callback(
+                "127.0.0.1",
+                "http://localhost:53692/callback",
+                true,
+                &[(1, u16::MAX)],
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("32 attempts")
+        );
+        let profiles = built_in_provider_profiles();
+        let mut anthropic = profiles
+            .iter()
+            .find(|profile| profile.id == "anthropic")
+            .unwrap()
+            .oauth_flow
+            .clone()
+            .unwrap();
+        assert!(oauth_allows_dynamic_callback(&anthropic));
+        anthropic.client_id = "unreviewed-client".to_string();
+        assert!(!oauth_allows_dynamic_callback(&anthropic));
+        anthropic.client_id = "9d1c250a-e61b-44d9-88ed-5944d1962f5e".to_string();
+        anthropic.authorize_url = "https://custom.example/authorize".to_string();
+        assert!(!oauth_allows_dynamic_callback(&anthropic));
+        assert!(!oauth_allows_dynamic_callback(
+            profiles
+                .iter()
+                .find(|profile| profile.id == "chatgpt")
+                .unwrap()
+                .oauth_flow
+                .as_ref()
+                .unwrap()
+        ));
+        assert!(
+            bind_oauth_callback("127.0.0.1", "http://example.com:53692/callback", true, &[])
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn oauth_dynamic_callback_browser_exchange_and_storage_use_same_redirect() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let _guard = crate::test_env_lock();
+        let home = temp_home("dynamic-oauth");
+        let bin = home.join("bin");
+        std::fs::create_dir_all(&bin)?;
+        let marker = home.join("authorize-url");
+        for name in ["wslview", "xdg-open"] {
+            let path = bin.join(name);
+            std::fs::write(
+                &path,
+                "#!/bin/sh\nprintf '%s' \"$1\" > \"$BROWSER_TEST_MARKER.tmp\" && mv \"$BROWSER_TEST_MARKER.tmp\" \"$BROWSER_TEST_MARKER\"\n",
+            )?;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+        }
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let preferred = occupied.local_addr()?.port();
+        let probe = bin.join("powershell.exe");
+        std::fs::write(
+            &probe,
+            format!("#!/bin/sh\nprintf '{preferred} {preferred}\\n'\n"),
+        )?;
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o700))?;
+        let names = [
+            "DEXT_HOME",
+            "PATH",
+            "BROWSER_TEST_MARKER",
+            "DEXT_SKIP_BROWSER_OPEN",
+            "DEXT_DISABLE_WSL_BROWSER_OPEN",
+            "DEXT_OAUTH_CALLBACK_HOST",
+            "NO_PROXY",
+            "no_proxy",
+            "WSL_DISTRO_NAME",
+        ];
+        struct Cleanup {
+            home: PathBuf,
+            old: [(&'static str, Option<std::ffi::OsString>); 9],
+        }
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                for (name, value) in &self.old {
+                    unsafe {
+                        match value {
+                            Some(value) => std::env::set_var(name, value),
+                            None => std::env::remove_var(name),
+                        }
+                    }
+                }
+                let _ = std::fs::remove_dir_all(&self.home);
+            }
+        }
+        let _cleanup = Cleanup {
+            home: home.clone(),
+            old: names.map(|name| (name, std::env::var_os(name))),
+        };
+        let mut paths = vec![bin];
+        paths.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        let path = std::env::join_paths(paths)?;
+        unsafe {
+            std::env::set_var("DEXT_HOME", &home);
+            std::env::set_var("PATH", path);
+            std::env::set_var("BROWSER_TEST_MARKER", &marker);
+            std::env::set_var("DEXT_OAUTH_CALLBACK_HOST", "127.0.0.1");
+            std::env::remove_var("DEXT_SKIP_BROWSER_OPEN");
+            std::env::remove_var("DEXT_DISABLE_WSL_BROWSER_OPEN");
+            std::env::set_var("NO_PROXY", "localhost,127.0.0.1");
+            std::env::set_var("no_proxy", "localhost,127.0.0.1");
+            std::env::set_var("WSL_DISTRO_NAME", "dext-oauth-fixture");
+        }
+        (|| -> Result<()> {
+            assert_eq!(
+                wsl_oauth_unavailable_ports("127.0.0.1"),
+                vec![(preferred, preferred)]
+            );
+            let token_listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+            let token_address = token_listener.local_addr()?;
+            token_listener.set_nonblocking(true)?;
+            let token_server = std::thread::spawn(move || -> Result<Value> {
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                let mut stream = loop {
+                    match token_listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error)
+                            if error.kind() == io::ErrorKind::WouldBlock
+                                && std::time::Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                };
+                stream.set_nonblocking(false)?;
+                stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+                let mut request = Vec::new();
+                let body = loop {
+                    let mut buffer = [0u8; 4096];
+                    let count = stream.read(&mut buffer)?;
+                    anyhow::ensure!(
+                        count > 0 && request.len() + count <= 16 * 1024,
+                        "incomplete token request"
+                    );
+                    request.extend_from_slice(&buffer[..count]);
+                    if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..end]);
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().ok())
+                                    .flatten()
+                            })
+                            .context("token request length")?;
+                        if request.len() >= end + 4 + length {
+                            break serde_json::from_slice::<Value>(
+                                &request[end + 4..end + 4 + length],
+                            )?;
+                        }
+                    }
+                };
+                let response = serde_json::json!({
+                    "access_token": "dynamic-fixture-access",
+                    "refresh_token": "dynamic-fixture-refresh",
+                    "expires_in": 3600,
+                })
+                .to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                    response.len()
+                )?;
+                Ok(body)
+            });
+            let browser = std::thread::spawn(move || -> Result<(String, String)> {
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                let url = loop {
+                    if let Ok(value) = std::fs::read_to_string(&marker)
+                        && !value.is_empty()
+                    {
+                        break reqwest::Url::parse(&value)?;
+                    }
+                    anyhow::ensure!(
+                        std::time::Instant::now() < deadline,
+                        "browser launcher timeout"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                };
+                let params = url.query_pairs().collect::<HashMap<_, _>>();
+                let redirect = params
+                    .get("redirect_uri")
+                    .context("browser redirect")?
+                    .to_string();
+                let callback = reqwest::Url::parse(&redirect)?;
+                let port = callback.port().context("callback port")?;
+                assert_ne!(port, preferred);
+                let state = params.get("state").context("callback state")?;
+                let mut stream = std::net::TcpStream::connect(("127.0.0.1", port))?;
+                stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+                write!(
+                    stream,
+                    "GET /callback?code=dynamic-code&state={state} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                )?;
+                let mut response = String::new();
+                stream.read_to_string(&mut response)?;
+                Ok((redirect, response))
+            });
+            let mut profile = built_in_provider_profiles()
+                .into_iter()
+                .find(|profile| profile.id == "anthropic")
+                .unwrap();
+            let mut oauth = profile.oauth_flow.clone().unwrap();
+            oauth.redirect_uri = Some(format!("http://localhost:{preferred}/callback"));
+            oauth.token_url = format!("http://{token_address}/token");
+            profile.oauth_flow = Some(oauth.clone());
+            let login = run_oauth_login(&oauth, &profile);
+            let token_result = token_server.join();
+            let browser_result = browser.join();
+            let token_request =
+                token_result.map_err(|_| anyhow::anyhow!("token server panic"))??;
+            let (redirect, page) =
+                browser_result.map_err(|_| anyhow::anyhow!("browser panic"))??;
+            assert!(!login?.awaiting_credentials);
+            assert_eq!(token_request["redirect_uri"], redirect);
+            assert_eq!(token_request["code"], "dynamic-code");
+            assert!(page.contains("200 OK"));
+            assert!(page.contains("You're signed in"));
+            assert!(!page.contains("dynamic-fixture-access"));
+            assert!(load_auth_store()?.providers.contains_key("anthropic"));
+            assert!(load_pending_oauth().is_none());
+            Ok(())
+        })()
     }
 
     #[test]
