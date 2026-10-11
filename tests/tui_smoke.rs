@@ -352,6 +352,10 @@ fn tui_streams_mermaid_and_prose_into_history_before_provider_completion() {
     assert!(!output.contains("flowchart LR"), "{output}");
     assert!(!output.contains("completion-after-release"));
     assert_eq!(output.matches("┌─ dext").count(), 1, "{output}");
+    assert!(
+        output.contains("Responding  ·  "),
+        "response activity missing above composer: {output}"
+    );
     pty.write_all_retry(b"/compact 13").unwrap();
     pty.pump_for(&mut child, Duration::from_millis(200))
         .unwrap();
@@ -381,6 +385,10 @@ fn tui_streams_mermaid_and_prose_into_history_before_provider_completion() {
         "{narrow}"
     );
     assert!(!narrow.contains("Mermaid source"), "{narrow}");
+    assert_response_painted_below_activity(
+        &pty.capture[narrow_start..],
+        "live-tail-before-complete",
+    );
     release_tx.send(()).unwrap();
     assert_visible(
         &mut pty,
@@ -516,6 +524,10 @@ fn tui_thinking_handoff_keeps_answer_card_contiguous_without_completion_repaint(
     assert!(
         live.rfind("pending-thinking-before-answer").unwrap() < live.find("┌─ dext").unwrap(),
         "{live}"
+    );
+    assert!(
+        live.contains("Responding  ·  "),
+        "response activity missing above composer: {live}"
     );
     pty.write_all_retry(b"/compact 17").unwrap();
     pty.pump_for(&mut child, Duration::from_millis(150))
@@ -1424,6 +1436,77 @@ fn byte_offsets(haystack: &[u8], needle: &[u8]) -> Vec<usize> {
         .enumerate()
         .filter_map(|(index, window)| (window == needle).then_some(index))
         .collect()
+}
+
+fn absolute_paint_row(capture: &[u8], needle: &str) -> Option<usize> {
+    let end = byte_offsets(capture, needle.as_bytes()).last().copied()?;
+    let mut row = None;
+    let mut offset = 0;
+    while offset < end {
+        if capture[offset..].starts_with(b"\x1b[") {
+            let start = offset + 2;
+            let final_offset = capture
+                .get(start..end)?
+                .iter()
+                .position(|byte| (b'@'..=b'~').contains(byte))?
+                + start;
+            match capture[final_offset] {
+                b'H' | b'f' => {
+                    let params = std::str::from_utf8(&capture[start..final_offset]).ok()?;
+                    let first = params.split(';').next()?;
+                    row = Some(if first.is_empty() {
+                        1
+                    } else {
+                        first.parse::<usize>().ok()?.max(1)
+                    });
+                }
+                // This checks explicit repaint coordinates, not a terminal emulator.
+                b'A' | b'B' | b'E' | b'F' | b'd' | b'e' | b'r' | b'S' | b'T' | b'L' | b'M'
+                | b'u' => row = None,
+                _ => {}
+            }
+            offset = final_offset + 1;
+        } else if capture[offset] == b'\x1b' {
+            row = None;
+            offset += 2;
+        } else {
+            if capture[offset] == b'\n' {
+                row = None;
+            }
+            offset += 1;
+        }
+    }
+    row
+}
+
+fn assert_response_painted_below_activity(capture: &[u8], marker: &str) {
+    let activity =
+        absolute_paint_row(capture, "Responding  ·  ").expect("absolute activity repaint");
+    let response = absolute_paint_row(capture, marker).expect("absolute live response repaint");
+    assert!(
+        activity < response,
+        "activity row {activity}, response row {response}"
+    );
+}
+
+#[test]
+fn response_repaint_coordinates_distinguish_status_order_and_reject_ambiguous_moves() {
+    let expected = b"\x1b[8;1H\x1b[33mResponding  \xc2\xb7  0s\x1b[9;1H\x1b[0mlive-tail";
+    assert_response_painted_below_activity(expected, "live-tail");
+    let reversed = b"\x1b[9;1HResponding  \xc2\xb7  0s\x1b[8;1Hlive-tail";
+    assert!(
+        absolute_paint_row(reversed, "Responding").unwrap()
+            > absolute_paint_row(reversed, "live-tail").unwrap()
+    );
+    for ambiguous in [
+        b"live-tail".as_slice(),
+        b"\x1b[8;1H\n live-tail",
+        b"\x1b[8;1H\x1b[2Blive-tail",
+        b"\x1b[8;1H\x1b8live-tail",
+    ] {
+        assert_eq!(absolute_paint_row(ambiguous, "live-tail"), None);
+    }
+    assert_eq!(absolute_paint_row(expected, "missing"), None);
 }
 
 fn resize_replay_transactions(capture: &[u8]) -> Result<Vec<&[u8]>, &'static str> {

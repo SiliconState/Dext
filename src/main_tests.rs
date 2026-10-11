@@ -6885,6 +6885,77 @@ async fn non_aborting_runtime_control_keeps_pending_provider_response() {
 }
 
 #[tokio::test]
+async fn provider_retry_wait_preserves_deadline_after_status_control() {
+    let root = temp_test_dir("retry-wait-status");
+    let mut agent = test_agent(&root);
+    agent.session_enabled = false;
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    agent.install_runtime_controls(rx, tx.clone());
+    tx.send("/effort status".into()).unwrap();
+    let started = tokio::time::Instant::now();
+    let wait = agent.interrupt_aware_sleep(1);
+    tokio::pin!(wait);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut wait)
+            .await
+            .is_err(),
+        "status control bypassed retry wait"
+    );
+    let result = tokio::time::timeout(Duration::from_secs(5), &mut wait)
+        .await
+        .unwrap();
+    assert!(!result.aborted_stream);
+    assert_eq!(result.commands, 1);
+    assert!(started.elapsed() >= Duration::from_secs(1));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn provider_retry_wait_still_observes_interrupt_and_route_controls() {
+    let root = temp_test_dir("retry-wait-cancellation");
+    let mut agent = test_agent(&root);
+    agent.session_enabled = false;
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    agent.install_runtime_controls(rx, tx.clone());
+    tx.send("/effort status".into()).unwrap();
+    let interrupt = agent.interrupt.clone();
+    let cancel = async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        interrupt.store(true, Ordering::SeqCst);
+    };
+    let (result, ()) = tokio::join!(
+        tokio::time::timeout(Duration::from_secs(2), agent.interrupt_aware_sleep(60)),
+        cancel
+    );
+    assert!(!result.unwrap().aborted_stream);
+    agent.interrupt.store(false, Ordering::SeqCst);
+    agent.thinking_effort = ThinkingEffort::Medium;
+    tx.send("/effort high".into()).unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(2), agent.interrupt_aware_sleep(60))
+        .await
+        .unwrap();
+    assert!(result.aborted_stream);
+    assert!(result.changed_effort);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn provider_runtime_control_waiter_disables_closed_receivers() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    drop(tx);
+    let mut receiver = Some(rx);
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(25),
+            queued_runtime_control_waiter(&mut receiver)
+        )
+        .await
+        .is_err()
+    );
+    assert!(receiver.is_none());
+}
+
+#[tokio::test]
 async fn transient_503_burst_retries_through_six_attempts_before_success() {
     assert_provider_http_retry_case(503, 6, true, false).await;
 }
@@ -7017,6 +7088,15 @@ async fn assert_provider_http_retry_case(
             error.contains(if interrupted { "interrupted" } else { "HTTP" }),
             "{error}"
         );
+        if !interrupted && status == 503 {
+            assert!(error.contains("upstream connect error"), "{error}");
+            assert!(error.contains(&format!(
+                "Provider retry budget exhausted after {requests} attempts on local/{DEFAULT_LOCAL_MODEL}."
+            )), "{error}");
+            assert!(error.contains("/provider or /model"), "{error}");
+        } else {
+            assert!(!error.contains("retry budget exhausted"), "{error}");
+        }
     }
     assert_eq!(bodies.len(), requests);
     assert!(bodies.windows(2).all(|pair| pair[0] == pair[1]));

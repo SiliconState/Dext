@@ -13154,11 +13154,13 @@ fn apply_queued_runtime_controls(agent: &mut Agent) -> AppliedRuntimeControls {
 async fn queued_runtime_control_waiter(
     rx: &mut Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
 ) -> Option<String> {
-    if let Some(rx) = rx {
-        rx.recv().await
-    } else {
-        std::future::pending::<Option<String>>().await
+    if let Some(receiver) = rx {
+        if let Some(message) = receiver.recv().await {
+            return Some(message);
+        }
+        *rx = None;
     }
+    std::future::pending::<Option<String>>().await
 }
 
 fn apply_runtime_control_for_stream(
@@ -15336,14 +15338,24 @@ impl Agent {
         let sleep = tokio::time::sleep(std::time::Duration::from_secs(secs));
         tokio::pin!(sleep);
         let mut ticker = tokio::time::interval(std::time::Duration::from_millis(25));
+        let mut applied = AppliedRuntimeControls::default();
         loop {
             if self.interrupt.load(Ordering::SeqCst) {
-                return AppliedRuntimeControls::default();
+                return applied;
             }
             tokio::select! {
-                _ = &mut sleep => return AppliedRuntimeControls::default(),
+                _ = &mut sleep => return applied,
                 msg = queued_runtime_control_waiter(&mut self.runtime_control_rx) => {
-                    return apply_runtime_control_for_stream(self, msg);
+                    let control = apply_runtime_control_for_stream(self, msg);
+                    applied.commands = applied.commands.saturating_add(control.commands);
+                    applied.changed_model |= control.changed_model;
+                    applied.changed_effort |= control.changed_effort;
+                    applied.changed_mode |= control.changed_mode;
+                    applied.effective_mode_changed |= control.effective_mode_changed;
+                    applied.aborted_stream |= control.aborted_stream;
+                    if applied.aborted_stream {
+                        return applied;
+                    }
                 }
                 _ = ticker.tick() => {}
             }
@@ -19372,6 +19384,14 @@ impl Agent {
 
                             if !plan.retry || attempt >= MAX_HTTP_ATTEMPTS {
                                 let error = http_status_error(status, &text);
+                                let error = if plan.retry {
+                                    format!(
+                                        "{error}\nProvider retry budget exhausted after {attempt} attempts on {}/{}. Retry later or select another route with /provider or /model.",
+                                        self.provider_id, self.model
+                                    )
+                                } else {
+                                    error
+                                };
                                 self.append_latest_log(
                                     "http_error",
                                     &format!("kind={} {error}", plan.label()),

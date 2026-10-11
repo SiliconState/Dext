@@ -9604,57 +9604,63 @@ fn transcript_live_indicator_text(state: &TuiState, width: u16) -> Option<Text<'
         return None;
     }
     let status = display_busy_status(derived_busy_status(state));
+    let elapsed = live_indicator_elapsed(state).filter(|elapsed| {
+        // Keep at least one status cell beside the spinner and elapsed separator.
+        width as usize >= 3 + 1 + 5 + text_width(elapsed)
+    });
+    let spinner_padding = if width < 3 {
+        if width == 1 { "" } else { " " }
+    } else {
+        "  "
+    };
+    let elapsed_width = elapsed
+        .as_deref()
+        .map_or(0, |elapsed| 5 + text_width(elapsed));
+    let status = clamp_chars(
+        &single_line_display_text(&status),
+        (width as usize).saturating_sub(3 + elapsed_width),
+    );
     let mut top = vec![
         Span::styled(
             SPINNER_FRAMES[(state.frame_count % SPINNER_FRAMES.len() as u64) as usize].to_string(),
             Style::default().fg(Color::Yellow),
         ),
-        Span::raw("  "),
+        Span::raw(spinner_padding),
         Span::styled(status, Style::default().fg(Color::DarkGray)),
     ];
-    if let Some(elapsed) = live_indicator_elapsed(state) {
+    if let Some(elapsed) = elapsed {
         top.push(Span::styled("  ·  ", Style::default().fg(Color::DarkGray)));
         top.push(Span::styled(elapsed, Style::default().fg(Color::Yellow)));
     }
     let status_line = Line::from(top);
     let mut lines = live_indicator_detail(state, width);
-    if state.active_answer.is_some() {
-        lines.push(status_line);
-    } else {
-        lines.insert(0, status_line);
-    }
+    lines.insert(0, status_line);
     Some(Text::from(lines))
 }
 
-fn cap_answer_live_lines(mut lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
-    const ANSWER_TAIL_ROWS: usize = 8;
-    if lines.len() <= ANSWER_TAIL_ROWS + 1 {
+fn cap_live_indicator_lines(
+    mut lines: Vec<Line<'static>>,
+    max_rows: usize,
+    omission: &'static str,
+) -> Vec<Line<'static>> {
+    if max_rows == 0 {
+        return Vec::new();
+    }
+    if lines.len() <= max_rows {
         return lines;
     }
-    let status = lines.pop();
-    let start = lines.len().saturating_sub(ANSWER_TAIL_ROWS - 1);
-    let mut tail = vec![Line::from(Span::styled(
-        "│ …",
-        Style::default().fg(Color::DarkGray),
-    ))];
-    tail.extend(lines.drain(start..));
-    tail.extend(status);
-    tail
-}
-
-fn cap_live_indicator_detail(mut lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
-    const STATUS_ROWS: usize = 1;
-    if lines.len() <= STATUS_ROWS + THINKING_DETAIL_MAX_ROWS {
-        return lines;
+    let mut capped = vec![lines.remove(0)];
+    if max_rows == 1 {
+        return capped;
     }
-    let status = lines.remove(0);
-    let keep = THINKING_DETAIL_MAX_ROWS.saturating_sub(1);
-    let detail_start = lines.len().saturating_sub(keep);
-    let mut capped = vec![
-        status,
-        Line::from(Span::styled("  …", Style::default().fg(Color::DarkGray))),
-    ];
-    capped.extend(lines.drain(detail_start..));
+    if max_rows > 2 {
+        capped.push(Line::from(Span::styled(
+            omission,
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    let start = lines.len().saturating_sub(max_rows - capped.len());
+    capped.extend(lines.drain(start..));
     capped
 }
 
@@ -9819,21 +9825,40 @@ fn render_transcript(frame: &mut ratatui::Frame, state: &mut TuiState, transcrip
     let pending_prompt = pending_permission_prompt_text(state, content_width);
     let prompt_active = pending_prompt.is_some();
     let live_text = pending_prompt.or_else(|| transcript_live_indicator_text(state, content_width));
+    let available_rows = if slash_popup_visible(state) {
+        slash_popup_layout(
+            frame.area(),
+            state.input_area,
+            &slash_completions(&state.input),
+        )
+        .map_or(transcript_area.height, |layout| {
+            layout
+                .rect
+                .y
+                .saturating_sub(transcript_area.y)
+                .min(transcript_area.height)
+        })
+    } else {
+        transcript_area.height
+    } as usize;
     let mut live_lines = live_text
         .as_ref()
         .map(|text| {
             let lines = collect_wrapped_lines(text, content_width);
             if prompt_active {
                 cap_permission_prompt_lines(lines, transcript_area.height as usize)
-            } else if state.active_answer.is_some() {
-                cap_answer_live_lines(lines)
             } else {
-                cap_live_indicator_detail(lines)
+                let (detail_rows, omission) = if state.active_answer.is_some() {
+                    (8, "│ …")
+                } else {
+                    (THINKING_DETAIL_MAX_ROWS, "  …")
+                };
+                cap_live_indicator_lines(lines, available_rows.min(detail_rows + 1), omission)
             }
         })
         .unwrap_or_default();
     if !live_lines.is_empty()
-        && transcript_area.height as usize > live_lines.len()
+        && available_rows > live_lines.len()
         && state.last_line_needs_history_spacing()
         && !state
             .active_answer
@@ -9866,12 +9891,8 @@ fn render_transcript(frame: &mut ratatui::Frame, state: &mut TuiState, transcrip
         return;
     }
 
-    let live_height = live_indicator_lines.min(transcript_area.height as usize) as u16;
-    let live_start = if state.active_answer.is_some() && !prompt_active {
-        0
-    } else {
-        transcript_area.height.saturating_sub(live_height) as usize
-    };
+    let live_height = live_indicator_lines.min(available_rows) as u16;
+    let live_start = available_rows.saturating_sub(live_height as usize);
     let live_area = Rect::new(
         content_area.x,
         content_area.y.saturating_add(live_start as u16),
@@ -10488,19 +10509,33 @@ fn compute_layout(area: ratatui::layout::Rect, state: &TuiState) -> TuiLayout {
     }
 }
 
+fn slash_popup_visible(state: &TuiState) -> bool {
+    !state.show_help
+        && !state.show_todos
+        && state.resume_picker.is_none()
+        && state.path_picker.is_none()
+        && !state.resume_picker_requested
+        && !state.resume_loading
+        && state.pending_local_auth.is_none()
+        && state.pending_perm.is_none()
+        && !state.show_inspector
+        && (!state.agent_busy || state.input.starts_with('/'))
+}
+
 fn slash_popup_layout(
     area: ratatui::layout::Rect,
     input_area: ratatui::layout::Rect,
     completions: &[SlashCompletion],
 ) -> Option<SlashPopupLayout> {
-    if completions.is_empty() || area.width == 0 || area.height < 3 {
+    let available_height = input_area.y.saturating_sub(area.y).min(area.height);
+    if completions.is_empty() || area.width < 3 || available_height < 3 {
         return None;
     }
 
     let visible_count = completions
         .len()
         .min(SLASH_COMPLETION_MAX_VISIBLE)
-        .min(area.height.saturating_sub(2) as usize);
+        .min(available_height.saturating_sub(2) as usize);
     if visible_count == 0 {
         return None;
     }
@@ -10518,14 +10553,17 @@ fn slash_popup_layout(
         .saturating_add(1)
         .min(area_right.saturating_sub(1));
     let max_popup_w = area_right.saturating_sub(popup_x);
-    if max_popup_w == 0 {
+    if max_popup_w < 3 {
         return None;
     }
 
     let desired_w = (name_width as u16).saturating_add(28).max(30);
     let popup_w = desired_w.min(max_popup_w);
-    let popup_h = (visible_count as u16).saturating_add(2).min(area.height);
-    let popup_y = input_area.y.saturating_sub(popup_h).max(area.y);
+    let popup_h = (visible_count as u16).saturating_add(2);
+    let popup_y = area
+        .y
+        .saturating_add(available_height)
+        .saturating_sub(popup_h);
 
     Some(SlashPopupLayout {
         rect: ratatui::layout::Rect::new(popup_x, popup_y, popup_w, popup_h),
@@ -11313,17 +11351,7 @@ fn draw(frame: &mut ratatui::Frame, state: &mut TuiState) {
         render_local_auth_overlay(frame, state, area);
     }
 
-    if !state.show_help
-        && !state.show_todos
-        && state.resume_picker.is_none()
-        && state.path_picker.is_none()
-        && !state.resume_picker_requested
-        && !state.resume_loading
-        && state.pending_local_auth.is_none()
-        && state.pending_perm.is_none()
-        && !state.show_inspector
-        && (!state.agent_busy || state.input.starts_with('/'))
-    {
+    if slash_popup_visible(state) {
         let completions = slash_completions(&state.input);
         if let Some(layout) = slash_popup_layout(area, input_area, &completions) {
             let (sel, scroll) = state
@@ -16306,10 +16334,566 @@ mod tests {
             assert_eq!(actual, expected, "history/live seam at width {width}");
             let screen = draw_to_lines(width, VIEWPORT_HEIGHT, &mut state);
             assert!(
-                !screen[0].trim().is_empty(),
-                "live answer detached from history: {screen:?}"
+                screen[state.live_indicator_top_padding].contains("Responding"),
+                "{screen:?}"
             );
-            assert_eq!(state.live_indicator_top_padding, 0);
+            assert_eq!(
+                state.live_indicator_top_padding + state.live_indicator_lines,
+                state.transcript_area.height as usize
+            );
+        }
+    }
+
+    #[test]
+    fn answer_cosmetic_flow_starts_below_status_and_seals_into_history() {
+        use ratatui::backend::TestBackend;
+        for width in [20, 60, 100, 160] {
+            for height in [6, 10, 28] {
+                let mut terminal = Terminal::with_options(
+                    TestBackend::new(width, height),
+                    TerminalOptions {
+                        viewport: Viewport::Inline(VIEWPORT_HEIGHT),
+                    },
+                )
+                .unwrap();
+                let mut state = answer_test_state();
+                state.input = "draft".into();
+                state.cursor = state.input.len();
+                let mut source = String::new();
+                for (delta, marker) in [
+                    ("live-first", "live-first"),
+                    ("\n\nlive-next", "live-next"),
+                    ("\n\nlive-last", "live-last"),
+                ] {
+                    source.push_str(delta);
+                    state.apply_event(AgentEvent::TextDelta(delta.into()));
+                    state.set_answer_width(width);
+                    flush_pending_insert(&mut terminal, &mut state, width).unwrap();
+                    terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+                    let rows = buffer_to_lines(
+                        terminal.backend().buffer(),
+                        Rect::new(0, 0, width, height),
+                    )
+                    .iter()
+                    .map(rendered_line_text)
+                    .collect::<Vec<_>>();
+                    let status = rows
+                        .iter()
+                        .position(|row| row.contains("Respon"))
+                        .unwrap_or_else(|| {
+                            panic!("missing activity at {width}x{height}: {rows:?}")
+                        });
+                    let live = rows
+                        .iter()
+                        .position(|row| row.contains(marker))
+                        .unwrap_or_else(|| panic!("missing tail at {width}x{height}: {rows:?}"));
+                    assert!(status < live, "{width}x{height}: {rows:?}");
+                    assert_eq!(live + 1, state.input_area.top() as usize, "{rows:?}");
+                    assert_eq!(state.input, "draft");
+                    assert!(!state.transcript_needs_rebuild);
+                    if marker != "live-first" {
+                        let history = state
+                            .transcript
+                            .iter()
+                            .flat_map(|item| flatten_lines(&line_to_text(item, width - 1)))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        assert_eq!(history.matches("live-first").count(), 1, "{history}");
+                        assert!(!history.contains(marker), "{history}");
+                        assert!(!history.contains("Responding"), "{history}");
+                    }
+                }
+                state.apply_event(AgentEvent::TextBlockComplete(source));
+                assert!(!state.transcript_needs_rebuild);
+                flush_pending_insert(&mut terminal, &mut state, width).unwrap();
+                state.agent_busy = false;
+                terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+                let backend = terminal.backend();
+                let rendered = [backend.scrollback(), backend.buffer()]
+                    .into_iter()
+                    .flat_map(|buffer| buffer_to_lines(buffer, buffer.area))
+                    .map(|line| rendered_line_text(&line))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                for marker in ["live-first", "live-next", "live-last", "┌─ dext"] {
+                    assert_eq!(rendered.matches(marker).count(), 1, "{rendered}");
+                }
+                assert!(!rendered.contains("Responding"), "{rendered}");
+                assert_eq!(state.input, "draft");
+            }
+        }
+    }
+
+    #[test]
+    fn live_activity_review_keeps_thinking_and_tool_status_in_short_panes() {
+        for tool in [false, true] {
+            for height in [5, 6, 10, 20] {
+                let mut state = answer_test_state();
+                state.verbose = true;
+                if tool {
+                    state.apply_event(AgentEvent::ToolCallStart {
+                        call_id: "review-tool".into(),
+                        name: "bash".into(),
+                        summary: "newest-detail".into(),
+                    });
+                } else {
+                    state.apply_event(AgentEvent::ThinkingDelta(format!(
+                        "{}newest-detail",
+                        "earlier thought ".repeat(25)
+                    )));
+                }
+                let rows = draw_to_lines(60, height, &mut state);
+                let live = &rows
+                    [state.transcript_area.top() as usize..state.transcript_area.bottom() as usize];
+                let activity = live
+                    .iter()
+                    .position(|row| row.contains(if tool { "Running bash" } else { "Thinking" }))
+                    .unwrap_or_else(|| panic!("missing status at height {height}: {rows:?}"));
+                if height > 5 {
+                    let detail = live
+                        .iter()
+                        .position(|row| row.contains("newest-detail"))
+                        .unwrap();
+                    assert!(activity < detail, "{rows:?}");
+                }
+                assert!(
+                    state.live_indicator_line_layout.unwrap().1
+                        <= state.transcript_area.height as usize
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn live_activity_review_sanitizes_and_bounds_non_answer_status() {
+        for width in 1..=80 {
+            let mut state = answer_test_state();
+            state.apply_event(AgentEvent::ToolCallStart {
+                call_id: "review-tool".into(),
+                name: "界tool\nspoofed\t\x1b[31mred".repeat(8),
+                summary: "running".into(),
+            });
+            state.live_tools[0].started = Some(Instant::now() - Duration::from_secs(65));
+            let live = transcript_live_indicator_text(&state, width).unwrap();
+            let activity = live.lines.first().unwrap();
+            assert!(
+                activity.width() <= width as usize,
+                "width {width}: {activity:?}"
+            );
+            assert!(!rendered_line_text(activity).contains(['\n', '\r', '\t', '\x1b']));
+            assert_eq!(
+                collect_wrapped_lines(&Text::from(activity.clone()), width).len(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn live_activity_review_reserves_slash_rows_for_thinking_and_tools() {
+        for tool in [false, true] {
+            let mut state = answer_test_state();
+            state.verbose = true;
+            state.input = "/compact 13".into();
+            state.cursor = state.input.len();
+            if tool {
+                state.apply_event(AgentEvent::ToolCallStart {
+                    call_id: "review-tool".into(),
+                    name: "bash".into(),
+                    summary: "live-detail".into(),
+                });
+            } else {
+                state.apply_event(AgentEvent::ThinkingDelta("live-detail".into()));
+            }
+            let rows = draw_to_lines(80, 20, &mut state);
+            let activity = rows
+                .iter()
+                .position(|row| row.contains(if tool { "Running bash" } else { "Thinking" }))
+                .unwrap();
+            let detail = rows
+                .iter()
+                .position(|row| row.contains("live-detail"))
+                .unwrap();
+            let popup = rows
+                .iter()
+                .position(|row| row.contains("Tab accept"))
+                .unwrap();
+            assert!(activity < detail && detail < popup, "{rows:?}");
+            assert_eq!(detail + 1, popup, "{rows:?}");
+        }
+    }
+
+    #[test]
+    fn live_activity_review_popup_never_overlays_composer() {
+        let completions = slash_completions("/");
+        for y in [0, 10] {
+            for height in 3..=20 {
+                let area = Rect::new(0, y, 80, height);
+                let state = answer_test_state();
+                let input_area = compute_layout(area, &state).input_area;
+                let available = input_area.top().saturating_sub(area.top());
+                let popup = slash_popup_layout(area, input_area, &completions);
+                if available < 3 {
+                    assert!(
+                        popup.is_none(),
+                        "popup overlaps composer at height {height}"
+                    );
+                } else {
+                    let popup = popup.unwrap();
+                    assert!(popup.rect.bottom() <= input_area.top(), "height {height}");
+                    assert_eq!(popup.visible_count + 2, popup.rect.height as usize);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn answer_cosmetic_layout_keeps_composer_and_footer_bottom_anchored() {
+        use ratatui::backend::TestBackend;
+        for width in [20, 60, 100, 160] {
+            for height in [6, 10, 20] {
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                let mut state = answer_test_state();
+                state.input = "editable draft".into();
+                state.cursor = state.input.len();
+                let area = Rect::new(0, 0, width, height);
+                let baseline = compute_layout(area, &state);
+                for delta in ["Live response", ".\n\n", "Tail", "\n\n"] {
+                    state.apply_event(AgentEvent::TextDelta(delta.into()));
+                    state.set_answer_width(width);
+                    flush_pending_insert(&mut terminal, &mut state, width).unwrap();
+                    terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+                    assert_eq!(state.input_area, baseline.input_area);
+                    assert_eq!(state.transcript_area, baseline.transcript_area);
+                    assert_eq!(state.input_area.bottom(), baseline.status_area.top());
+                    assert_eq!(baseline.status_area.bottom(), area.bottom());
+                    let buffer = terminal.backend().buffer();
+                    let footer = (0..width)
+                        .map(|x| buffer[(x, baseline.status_area.top())].symbol())
+                        .collect::<String>();
+                    assert!(!footer.contains("Responding"), "{footer}");
+                    let live = (baseline.transcript_area.top()..baseline.transcript_area.bottom())
+                        .flat_map(|y| (0..width).map(move |x| buffer[(x, y)].symbol()))
+                        .collect::<String>();
+                    assert!(live.contains("Respon") && live.contains("  ·  "), "{live}");
+                    assert_eq!(
+                        state.live_indicator_top_padding + state.live_indicator_lines,
+                        state.transcript_area.height as usize
+                    );
+                    assert_eq!(state.input, "editable draft");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn answer_cosmetic_layout_preserves_thinking_status_first_and_bottom_alignment() {
+        let mut state = answer_test_state();
+        state.verbose = true;
+        state.apply_event(AgentEvent::ThinkingDelta("Unfinished thought".into()));
+        let area = Rect::new(0, 0, 80, 20);
+        let baseline = compute_layout(area, &state);
+        let text = transcript_live_indicator_text(&state, 79).unwrap();
+        let rows = flatten_lines(&text);
+        assert!(rows[0].contains("Thinking"), "{rows:?}");
+        assert!(rows[1].contains("Unfinished thought"), "{rows:?}");
+        let screen = draw_to_lines(80, 20, &mut state);
+        assert!(state.live_indicator_top_padding > 0);
+        assert!(screen[baseline.status_area.top() as usize].contains("test-model"));
+        assert!(!screen[baseline.status_area.top() as usize].contains("Thinking"));
+    }
+
+    #[test]
+    fn answer_cosmetic_layout_keeps_permission_auth_and_overlay_geometry() {
+        for mode in [
+            "permission",
+            "auth",
+            "help",
+            "todos",
+            "inspector",
+            "resume",
+            "resume-picker",
+            "resume-loading",
+            "path",
+            "slash",
+        ] {
+            let mut state = answer_test_state();
+            state.apply_event(AgentEvent::TextDelta("Live answer".into()));
+            match mode {
+                "permission" => queue_permission_request(
+                    &mut state,
+                    "bash".into(),
+                    serde_json::json!({"command": "echo fixture"}),
+                    std::sync::mpsc::sync_channel(0).0,
+                ),
+                "auth" => queue_local_auth_secret_request(
+                    &mut state,
+                    "git".into(),
+                    "Fixture credential".into(),
+                    std::sync::mpsc::sync_channel(0).0,
+                ),
+                "help" => state.show_help = true,
+                "todos" => state.show_todos = true,
+                "inspector" => state.show_inspector = true,
+                "resume" => state.resume_picker_requested = true,
+                "resume-picker" => {
+                    state.resume_picker = Some(ResumePicker {
+                        choices: Vec::new(),
+                        selected: 0,
+                        scroll: 0,
+                    });
+                }
+                "resume-loading" => state.resume_loading = true,
+                "path" => start_path_picker(&mut state),
+                "slash" => state.input = "/compact 13".into(),
+                _ => unreachable!(),
+            }
+            let baseline = compute_layout(Rect::new(0, 0, 160, 20), &state);
+            draw_to_lines(160, 20, &mut state);
+            assert_eq!(state.input_area, baseline.input_area, "{mode}");
+            assert_eq!(state.transcript_area, baseline.transcript_area, "{mode}");
+            if matches!(mode, "permission" | "auth") {
+                assert!(transcript_live_indicator_text(&state, 80).is_none());
+                let footer =
+                    flatten_lines(&Text::from(Line::from(status_spans(&state)))).join("\n");
+                assert!(!footer.contains("Responding"), "{footer}");
+            }
+        }
+    }
+
+    #[test]
+    fn answer_cosmetic_slash_popup_keeps_short_tail_visible_through_resize() {
+        use ratatui::backend::TestBackend;
+        let mut terminal = Terminal::with_options(
+            TestBackend::new(100, 28),
+            TerminalOptions {
+                viewport: Viewport::Inline(VIEWPORT_HEIGHT),
+            },
+        )
+        .unwrap();
+        let mut state = answer_test_state();
+        state.input = "/compact 13".into();
+        state.cursor = state.input.len();
+        state.apply_event(AgentEvent::TextDelta(
+            "Stable paragraph.\n\nresize-live-marker".into(),
+        ));
+        for width in [100, 80, 160] {
+            terminal.backend_mut().resize(width, 28);
+            state.set_answer_width(width);
+            terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+            let rows = buffer_to_lines(terminal.backend().buffer(), Rect::new(0, 0, width, 28))
+                .iter()
+                .map(rendered_line_text)
+                .collect::<Vec<_>>();
+            let response = rows
+                .iter()
+                .position(|row| row.contains("resize-live-marker"))
+                .unwrap();
+            let activity = rows
+                .iter()
+                .position(|row| row.contains("Responding"))
+                .unwrap();
+            let popup = rows
+                .iter()
+                .position(|row| row.contains("Tab accept"))
+                .unwrap();
+            assert!(activity < response && response < popup, "{rows:?}");
+            assert_eq!(response + 1, popup, "{rows:?}");
+            assert_eq!(state.input, "/compact 13");
+        }
+    }
+
+    #[test]
+    fn answer_cosmetic_layout_bounds_tiny_terminals_and_preserves_details() {
+        for width in [0, 1, 2, 8, 80] {
+            for height in [0, 1, 2, 3, 6, 20] {
+                let mut state = answer_test_state();
+                state.show_status_details = true;
+                state.apply_event(AgentEvent::TextDelta("Live response".into()));
+                let area = Rect::new(0, 0, width, height);
+                let layout = compute_layout(area, &state);
+                assert!(layout.transcript_area.bottom() <= area.bottom());
+                assert!(layout.input_area.bottom() <= area.bottom());
+                assert!(layout.status_area.bottom() <= area.bottom());
+                draw_to_lines(width, height, &mut state);
+            }
+        }
+    }
+
+    #[test]
+    fn answer_cosmetic_multiline_draft_cursor_stays_in_bounds() {
+        use ratatui::backend::TestBackend;
+        for width in [20, 60, 100] {
+            for height in [6, 10, 20] {
+                for source in [
+                    "Live response",
+                    "Stable paragraph.\n\n",
+                    "```rust\nfirst\nsecond\nthird\nfourth\nfifth\nsixth\nseventh\neighth\nlast-row",
+                ] {
+                    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                    let mut state = answer_test_state();
+                    state.show_status_details = true;
+                    state.input = format!("{}\nlast draft row", "界 editable draft ".repeat(6));
+                    state.cursor = state.input.len();
+                    state.apply_event(AgentEvent::TextDelta(source.into()));
+                    state.set_answer_width(width);
+                    flush_pending_insert(&mut terminal, &mut state, width).unwrap();
+                    let area = terminal.get_frame().area();
+                    let baseline = compute_layout(area, &state);
+                    terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+                    assert_eq!(state.transcript_area, baseline.transcript_area);
+                    assert_eq!(state.input_area, baseline.input_area);
+                    assert_eq!(state.input_area.top(), state.transcript_area.bottom());
+                    assert_eq!(state.input_area.height, baseline.input_area.height);
+                    let cursor = terminal.get_cursor_position().unwrap();
+                    assert!(cursor.x > state.input_area.left());
+                    assert!(cursor.x < state.input_area.right() - 1);
+                    assert!(cursor.y > state.input_area.top());
+                    assert!(cursor.y < state.input_area.bottom() - 1);
+                    let buffer = terminal.backend().buffer();
+                    let cursor_line = (0..width)
+                        .map(|x| buffer[(x, cursor.y)].symbol())
+                        .collect::<String>();
+                    assert!(cursor_line.contains("last draft row"), "{cursor_line}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn answer_cosmetic_layout_stays_anchored_on_completion_retry_and_interrupt() {
+        for event in [
+            AgentEvent::TextBlockComplete("Final answer".into()),
+            AgentEvent::HttpRetry {
+                attempt: 1,
+                wait_secs: 1,
+                reason: "fixture".into(),
+            },
+            AgentEvent::Interrupted,
+        ] {
+            let mut state = answer_test_state();
+            state.input = "draft".into();
+            state.cursor = state.input.len();
+            state.apply_event(AgentEvent::TextDelta("Live answer".into()));
+            let baseline = compute_layout(Rect::new(0, 0, 80, 20), &state);
+            draw_to_lines(80, 20, &mut state);
+            assert_eq!(state.input_area, baseline.input_area);
+            state.apply_event(event);
+            assert!(state.active_answer.is_none());
+            draw_to_lines(80, 20, &mut state);
+            assert_eq!(state.input_area, baseline.input_area);
+            assert_eq!(state.input, "draft");
+        }
+    }
+
+    #[test]
+    fn answer_cosmetic_activity_uses_live_tool_priority_and_elapsed() {
+        let mut state = answer_test_state();
+        state.apply_event(AgentEvent::TextDelta("Live answer".into()));
+        state.apply_event(AgentEvent::ToolCallStart {
+            call_id: "fixture-call".into(),
+            name: "bash".into(),
+            summary: "fixture command".into(),
+        });
+        state.live_tools[0].started = Some(Instant::now() - Duration::from_secs(5));
+        let text = transcript_live_indicator_text(&state, 80).unwrap();
+        let live = flatten_lines(&text).join("\n");
+        assert!(live.contains("Live answer"), "{live}");
+        assert!(live.contains("Running bash  ·  5s"), "{live}");
+        let footer = flatten_lines(&Text::from(Line::from(status_spans(&state)))).join("\n");
+        assert!(!footer.contains("Running bash"), "{footer}");
+    }
+
+    #[test]
+    fn answer_cosmetic_activity_keeps_elapsed_visible_with_long_tool_names() {
+        for width in [20, 40, 80, 160] {
+            let mut state = answer_test_state();
+            state.agent_active_elapsed = Duration::from_secs(425);
+            state.apply_event(AgentEvent::TextDelta("Live answer".into()));
+            state.apply_event(AgentEvent::ToolCallStart {
+                call_id: "fixture-call".into(),
+                name: "界long_tool_name".repeat(12),
+                summary: "fixture command".into(),
+            });
+            state.live_tools[0].started = Some(Instant::now() - Duration::from_secs(65));
+            let screen = draw_to_lines(width, 20, &mut state);
+            let live = screen[..state.input_area.top() as usize].join("\n");
+            assert!(live.contains("1m 05s"), "width {width}: {live}");
+            let footer = &screen[state.input_area.bottom() as usize];
+            assert!(!footer.contains("Running"), "width {width}: {footer}");
+            assert!(footer.ends_with("7m 05s"), "width {width}: {footer}");
+        }
+    }
+
+    #[test]
+    fn answer_cosmetic_activity_fits_one_row_at_every_narrow_width() {
+        for elapsed_secs in [None, Some(0), Some(65), Some(3600), Some(600_000)] {
+            for width in 1..=80 {
+                let mut state = answer_test_state();
+                state.apply_event(AgentEvent::TextDelta("Live answer".into()));
+                state.stream_started_at =
+                    elapsed_secs.map(|secs| Instant::now() - Duration::from_secs(secs));
+                let text = transcript_live_indicator_text(&state, width).unwrap();
+                let activity = text.lines.first().unwrap().clone();
+                assert!(
+                    activity.width() <= width as usize,
+                    "width {width}, elapsed {elapsed_secs:?}: {activity:?}"
+                );
+                assert_eq!(
+                    collect_wrapped_lines(&Text::from(activity), width).len(),
+                    1,
+                    "width {width}, elapsed {elapsed_secs:?}"
+                );
+                let label = rendered_line_text(text.lines.first().unwrap());
+                assert!(label.starts_with(SPINNER_FRAMES[0]), "{label}");
+                if let Some(secs) = elapsed_secs {
+                    let elapsed = format_elapsed(Duration::from_secs(secs));
+                    assert_eq!(
+                        label.ends_with(&elapsed),
+                        width as usize >= 3 + 1 + 5 + text_width(&elapsed),
+                        "width {width}: {label}"
+                    );
+                }
+                if width >= 4 {
+                    assert!(label.contains('R') || label.contains('…'), "{label}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn answer_cosmetic_activity_sanitizes_tool_status_to_one_line() {
+        let mut state = answer_test_state();
+        state.apply_event(AgentEvent::TextDelta("Live answer".into()));
+        state.apply_event(AgentEvent::ToolCallStart {
+            call_id: "fixture-call".into(),
+            name: "fixture\nspoofed\t\x1b[31mred".into(),
+            summary: "fixture command".into(),
+        });
+        let live = transcript_live_indicator_text(&state, 80).unwrap();
+        let activity = rendered_line_text(live.lines.first().unwrap());
+        assert!(
+            activity.contains("Running fixture spoofed red"),
+            "{activity}"
+        );
+        assert!(!activity.contains(['\n', '\r', '\t', '\x1b']), "{activity}");
+    }
+
+    #[test]
+    fn answer_cosmetic_tail_cap_retains_last_content_row_and_activity() {
+        let mut lines = vec![Line::raw("Responding")];
+        lines.extend((0..12).map(|i| Line::raw(format!("│ row {i}"))));
+        for available in 0..=14 {
+            let rows = cap_live_indicator_lines(lines.clone(), available.min(9), "│ …");
+            assert_eq!(rows.len(), available.min(9));
+            if available > 0 {
+                assert_eq!(rendered_line_text(&rows[0]), "Responding");
+            }
+            if available > 1 {
+                assert_eq!(rendered_line_text(rows.last().unwrap()), "│ row 11");
+            }
+            if available > 2 {
+                assert_eq!(rendered_line_text(&rows[1]), "│ …");
+            }
         }
     }
 
@@ -16400,6 +16984,34 @@ mod tests {
                 state.set_answer_width(width);
                 flush_pending_insert(&mut terminal, &mut state, width).unwrap();
                 terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+                assert_eq!(state.input_area.top(), state.transcript_area.bottom());
+                let frame_area = terminal.get_frame().area();
+                let layout = compute_layout(frame_area, &state);
+                assert_eq!(layout.input_area.top(), layout.transcript_area.bottom());
+                let buffer = terminal.backend().buffer();
+                let footer = (layout.status_area.left()..layout.status_area.right())
+                    .map(|x| buffer[(x, layout.status_area.top())].symbol())
+                    .collect::<String>();
+                assert!(!footer.contains("Responding"), "{footer}");
+                let tail = (layout.transcript_area.top()..layout.transcript_area.bottom())
+                    .map(|y| {
+                        (layout.transcript_area.left()..layout.transcript_area.right())
+                            .map(|x| buffer[(x, y)].symbol())
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>();
+                let status_row = tail
+                    .iter()
+                    .position(|row| row.contains("Responding"))
+                    .unwrap();
+                for (row_index, row) in tail.iter().enumerate() {
+                    if row.trim_start().starts_with(['│', '┌']) {
+                        assert!(status_row < row_index, "{tail:?}");
+                    }
+                }
+                assert!(!tail.last().unwrap().trim().is_empty(), "{tail:?}");
+                assert_eq!(state.input_area, layout.input_area);
+                assert_eq!(layout.status_area.bottom(), frame_area.bottom());
                 assert!(
                     !state.transcript_needs_rebuild,
                     "ordinary streaming rebuilt at {width}"
@@ -19393,14 +20005,18 @@ mod tests {
 
     #[test]
     fn live_indicator_keeps_status_and_caps_detail_rows() {
-        let lines = cap_live_indicator_detail(vec![
-            Line::from("status"),
-            Line::from("one"),
-            Line::from("two"),
-            Line::from("three"),
-            Line::from("four"),
-            Line::from("five"),
-        ]);
+        let lines = cap_live_indicator_lines(
+            vec![
+                Line::from("status"),
+                Line::from("one"),
+                Line::from("two"),
+                Line::from("three"),
+                Line::from("four"),
+                Line::from("five"),
+            ],
+            5,
+            "  …",
+        );
         let rendered = Text::from(lines);
         assert_eq!(
             flatten_lines(&rendered),
@@ -19409,7 +20025,20 @@ mod tests {
     }
 
     #[test]
-    fn transcript_live_indicator_shows_status_elapsed_and_stream_tail() {
+    fn transcript_live_indicator_preserves_status_first_without_active_answer() {
+        let mut state = answer_test_state();
+        state.stream_started_at = Some(Instant::now() - Duration::from_secs(12));
+        state.streaming_text = "first line\nfinal streamed line".into();
+        assert!(state.active_answer.is_none());
+        let text = transcript_live_indicator_text(&state, 80).unwrap();
+        let lines = flatten_lines(&text);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("Responding") && lines[0].contains("12s"));
+        assert!(lines[1].contains("final streamed line"));
+    }
+
+    #[test]
+    fn transcript_live_indicator_keeps_active_answer_below_status() {
         let mut state = TuiState::new(
             "test-model".to_string(),
             model_context_window("test-model"),
@@ -19420,14 +20049,21 @@ mod tests {
         state.agent_busy = true;
         state.frame_count = 1;
         state.stream_started_at = Some(Instant::now() - Duration::from_secs(12));
-        state.streaming_text = "first line\nfinal streamed line".to_string();
+        state.apply_event(AgentEvent::TextDelta(
+            "first line\nfinal streamed line".into(),
+        ));
 
         let text = transcript_live_indicator_text(&state, 80).expect("live indicator");
         let lines = flatten_lines(&text);
-        assert_eq!(lines.len(), 2);
-        assert!(lines[0].contains("Responding"));
-        assert!(lines[0].contains("12s"));
-        assert!(lines[1].contains("final streamed line"));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("final streamed line"))
+        );
+        assert!(lines.first().unwrap().contains("Responding"), "{lines:?}");
+        assert!(lines.first().unwrap().contains("12s"), "{lines:?}");
+        let footer = flatten_lines(&Text::from(Line::from(status_spans(&state)))).join("\n");
+        assert!(!footer.contains("Responding"), "{footer}");
     }
 
     #[test]
@@ -22900,7 +23536,7 @@ mod tests {
     #[test]
     fn slash_popup_layout_stays_inside_inline_viewport() {
         let area = ratatui::layout::Rect::new(0, 10, 92, 7);
-        let input_area = ratatui::layout::Rect::new(0, 10, 92, 6);
+        let input_area = ratatui::layout::Rect::new(0, 13, 92, 3);
         let completions: Vec<SlashCompletion> = SLASH_COMMANDS
             .iter()
             .map(|cmd| SlashCompletion {
@@ -22921,7 +23557,7 @@ mod tests {
     #[test]
     fn slash_popup_layout_clamps_width_when_input_is_indented() {
         let area = ratatui::layout::Rect::new(0, 0, 30, 8);
-        let input_area = ratatui::layout::Rect::new(4, 2, 26, 5);
+        let input_area = ratatui::layout::Rect::new(4, 3, 26, 4);
         let completions = vec![SlashCompletion {
             text: "/provider anthropic/claude-opus-4-5".to_string(),
             hint: "very long provider/model hint".to_string(),
