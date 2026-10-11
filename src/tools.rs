@@ -87,7 +87,7 @@ pub(crate) fn provider_tool_definitions() -> Vec<Tool> {
         },
         Tool {
             name: "read_image",
-            description: "Inspect a PNG, JPEG, or WebP image with the active vision-capable model. This sensitive read can disclose pixels to the provider, requires explicit approval except under approval=always or /allow read_image, and is limited to two successful images per user turn. Dext bounds decoding, resizes to 1568 px, composites transparency, strips metadata, and re-encodes before transmission.",
+            description: "Inspect a PNG, JPEG, or WebP image with the active vision-capable model. This sensitive read can disclose pixels to the provider, requires explicit approval except under approval=always or /allow read_image, and allows up to 100 successful images per user turn within a 20 MiB total sanitized-image budget. Dext bounds decoding, resizes to 1568 px, composites transparency, strips metadata, and re-encodes before transmission.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -505,7 +505,7 @@ pub(crate) fn should_parallelize_builtin_tools(names: &[&str]) -> bool {
 fn lean_description(name: &str, fallback: &str) -> String {
     match name {
         "read_file" => "Read capped line-numbered file window; absolute paths read-only.",
-        "read_image" => "Inspect workspace PNG/JPEG/WebP after approval.",
+        "read_image" => "Workspace image approval; 100/turn; 20 MiB JPEG.",
         "read_symbol" => {
             "Read symbol/enclosing block; Rust AST selectors disambiguate; absolute paths read-only."
         }

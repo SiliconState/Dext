@@ -182,8 +182,9 @@ const DEFAULT_DISCOVERY_EXCLUDES: &[&str] = &[
 const MAX_STREAM_ATTEMPTS: u32 = 4;
 const MAX_INCOMPLETE_RESPONSE_RECOVERIES: u32 = 3;
 // Inner per-request HTTP retry budget (distinct from the outer stream-restart
-// budget MAX_STREAM_ATTEMPTS, even though they currently share the value).
-const MAX_HTTP_ATTEMPTS: u32 = 4;
+// budget MAX_STREAM_ATTEMPTS). Six attempts allow 16–27 seconds of jittered
+// backoff, plus request time, to tolerate observed ChatGPT upstream 503 bursts.
+const MAX_HTTP_ATTEMPTS: u32 = 6;
 const PROVIDER_CONNECT_TIMEOUT_SECS: u64 = 15;
 const PROVIDER_FIRST_BYTE_TIMEOUT_SECS: u64 = 180;
 const LOCAL_PROVIDER_FIRST_BYTE_TIMEOUT_SECS: u64 = 600;
@@ -2000,7 +2001,7 @@ impl EventSink for ConsoleSink {
                 wait_secs,
                 reason,
             } => {
-                eprintln!("[retry {attempt}/4: {reason}, waiting {wait_secs}s]");
+                eprintln!("[retry {attempt}: {reason}, waiting {wait_secs}s]");
             }
             AgentEvent::ExternalTelemetry { .. } => {}
             AgentEvent::TurnDiagnostics { .. } => {}
@@ -2684,6 +2685,7 @@ fn anthropic_wire_messages(
         .rposition(is_fresh_user_prompt_message)
         .unwrap_or(0);
     let mut wire = Vec::new();
+    let mut image_budget = image::ImageBudget::default();
     for (message_index, message) in messages.iter().enumerate() {
         let mut content = Vec::new();
         let mut image_messages = Vec::new();
@@ -2701,7 +2703,7 @@ fn anthropic_wire_messages(
                 message_index,
                 current_turn_start,
             ) {
-                match active_image_wire(&reference, interrupt) {
+                match active_image_wire(&reference, interrupt, &mut image_budget) {
                     Ok((media_type, data)) => json!({
                         "type": "image",
                         "source": {"type": "base64", "media_type": media_type, "data": data}
@@ -2904,8 +2906,11 @@ fn image_placeholder(reference: &image::ImageReference, detail: &str) -> String 
 fn active_image_wire(
     reference: &image::ImageReference,
     interrupt: Option<&AtomicBool>,
+    budget: &mut image::ImageBudget,
 ) -> std::result::Result<(String, String), String> {
+    budget.check_available()?;
     let prepared = image::prepare_if_unchanged(reference, interrupt)?;
+    budget.admit(prepared.bytes.len())?;
     let encoded = base64::engine::general_purpose::STANDARD.encode(prepared.bytes);
     Ok((prepared.reference.media_type, encoded))
 }
@@ -13969,7 +13974,7 @@ struct Agent {
     checkpoint_ordinal: usize,
     prompt_scan_cache: Mutex<Option<PromptScanCache>>,
     prompt_scan_epoch: u64,
-    successful_images_this_turn: usize,
+    image_budget_this_turn: image::ImageBudget,
     // (history len, history chars) at the last session autosave; lets
     // non-critical checkpoints skip rewriting an unchanged transcript.
     last_checkpoint_signature: Option<(usize, usize)>,
@@ -14192,7 +14197,7 @@ impl Agent {
             checkpoint_ordinal: 0,
             prompt_scan_cache: Mutex::new(None),
             prompt_scan_epoch: 0,
-            successful_images_this_turn: 0,
+            image_budget_this_turn: image::ImageBudget::default(),
             last_checkpoint_signature: None,
         })
     }
@@ -16946,6 +16951,7 @@ impl Agent {
         let valid_ids = Self::tool_use_ids_in_messages(history);
         let interrupt = Some(self.interrupt.as_ref());
         let current_image_target = self.image_disclosure_target();
+        let mut image_budget = image::ImageBudget::default();
         let mut msgs = vec![OaiMessage {
             role: "system".to_string(),
             content: Some(Value::String(system_text.to_string())),
@@ -17011,7 +17017,7 @@ impl Agent {
                             message_index,
                             current_turn_start,
                         ) {
-                            match active_image_wire(&reference, interrupt) {
+                            match active_image_wire(&reference, interrupt, &mut image_budget) {
                                 Ok((media_type, data)) => json!([
                                     {"type": "text", "text": "Approved workspace image"},
                                     {"type": "image_url", "image_url": {"url": format!("data:{media_type};base64,{data}")}}
@@ -17145,6 +17151,7 @@ impl Agent {
         let valid_ids = Self::tool_use_ids_in_messages(history);
         let interrupt = Some(self.interrupt.as_ref());
         let current_image_target = self.image_disclosure_target();
+        let mut image_budget = image::ImageBudget::default();
         let mut items = Vec::new();
         let mut msg_counter = 0usize;
 
@@ -17213,7 +17220,7 @@ impl Agent {
                             message_index,
                             current_turn_start,
                         ) {
-                            match active_image_wire(&reference, interrupt) {
+                            match active_image_wire(&reference, interrupt, &mut image_budget) {
                                 Ok((media_type, data)) => json!([{
                                     "type": "input_image",
                                     "image_url": format!("data:{media_type};base64,{data}"),
@@ -18935,7 +18942,9 @@ impl Agent {
         explicit_pack: Option<packs::PackInvocation>,
     ) -> Result<()> {
         self.interrupt.store(false, Ordering::SeqCst);
-        self.successful_images_this_turn = 0;
+        self.image_budget_this_turn = image::ImageBudget::default();
+        // Invalidate prior image grants even when auth refresh fails before history changes.
+        self.prompt_scan_epoch = self.prompt_scan_epoch.wrapping_add(1);
         self.begin_provider_turn();
         self.sink.emit(AgentEvent::TurnStart);
         self.append_latest_log("chat_start", &format!("chars={}", user_input.len()));
@@ -18961,9 +18970,6 @@ impl Agent {
     ) -> Result<()> {
         self.refresh_runtime_provider_auth().await?;
         let mut compacted_this_turn = false;
-        // New user turn: force a fresh prompt filesystem scan (DEXT.md/recall.md
-        // walks, pack discovery) on the first request of the turn.
-        self.prompt_scan_epoch = self.prompt_scan_epoch.wrapping_add(1);
         let turn_id = format!("turn-{}-{}", unix_timestamp_secs(), self.prompt_scan_epoch);
         self.git_context = git_summary(&self.sandbox_root);
         let suppress_pack_activation = self.suppress_pack_activation || explicit_pack.is_some();
@@ -19253,6 +19259,9 @@ impl Agent {
                 }
                 let mut attempt: u32 = 0;
                 let resp = loop {
+                    if self.interrupt.load(Ordering::SeqCst) {
+                        anyhow::bail!("interrupted by user before provider response");
+                    }
                     attempt += 1;
                     let builder = self
                         .provider_post(&url)?

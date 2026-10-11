@@ -4054,13 +4054,13 @@ impl TuiState {
                 self.provisional_answer_chars = 0;
                 self.discard_answer_preview();
                 self.push_debug_event(format!(
-                    "http retry · attempt {attempt}/4 · wait {wait_secs}s · {reason}"
+                    "provider retry · attempt {attempt} · wait {wait_secs}s · {reason}"
                 ));
-                self.retry_status = Some(format!("retry backoff {attempt}/4"));
-                self.status = format!("retry backoff {attempt}/4");
+                self.retry_status = Some(format!("retry backoff {attempt}"));
+                self.status = format!("retry backoff {attempt}");
                 if attempt == 1 {
                     self.queue(Line_::Retry(format!(
-                        "retry {attempt}/4 ({reason}) in {wait_secs}s"
+                        "retry {attempt} ({reason}) in {wait_secs}s"
                     )));
                 }
             }
@@ -21823,8 +21823,19 @@ mod tests {
             ThinkingEffort::Medium,
         );
         state.agent_busy = true;
-        state.retry_status = Some("retry backoff 2/4".to_string());
-        assert_eq!(derived_busy_status(&state), "retry backoff 2/4");
+        state.apply_event(AgentEvent::HttpRetry {
+            attempt: 5,
+            wait_secs: 8,
+            reason: "transient HTTP 503".into(),
+        });
+        assert_eq!(derived_busy_status(&state), "retry backoff 5");
+        assert!(
+            state
+                .debug_events
+                .iter()
+                .any(|event| event.contains("attempt 5 · wait 8s"))
+        );
+        assert!(!state.debug_events.iter().any(|event| event.contains("5/4")));
     }
 
     #[test]
