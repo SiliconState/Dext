@@ -182,8 +182,9 @@ const DEFAULT_DISCOVERY_EXCLUDES: &[&str] = &[
 const MAX_STREAM_ATTEMPTS: u32 = 4;
 const MAX_INCOMPLETE_RESPONSE_RECOVERIES: u32 = 3;
 // Inner per-request HTTP retry budget (distinct from the outer stream-restart
-// budget MAX_STREAM_ATTEMPTS, even though they currently share the value).
-const MAX_HTTP_ATTEMPTS: u32 = 4;
+// budget MAX_STREAM_ATTEMPTS). Six attempts allow 16–27 seconds of jittered
+// backoff, plus request time, to tolerate observed ChatGPT upstream 503 bursts.
+const MAX_HTTP_ATTEMPTS: u32 = 6;
 const PROVIDER_CONNECT_TIMEOUT_SECS: u64 = 15;
 const PROVIDER_FIRST_BYTE_TIMEOUT_SECS: u64 = 180;
 const LOCAL_PROVIDER_FIRST_BYTE_TIMEOUT_SECS: u64 = 600;
@@ -376,13 +377,21 @@ fn stream_recovery_reason(
     chatgpt_incomplete_reason(contract, stop_reason)
         .map(str::to_string)
         .or_else(|| {
-            // Anthropic (max_tokens) and OpenAI Chat Completions (length)
-            // both report output-limit truncation through dropped tool calls.
-            (matches!(
+            if matches!(
                 contract,
                 RequestContract::AnthropicMessages | RequestContract::OpenAiChatCompletions
-            ) && unfinished_tool_calls > 0)
-                .then(|| "unfinished_tool_call".to_string())
+            ) && unfinished_tool_calls > 0
+            {
+                Some("unfinished_tool_call".to_string())
+            } else if matches!(
+                (contract, stop_reason),
+                (RequestContract::AnthropicMessages, Some("max_tokens"))
+                    | (RequestContract::OpenAiChatCompletions, Some("length"))
+            ) {
+                Some("output_token_limit".to_string())
+            } else {
+                None
+            }
         })
 }
 
@@ -403,7 +412,7 @@ fn stream_chunk_err(e: reqwest::Error) -> anyhow::Error {
 fn provider_body_chunk_err(error: reqwest::Error) -> anyhow::Error {
     if error.is_timeout() {
         anyhow::Error::new(error)
-            .context("provider total request timeout while reading response body")
+            .context("transient stream transport error: timeout while reading provider response body (request deadline or connection timeout)")
     } else {
         stream_chunk_err(error)
     }
@@ -711,6 +720,40 @@ fn assistant_blocks_for_context(blocks: &[Block], context_mode: ContextMode) -> 
         redact_pseudo_tool_protocol_blocks(blocks)
     } else {
         blocks.to_vec()
+    }
+}
+
+#[derive(Default)]
+struct PartialStreamText {
+    text: String,
+    active_start: usize,
+    block_complete: bool,
+}
+
+impl PartialStreamText {
+    fn push_delta(&mut self, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        if self.block_complete {
+            self.text.push_str("\n\n");
+            self.active_start = self.text.len();
+            self.block_complete = false;
+        }
+        self.text.push_str(delta);
+    }
+
+    fn complete_block(&mut self, full: &str) {
+        if self.block_complete {
+            if full.is_empty() {
+                return;
+            }
+            self.text.push_str("\n\n");
+            self.active_start = self.text.len();
+        }
+        self.text.truncate(self.active_start);
+        self.text.push_str(full);
+        self.block_complete = true;
     }
 }
 
@@ -2000,7 +2043,7 @@ impl EventSink for ConsoleSink {
                 wait_secs,
                 reason,
             } => {
-                eprintln!("[retry {attempt}/4: {reason}, waiting {wait_secs}s]");
+                eprintln!("[retry {attempt}: {reason}, waiting {wait_secs}s]");
             }
             AgentEvent::ExternalTelemetry { .. } => {}
             AgentEvent::TurnDiagnostics { .. } => {}
@@ -2684,10 +2727,15 @@ fn anthropic_wire_messages(
         .rposition(is_fresh_user_prompt_message)
         .unwrap_or(0);
     let mut wire = Vec::new();
+    let mut image_budget = image::ImageBudget::default();
     for (message_index, message) in messages.iter().enumerate() {
         let mut content = Vec::new();
         let mut image_messages = Vec::new();
         for block in &message.content {
+            if let Block::PartialStream { text } = block {
+                content.push(json!({"type": "text", "text": text}));
+                continue;
+            }
             let Some((reference, disclosure_target)) = block_image_reference(block) else {
                 content.push(
                     serde_json::to_value(block)
@@ -2701,7 +2749,7 @@ fn anthropic_wire_messages(
                 message_index,
                 current_turn_start,
             ) {
-                match active_image_wire(&reference, interrupt) {
+                match active_image_wire(&reference, interrupt, &mut image_budget) {
                     Ok((media_type, data)) => json!({
                         "type": "image",
                         "source": {"type": "base64", "media_type": media_type, "data": data}
@@ -2904,8 +2952,11 @@ fn image_placeholder(reference: &image::ImageReference, detail: &str) -> String 
 fn active_image_wire(
     reference: &image::ImageReference,
     interrupt: Option<&AtomicBool>,
+    budget: &mut image::ImageBudget,
 ) -> std::result::Result<(String, String), String> {
+    budget.check_available()?;
     let prepared = image::prepare_if_unchanged(reference, interrupt)?;
+    budget.admit(prepared.bytes.len())?;
     let encoded = base64::engine::general_purpose::STANDARD.encode(prepared.bytes);
     Ok((prepared.reference.media_type, encoded))
 }
@@ -13149,11 +13200,13 @@ fn apply_queued_runtime_controls(agent: &mut Agent) -> AppliedRuntimeControls {
 async fn queued_runtime_control_waiter(
     rx: &mut Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
 ) -> Option<String> {
-    if let Some(rx) = rx {
-        rx.recv().await
-    } else {
-        std::future::pending::<Option<String>>().await
+    if let Some(receiver) = rx {
+        if let Some(message) = receiver.recv().await {
+            return Some(message);
+        }
+        *rx = None;
     }
+    std::future::pending::<Option<String>>().await
 }
 
 fn apply_runtime_control_for_stream(
@@ -13928,7 +13981,7 @@ struct Agent {
     suppress_checkpoints: bool,
     last_checkpoint_at: Option<std::time::Instant>,
     session_model_pins: HashMap<String, String>,
-    partial_stream_text: Option<String>,
+    partial_stream_text: Option<PartialStreamText>,
     quiet_stream_events: bool,
     background: compaction::BackgroundState,
     compact_threshold_chars: Option<usize>,
@@ -13969,7 +14022,7 @@ struct Agent {
     checkpoint_ordinal: usize,
     prompt_scan_cache: Mutex<Option<PromptScanCache>>,
     prompt_scan_epoch: u64,
-    successful_images_this_turn: usize,
+    image_budget_this_turn: image::ImageBudget,
     // (history len, history chars) at the last session autosave; lets
     // non-critical checkpoints skip rewriting an unchanged transcript.
     last_checkpoint_signature: Option<(usize, usize)>,
@@ -14192,7 +14245,7 @@ impl Agent {
             checkpoint_ordinal: 0,
             prompt_scan_cache: Mutex::new(None),
             prompt_scan_epoch: 0,
-            successful_images_this_turn: 0,
+            image_budget_this_turn: image::ImageBudget::default(),
             last_checkpoint_signature: None,
         })
     }
@@ -15331,14 +15384,24 @@ impl Agent {
         let sleep = tokio::time::sleep(std::time::Duration::from_secs(secs));
         tokio::pin!(sleep);
         let mut ticker = tokio::time::interval(std::time::Duration::from_millis(25));
+        let mut applied = AppliedRuntimeControls::default();
         loop {
             if self.interrupt.load(Ordering::SeqCst) {
-                return AppliedRuntimeControls::default();
+                return applied;
             }
             tokio::select! {
-                _ = &mut sleep => return AppliedRuntimeControls::default(),
+                _ = &mut sleep => return applied,
                 msg = queued_runtime_control_waiter(&mut self.runtime_control_rx) => {
-                    return apply_runtime_control_for_stream(self, msg);
+                    let control = apply_runtime_control_for_stream(self, msg);
+                    applied.commands = applied.commands.saturating_add(control.commands);
+                    applied.changed_model |= control.changed_model;
+                    applied.changed_effort |= control.changed_effort;
+                    applied.changed_mode |= control.changed_mode;
+                    applied.effective_mode_changed |= control.effective_mode_changed;
+                    applied.aborted_stream |= control.aborted_stream;
+                    if applied.aborted_stream {
+                        return applied;
+                    }
                 }
                 _ = ticker.tick() => {}
             }
@@ -16946,6 +17009,7 @@ impl Agent {
         let valid_ids = Self::tool_use_ids_in_messages(history);
         let interrupt = Some(self.interrupt.as_ref());
         let current_image_target = self.image_disclosure_target();
+        let mut image_budget = image::ImageBudget::default();
         let mut msgs = vec![OaiMessage {
             role: "system".to_string(),
             content: Some(Value::String(system_text.to_string())),
@@ -17011,7 +17075,7 @@ impl Agent {
                             message_index,
                             current_turn_start,
                         ) {
-                            match active_image_wire(&reference, interrupt) {
+                            match active_image_wire(&reference, interrupt, &mut image_budget) {
                                 Ok((media_type, data)) => json!([
                                     {"type": "text", "text": "Approved workspace image"},
                                     {"type": "image_url", "image_url": {"url": format!("data:{media_type};base64,{data}")}}
@@ -17145,6 +17209,7 @@ impl Agent {
         let valid_ids = Self::tool_use_ids_in_messages(history);
         let interrupt = Some(self.interrupt.as_ref());
         let current_image_target = self.image_disclosure_target();
+        let mut image_budget = image::ImageBudget::default();
         let mut items = Vec::new();
         let mut msg_counter = 0usize;
 
@@ -17213,7 +17278,7 @@ impl Agent {
                             message_index,
                             current_turn_start,
                         ) {
-                            match active_image_wire(&reference, interrupt) {
+                            match active_image_wire(&reference, interrupt, &mut image_budget) {
                                 Ok((media_type, data)) => json!([{
                                     "type": "input_image",
                                     "image_url": format!("data:{media_type};base64,{data}"),
@@ -18646,8 +18711,9 @@ impl Agent {
         }
         let mut builder = self
             .provider_post(provider_request_url(&self.base_url, contract))?
-            .header("content-type", "application/json")
-            .body(bytes);
+            .header("content-type", "application/json");
+        let body = provider::ProviderRequestBody::encode(contract, bytes, &self.interrupt)?;
+        builder = body.apply(builder);
         if contract.is_responses() {
             builder = builder.header("accept", "text/event-stream");
         }
@@ -18935,7 +19001,9 @@ impl Agent {
         explicit_pack: Option<packs::PackInvocation>,
     ) -> Result<()> {
         self.interrupt.store(false, Ordering::SeqCst);
-        self.successful_images_this_turn = 0;
+        self.image_budget_this_turn = image::ImageBudget::default();
+        // Invalidate prior image grants even when auth refresh fails before history changes.
+        self.prompt_scan_epoch = self.prompt_scan_epoch.wrapping_add(1);
         self.begin_provider_turn();
         self.sink.emit(AgentEvent::TurnStart);
         self.append_latest_log("chat_start", &format!("chars={}", user_input.len()));
@@ -18961,9 +19029,6 @@ impl Agent {
     ) -> Result<()> {
         self.refresh_runtime_provider_auth().await?;
         let mut compacted_this_turn = false;
-        // New user turn: force a fresh prompt filesystem scan (DEXT.md/recall.md
-        // walks, pack discovery) on the first request of the turn.
-        self.prompt_scan_epoch = self.prompt_scan_epoch.wrapping_add(1);
         let turn_id = format!("turn-{}-{}", unix_timestamp_secs(), self.prompt_scan_epoch);
         self.git_context = git_summary(&self.sandbox_root);
         let suppress_pack_activation = self.suppress_pack_activation || explicit_pack.is_some();
@@ -19247,12 +19312,31 @@ impl Agent {
                     chatgpt_session_id.as_deref().unwrap_or("dext"),
                     request_effort_override,
                 )?;
+                let req_body = provider::ProviderRequestBody::encode(
+                    self.request_contract(),
+                    req_body,
+                    &self.interrupt,
+                )?;
+                if req_body.gzip {
+                    self.append_latest_log(
+                        "provider_request_encoding",
+                        &format!(
+                            "contract={} encoding=gzip json_bytes={} wire_bytes={}",
+                            self.request_contract().as_str(),
+                            req_body.json_bytes,
+                            req_body.bytes.len()
+                        ),
+                    );
+                }
                 stream_attempt += 1;
                 if stream_attempt > 1 && !self.quiet_stream_events {
                     self.sink.emit(AgentEvent::ThinkingPreviewDiscarded);
                 }
                 let mut attempt: u32 = 0;
                 let resp = loop {
+                    if self.interrupt.load(Ordering::SeqCst) {
+                        anyhow::bail!("interrupted by user before provider response");
+                    }
                     attempt += 1;
                     let builder = self
                         .provider_post(&url)?
@@ -19269,7 +19353,7 @@ impl Agent {
                         chatgpt_session_id.as_deref()
                     };
                     let req = apply_provider_headers(
-                        builder.body(req_body.clone()),
+                        req_body.apply(builder),
                         self.request_contract(),
                         &self.api_key,
                         self.provider_profile.as_ref().is_some_and(|profile| {
@@ -19334,6 +19418,7 @@ impl Agent {
                             let plan = orchestrator::classify_http_failure(code, &text);
 
                             if matches!(code, 400 | 500)
+                                && stream_attempt < MAX_STREAM_ATTEMPTS
                                 && !provider_workaround_used
                                 && is_provider_tool_result_id_bug(&text)
                                 && self.rewrite_latest_tool_results_as_text_fallback()
@@ -19352,6 +19437,7 @@ impl Agent {
                             }
 
                             if !context_overflow_compact_attempted
+                                && stream_attempt < MAX_STREAM_ATTEMPTS
                                 && matches!(code, 400 | 413)
                                 && orchestrator::stream_error_is_context_overflow(&text)
                             {
@@ -19363,6 +19449,14 @@ impl Agent {
 
                             if !plan.retry || attempt >= MAX_HTTP_ATTEMPTS {
                                 let error = http_status_error(status, &text);
+                                let error = if plan.retry {
+                                    format!(
+                                        "{error}\nProvider retry budget exhausted after {attempt} attempts on {}/{}. Retry later or select another route with /provider or /model.",
+                                        self.provider_id, self.model
+                                    )
+                                } else {
+                                    error
+                                };
                                 self.append_latest_log(
                                     "http_error",
                                     &format!("kind={} {error}", plan.label()),
@@ -19461,14 +19555,18 @@ impl Agent {
                         break 'stream_retry ParsedProviderStream::stopped("runtime_control");
                     }
                     Err(e) => {
+                        if self.interrupt.load(Ordering::SeqCst) {
+                            return Err(e);
+                        }
                         let body = stream_error_body(&e);
                         self.record_provider_stream_failure(&body);
                         let plan = orchestrator::classify_stream_error(&body);
                         let visible_text_streamed = self
                             .partial_stream_text
-                            .as_deref()
-                            .is_some_and(|text| !text.is_empty());
+                            .as_ref()
+                            .is_some_and(|partial| !partial.text.is_empty());
                         if !context_overflow_compact_attempted
+                            && stream_attempt < MAX_STREAM_ATTEMPTS
                             && !visible_text_streamed
                             && orchestrator::stream_error_is_context_overflow(&body)
                         {
@@ -19478,6 +19576,7 @@ impl Agent {
                             }
                         }
                         if !malformed_tool_call_recovery_attempted
+                            && stream_attempt < MAX_STREAM_ATTEMPTS
                             && !visible_text_streamed
                             && malformed_responses_tool_arguments_error(
                                 self.request_contract(),
@@ -19510,16 +19609,23 @@ impl Agent {
                             self.partial_stream_text = None;
                             continue 'stream_retry;
                         }
-                        if plan.retry
-                            && !visible_text_streamed
-                            && stream_attempt < MAX_STREAM_ATTEMPTS
-                        {
+                        let partial_preserved = self.preserve_interrupted_stream();
+                        if plan.retry && stream_attempt < MAX_STREAM_ATTEMPTS {
+                            if partial_preserved {
+                                self.history.push(Message {
+                                    role: "user".to_string(),
+                                    content: vec![Block::Text {
+                                        text: "[runtime-note] The provider stream was interrupted. The preceding partial response is incomplete, not a completed answer. No tool calls from that failed response were executed. Earlier completed tool results remain valid. Continue from the saved history without repeating completed work or analysis; make the next concise tool call or finish the answer.".to_string(),
+                                    }],
+                                });
+                                self.checkpoint_latest_session("after_stream_continuation_note");
+                            }
                             let wait = jittered_backoff_secs(1u64 << (stream_attempt - 1));
                             self.append_latest_log(
                                 "stream_retry",
                                 &format!(
-                                    "attempt={stream_attempt} kind={} wait={wait}s body={body}",
-                                    plan.label()
+                                    "attempt={stream_attempt} kind={} route={}/{} contract={} partial_preserved={partial_preserved} wait={wait}s body={body}",
+                                    plan.label(), self.provider_id, self.model, self.request_contract().as_str()
                                 ),
                             );
                             last_retry_reason = Some(format!("{} stream error", plan.label()));
@@ -19538,33 +19644,17 @@ impl Agent {
                             }
                             continue 'stream_retry;
                         }
-                        if self.request_contract().is_responses() {
-                            let partial_blocks = self.partial_chatgpt_stream_blocks();
-                            if maybe_preserve_partial_stream(
-                                &partial_blocks,
-                                &mut self.history,
-                                self.context_mode,
-                            ) {
-                                self.checkpoint_latest_session("after_partial_stream_preserve");
-                                self.sink.emit(AgentEvent::Warn(
-                                    "provider closed the stream after partial text; preserved partial response instead of replaying the same turn".to_string(),
-                                ));
-                                break 'stream_retry ParsedProviderStream {
-                                    blocks: partial_blocks,
-                                    stop_reason: Some("partial_stream_eof".to_string()),
-                                    usage: Usage::default(),
-                                    unfinished_tool_calls: 0,
-                                };
-                            }
-                        }
                         self.append_latest_log(
                             "stream_error",
-                            &format!("kind={} {body}", plan.label()),
+                            &format!(
+                                "kind={} route={}/{} contract={} attempts={stream_attempt} partial_preserved={partial_preserved} {body}",
+                                plan.label(), self.provider_id, self.model, self.request_contract().as_str()
+                            ),
                         );
                         if plan.retry {
                             return Err(e.context(format!(
-                                "{} stream error after {stream_attempt} attempts; provider/upstream kept returning retryable SSE errors",
-                                plan.label()
+                                "Provider stream retry budget exhausted after {stream_attempt} attempts on {}/{}. Interrupted tool calls were not executed. Retry with `continue` or select another route with /provider or /model",
+                                self.provider_id, self.model
                             )));
                         }
                         return Err(e);
@@ -20223,19 +20313,30 @@ impl Agent {
     }
 
     fn emit_stream_updates(&mut self, updates: Vec<streaming::StreamUpdate>) {
-        if self.quiet_stream_events {
-            return;
-        }
         for update in updates {
+            if let streaming::StreamUpdate::TextDelta(text) = &update {
+                self.partial_stream_text
+                    .get_or_insert_with(PartialStreamText::default)
+                    .push_delta(text);
+            } else if let streaming::StreamUpdate::TextBlockComplete(text) = &update {
+                self.partial_stream_text
+                    .get_or_insert_with(PartialStreamText::default)
+                    .complete_block(text);
+            } else if matches!(update, streaming::StreamUpdate::TextPreviewDiscarded) {
+                self.partial_stream_text = None;
+            }
+            if self.quiet_stream_events {
+                continue;
+            }
             match update {
                 streaming::StreamUpdate::TextDelta(text) => {
-                    self.partial_stream_text
-                        .get_or_insert_with(String::new)
-                        .push_str(&text);
                     self.sink.emit(AgentEvent::TextDelta(text));
                 }
                 streaming::StreamUpdate::TextBlockComplete(text) => {
                     self.sink.emit(AgentEvent::TextBlockComplete(text));
+                }
+                streaming::StreamUpdate::TextPreviewDiscarded => {
+                    self.sink.emit(AgentEvent::TextBlockComplete(String::new()));
                 }
                 streaming::StreamUpdate::ThinkingDelta(text) => {
                     self.sink.emit(AgentEvent::ThinkingDelta(text));
@@ -20260,16 +20361,38 @@ impl Agent {
             .await
     }
 
-    fn partial_chatgpt_stream_blocks(&mut self) -> Vec<Block> {
-        let mut blocks = Vec::new();
-        let text = self.partial_stream_text.take().unwrap_or_default();
-        let text = text.trim_end();
-        if !text.is_empty() {
-            blocks.push(Block::PartialStream {
-                text: format!("{text}\n\n[stream ended early; preserved partial response]"),
-            });
+    fn preserve_interrupted_stream(&mut self) -> bool {
+        let partial = self.partial_stream_text.take().unwrap_or_default();
+        if partial.text.trim().is_empty() {
+            return false;
         }
-        blocks
+        // A failed parser never releases tool calls or reasoning for replay.
+        const MARKER: &str = "[stream interrupted; incomplete response]";
+        let text = format!("{}\n\n{MARKER}", partial.text.trim_end());
+        let blocks = [Block::PartialStream { text }];
+        if !maybe_preserve_partial_stream(&blocks, &mut self.history, self.context_mode) {
+            return false;
+        }
+        self.checkpoint_latest_session("after_partial_stream_preserve");
+        if !self.quiet_stream_events {
+            let tail = if partial.block_complete {
+                ""
+            } else {
+                partial.text[partial.active_start..].trim_end()
+            };
+            let display = if tail.is_empty() {
+                MARKER.to_string()
+            } else {
+                format!("{tail}\n\n{MARKER}")
+            };
+            self.sink.emit(AgentEvent::ThinkingPreviewDiscarded);
+            self.sink.emit(AgentEvent::TextBlockComplete(display));
+            self.sink.emit(AgentEvent::ThinkingPreviewCommitted);
+            self.sink.emit(AgentEvent::Warn(
+                "[provider stream interrupted] Partial response retained as incomplete; no calls from the failed response were executed.".to_string(),
+            ));
+        }
+        true
     }
 
     async fn read_stream_responses(

@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Changed
+
+- Raised the transient foreground provider HTTP retry budget from four to six attempts per request round. Without `Retry-After`, five jittered waits total 16–27 seconds plus request time; this improves transient-failure tolerance but does not establish the cause of observed ChatGPT 503s or exclude size-dependent failures. A pre-request cancellation check prevents another request after an interrupted zero-second wait. Mock-server regressions cover five 503s before success, exhaustion at six requests, identical retry bodies, fail-fast authentication/schema errors, and interruption. Four-attempt stream/summary budgets remain separate.
+
+- Raised `read_image` from two to 100 successful images per user turn, with a shared 20 MiB sanitized-JPEG budget. Failed/over-budget calls do not add references or consume budget; batched dispatch and all four provider wire contracts enforce the same bounds before disclosure/base64 encoding. Existing approvals, decoder isolation, digest/route fences, metadata stripping and path-only sessions remain unchanged; no dependencies or persistent pixel cache were added. Provider context/request limits may be lower.
+
+### Fixed
+
+- Fresh-eyes image audit deferred batch image approvals/digest capture/pre-tool hooks until sequential dispatch after capacity and interrupt checks; exhausted budgets no longer cause unusable prompts. New-turn image grants expire before authentication refresh, including on early failure. Lean tool descriptions now expose count/byte limits within the unchanged prompt budget. Regressions cover policy/denial/cancellation, hook blocking/source changes, smaller-after-overflow admission, exact decoded wire bytes across messages/rebuilt requests, and six distinguishable gateway images. The real-binary worker/gateway fixture additionally verifies 100/101 admission across 50/51-call batches, sanitized dimensions/order and aggregate bytes, and refusal without pixels. A bounded live ChatGPT smoke correctly identified 12 distinct fixture colors; 100-image and cross-provider live acceptance remain unclaimed.
+
+- Fixed live answers appearing above the spinner. Answers now use the same status-first, bottom-aligned flow as thinking/tool output: activity, unfinished response, then composer. Stable content enters native history once without the spinner. Composer/footer retain normal bottom anchoring; short panes preserve activity before newest content, and slash popups reserve space below the live tail. Long activity labels remain single-line with bounded elapsed text. Renderer, inline-backend and Unix PTY regressions cover actual row ordering, history handoff, empty tails, multiline drafts, prompts/overlays, lifecycle changes and resize.
+
+- Retry waits now preserve their deadline through status-only runtime controls; closed control channels no longer spin. Cancellation and route changes remain responsive. Exhausted HTTP errors retain the upstream response and add route, attempt count and explicit recovery options without automatic provider switching. Thinking/tool activity receives the same short-pane retention and single-line bounds as answers, and slash popups shrink or hide instead of covering the composer.
+
 ## v0.2.1 - 2026-10-07
 
 Patch release replacing the unpublished `v0.2.0`, whose release workflow stopped before publication; the `v0.2.0` tag is retained unchanged.

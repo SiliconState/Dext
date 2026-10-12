@@ -1712,10 +1712,19 @@ pub(crate) fn classify_stream_error(body: &str) -> RetryPlan {
     // Responses streams that die inside a `response.incomplete` terminal event
     // (missing/conflicting response objects) are backend truncation, not a
     // request defect. Retry the request — bounded upstream by
-    // MAX_STREAM_ATTEMPTS and the visible-text guard — instead of failing the
+    // MAX_STREAM_ATTEMPTS — instead of failing the
     // turn permanently. This must run before the token-limit rule below
     // because these bodies can mention `max_output_tokens`.
     if lower.contains("stream protocol error") && lower.contains("response.incomplete") {
+        return RetryPlan {
+            kind: FailureKind::Transient,
+            retry: true,
+        };
+    }
+
+    if lower
+        == "stream protocol error [anthropic-messages/finalize]: stream ended before message_stop"
+    {
         return RetryPlan {
             kind: FailureKind::Transient,
             retry: true,
@@ -1743,11 +1752,29 @@ pub(crate) fn classify_stream_error(body: &str) -> RetryPlan {
         };
     }
     if lower.contains("invalid api key")
+        || lower.contains("invalid_api_key")
         || lower.contains("unauthorized")
         || lower.contains("authentication")
     {
         return RetryPlan {
             kind: FailureKind::Auth,
+            retry: false,
+        };
+    }
+
+    if [
+        "invalid_request_error",
+        "invalid_request",
+        "permission_error",
+        "permission_denied",
+        "content_filter",
+        "unsupported_parameter",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+    {
+        return RetryPlan {
+            kind: FailureKind::Schema,
             retry: false,
         };
     }

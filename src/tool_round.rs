@@ -89,6 +89,115 @@ fn command_install_target_status(command: &str, root: &Path) -> Option<Option<bo
 }
 
 impl Agent {
+    async fn prepare_approved_image_call(
+        &mut self,
+        input: &mut Value,
+        call_id: &str,
+        input_str: &str,
+        denied_signatures: &mut HashSet<String>,
+        hooks_approved: bool,
+    ) -> Result<(), String> {
+        if self.interrupt.load(Ordering::SeqCst) {
+            return Err("read_image was not executed: interrupted by user".to_string());
+        }
+        self.image_budget_this_turn.check_available()?;
+        let approved_path = image::workspace_path(&self.sandbox_root, input)?;
+        if let Some(error) = self
+            .privacy
+            .path_denial("read_image", input, &self.sandbox_root)
+        {
+            return Err(error);
+        }
+        let call_sig = format!("read_image\n{input}");
+        let approved = if self.deny_tools.contains("read_image")
+            || denied_signatures.contains(&call_sig)
+            || self.approval_profile == ApprovalProfile::Never
+        {
+            false
+        } else if self.tool_auto_approved("read_image", input) {
+            true
+        } else {
+            match self.sink.request_permission("read_image", input) {
+                Choice::Once => true,
+                Choice::Always => {
+                    self.allowed.insert("read_image".to_string());
+                    true
+                }
+                Choice::Deny => false,
+            }
+        };
+        if !approved {
+            denied_signatures.insert(call_sig);
+            return Err(
+                "permission denied by user — do not retry this tool call; ask the user instead"
+                    .to_string(),
+            );
+        }
+        if image::workspace_path(&self.sandbox_root, input)? != approved_path {
+            return Err("source path changed during read_image approval".to_string());
+        }
+        input
+            .as_object_mut()
+            .ok_or("invalid tool args for read_image: expected an object")?
+            .insert(
+                image::APPROVED_SOURCE_PATH_FIELD.to_string(),
+                Value::String(
+                    approved_path
+                        .to_str()
+                        .ok_or("read_image requires a UTF-8 workspace path")?
+                        .to_string(),
+                ),
+            );
+        let image_root = self.sandbox_root.clone();
+        let mut image_input = input.clone();
+        image_input["path"] = input[image::APPROVED_SOURCE_PATH_FIELD].clone();
+        let image_interrupt = self.interrupt.clone();
+        let digest = tokio::task::spawn_blocking(move || {
+            image::approval_digest(&image_root, &image_input, Some(image_interrupt.as_ref()))
+        })
+        .await
+        .map_err(|error| format!("image approval task failed: {error}"))??;
+        input
+            .as_object_mut()
+            .ok_or("invalid tool args for read_image: expected an object")?
+            .insert(
+                image::APPROVED_SOURCE_SHA256_FIELD.to_string(),
+                Value::String(digest),
+            );
+        if hooks_approved {
+            let input_redacted = self.privacy.redact_text(input_str).text;
+            let pre_env = [
+                ("DEXT_TOOL_NAME", "read_image"),
+                ("DEXT_TOOL_INPUT", input_redacted.as_str()),
+                ("DEXT_TOOL_CALL_ID", call_id),
+                (
+                    "DEXT_SESSION_ID",
+                    if self.session_enabled {
+                        self.session_id.as_str()
+                    } else {
+                        ""
+                    },
+                ),
+            ];
+            for (out, code, _) in self.hooks.fire(
+                "pre_tool",
+                "read_image",
+                &pre_env,
+                &self.pack_hook_env,
+                &self.sandbox_root,
+                self.sandbox_profile(),
+            ) {
+                if code != 0 {
+                    return Err(format!(
+                        "pre_tool hook blocked (exit {code}):\n{}",
+                        out.trim()
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) async fn execute_tool_round(
         &mut self,
         context: ToolRoundContext<'_>,
@@ -170,7 +279,7 @@ impl Agent {
         let dext_checkout = batch_has_dext_install;
         let mut plans: Vec<PlannedCall> = Vec::new();
         let mut journal_terminal_errors: Vec<String> = Vec::new();
-        for (ordinal, (id, name, mut input)) in tool_calls.into_iter().enumerate() {
+        for (ordinal, (id, name, input)) in tool_calls.into_iter().enumerate() {
             let mut journal_input = input.clone();
             self.privacy
                 .redact_recall_tool_input(&name, &mut journal_input, &self.sandbox_root);
@@ -338,9 +447,12 @@ impl Agent {
                 });
             }
 
-            if plan.is_none() && name == "read_image" && self.successful_images_this_turn >= 2 {
+            if plan.is_none()
+                && name == "read_image"
+                && let Err(content) = self.image_budget_this_turn.check_available()
+            {
                 plan = Some(Plan::Immediate {
-                    content: "read_image allows at most two successful images per user turn; ask the user to start another turn for additional images".to_string(),
+                    content,
                     is_error: Some(true),
                 });
             }
@@ -450,6 +562,12 @@ impl Agent {
                 });
             }
 
+            if plan.is_none() && name == "read_image" {
+                // Image approval follows prior admissions, not the whole batch preflight.
+                image_disclosure_target = Some(self.image_disclosure_target());
+                plan = Some(Plan::Builtin);
+            }
+
             if plan.is_none() {
                 let approved = if self.deny_tools.contains(&name)
                     || denied_signatures.contains(&call_sig)
@@ -491,97 +609,56 @@ impl Agent {
                         is_error: Some(true),
                     });
                 } else {
-                    if name == "read_image" {
-                        image_disclosure_target = Some(self.image_disclosure_target());
-                        let image_root = self.sandbox_root.clone();
-                        let image_input = input.clone();
-                        let image_interrupt = self.interrupt.clone();
-                        let digest = tokio::task::spawn_blocking(move || {
-                            image::approval_digest(
-                                &image_root,
-                                &image_input,
-                                Some(image_interrupt.as_ref()),
-                            )
-                        })
-                        .await
-                        .map_err(|error| format!("image approval task failed: {error}"))
-                        .and_then(|result| result);
-                        match digest {
-                            Ok(digest) => {
-                                if let Some(fields) = input.as_object_mut() {
-                                    fields.insert(
-                                        image::APPROVED_SOURCE_SHA256_FIELD.to_string(),
-                                        Value::String(digest),
-                                    );
-                                } else {
-                                    plan = Some(Plan::Immediate {
-                                        content:
-                                            "invalid tool args for read_image: expected an object"
-                                                .to_string(),
-                                        is_error: Some(true),
-                                    });
-                                }
-                            }
-                            Err(content) => {
-                                plan = Some(Plan::Immediate {
-                                    content,
-                                    is_error: Some(true),
-                                });
-                            }
-                        }
-                    }
-                    if plan.is_none() {
-                        let input_redacted = self.privacy.redact_text(&input_str).text;
-                        let pre_env = [
-                            ("DEXT_TOOL_NAME", name.as_str()),
-                            ("DEXT_TOOL_INPUT", input_redacted.as_str()),
-                            ("DEXT_TOOL_CALL_ID", id.as_str()),
-                            (
-                                "DEXT_SESSION_ID",
-                                if self.session_enabled {
-                                    self.session_id.as_str()
-                                } else {
-                                    ""
-                                },
-                            ),
-                        ];
-                        let mut blocked: Option<String> = None;
-                        if hooks_approved {
-                            for (out, code, _) in self.hooks.fire(
-                                "pre_tool",
-                                &name,
-                                &pre_env,
-                                &self.pack_hook_env,
-                                &self.sandbox_root,
-                                self.sandbox_profile(),
-                            ) {
-                                if code != 0 {
-                                    blocked = Some(format!(
-                                        "pre_tool hook blocked (exit {code}):\n{}",
-                                        out.trim()
-                                    ));
-                                    break;
-                                }
-                            }
-                        }
-                        plan = Some(match blocked {
-                            Some(msg) => Plan::Immediate {
-                                content: msg,
-                                is_error: Some(true),
+                    let input_redacted = self.privacy.redact_text(&input_str).text;
+                    let pre_env = [
+                        ("DEXT_TOOL_NAME", name.as_str()),
+                        ("DEXT_TOOL_INPUT", input_redacted.as_str()),
+                        ("DEXT_TOOL_CALL_ID", id.as_str()),
+                        (
+                            "DEXT_SESSION_ID",
+                            if self.session_enabled {
+                                self.session_id.as_str()
+                            } else {
+                                ""
                             },
-                            None => {
-                                local_sudo_auth_needed = name == "bash"
-                                    && tool_policy::command_invokes_sudo(
-                                        input["command"].as_str().unwrap_or(""),
-                                    );
-                                if self.active_runtime_tool(&name).is_some() {
-                                    Plan::Runtime
-                                } else {
-                                    Plan::Builtin
-                                }
+                        ),
+                    ];
+                    let mut blocked: Option<String> = None;
+                    if hooks_approved {
+                        for (out, code, _) in self.hooks.fire(
+                            "pre_tool",
+                            &name,
+                            &pre_env,
+                            &self.pack_hook_env,
+                            &self.sandbox_root,
+                            self.sandbox_profile(),
+                        ) {
+                            if code != 0 {
+                                blocked = Some(format!(
+                                    "pre_tool hook blocked (exit {code}):\n{}",
+                                    out.trim()
+                                ));
+                                break;
                             }
-                        });
+                        }
                     }
+                    plan = Some(match blocked {
+                        Some(msg) => Plan::Immediate {
+                            content: msg,
+                            is_error: Some(true),
+                        },
+                        None => {
+                            local_sudo_auth_needed = name == "bash"
+                                && tool_policy::command_invokes_sudo(
+                                    input["command"].as_str().unwrap_or(""),
+                                );
+                            if self.active_runtime_tool(&name).is_some() {
+                                Plan::Runtime
+                            } else {
+                                Plan::Builtin
+                            }
+                        }
+                    });
                 }
             }
 
@@ -829,7 +906,7 @@ impl Agent {
             for idx in builtin_indices {
                 let root = self.sandbox_root.clone();
                 let n = plans[idx].name.clone();
-                let inp = plans[idx].input.clone();
+                let mut inp = plans[idx].input.clone();
                 let summary = plans[idx].summary.clone();
                 let session_id = self.session_id.clone();
                 let local_sudo_auth_needed = plans[idx].local_sudo_auth_needed;
@@ -931,11 +1008,18 @@ impl Agent {
                     );
                     continue;
                 }
-                if n == "read_image" && self.successful_images_this_turn >= 2 {
-                    builtin_outputs.insert(
-                        idx,
-                        Err("read_image allows at most two successful images per user turn; ask the user to start another turn for additional images".to_string()),
-                    );
+                if n == "read_image"
+                    && let Err(error) = self
+                        .prepare_approved_image_call(
+                            &mut inp,
+                            &plans[idx].tool_use_id,
+                            &plans[idx].input_str,
+                            &mut denied_signatures,
+                            hooks_approved,
+                        )
+                        .await
+                {
+                    builtin_outputs.insert(idx, Err(error));
                     continue;
                 }
                 self.sink.emit(AgentEvent::ToolCallStart {
@@ -1046,14 +1130,17 @@ impl Agent {
                     )
                     .await
                 };
-                if n == "read_image"
-                    && r.as_ref().is_ok_and(|content| {
-                        serde_json::from_str::<image::ImageReference>(content).is_ok()
+                let r = if n == "read_image" {
+                    r.and_then(|content| {
+                        let result = serde_json::from_str::<image::ReadImageResult>(&content)
+                            .map_err(|error| format!("invalid internal image result: {error}"))?;
+                        image::validate_reference(&result.reference)?;
+                        self.image_budget_this_turn.admit(result.encoded_bytes)?;
+                        Ok(content)
                     })
-                {
-                    self.successful_images_this_turn =
-                        self.successful_images_this_turn.saturating_add(1);
-                }
+                } else {
+                    r
+                };
                 if multi_verification_batch
                     && let Some(spec) = plans[idx].verification_spec.as_ref()
                 {
@@ -1144,10 +1231,11 @@ impl Agent {
             let mut image_reference = None;
             if !is_error.unwrap_or(false) && ran_tool && name == "read_image" {
                 match (
-                    serde_json::from_str::<image::ImageReference>(&content),
+                    serde_json::from_str::<image::ReadImageResult>(&content),
                     image_disclosure_target,
                 ) {
-                    (Ok(reference), Some(disclosure_target)) => {
+                    (Ok(result), Some(disclosure_target)) => {
+                        let reference = result.reference;
                         content = format!(
                             "approved image ({}x{}, sanitized as {}); pixels are available to the model only in this turn",
                             reference.width, reference.height, reference.media_type

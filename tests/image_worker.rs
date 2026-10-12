@@ -179,20 +179,37 @@ fn real_worker_rejects_hostile_inputs_without_pixel_output() {
 }
 
 #[test]
-fn real_agent_sends_only_worker_sanitized_pixels_to_mock_gateway() {
-    image_gateway_round_trip(false);
+fn real_agent_sends_multiple_batches_of_worker_sanitized_images_to_mock_gateway() {
+    image_gateway_round_trip(false, &[3, 3]);
+}
+
+#[test]
+fn real_agent_admits_100_images_across_batches_and_refuses_the_101st() {
+    image_gateway_round_trip(false, &[50, 51]);
 }
 
 #[cfg(target_os = "linux")]
 #[test]
 fn running_agent_can_launch_workers_after_its_binary_is_unlinked() {
-    image_gateway_round_trip(true);
+    image_gateway_round_trip(true, &[3, 3]);
 }
 
-fn image_gateway_round_trip(unlink_binary: bool) {
+fn image_gateway_round_trip(unlink_binary: bool, batch_sizes: &[usize]) {
     use base64::Engine as _;
     use serde_json::{Value, json};
 
+    let requested_images = batch_sizes.iter().sum::<usize>();
+    let admitted_images = requested_images.min(100);
+    let timeout = Duration::from_secs(if requested_images > 6 { 90 } else { 20 });
+    let mut requested_so_far = 0;
+    let expected_totals: Vec<_> = batch_sizes
+        .iter()
+        .map(|size| {
+            requested_so_far += size;
+            requested_so_far
+        })
+        .collect();
+    let batch_sizes = batch_sizes.to_vec();
     let built_binary = std::path::PathBuf::from(env!("CARGO_BIN_EXE_dext"));
     let fixture_parent = if unlink_binary {
         built_binary.parent().unwrap().to_path_buf()
@@ -200,7 +217,7 @@ fn image_gateway_round_trip(unlink_binary: bool) {
         std::env::temp_dir()
     };
     let root = fixture_parent.join(format!(
-        "dext-image-gateway-{}-{unlink_binary}",
+        "dext-image-gateway-{}-{unlink_binary}-{requested_images}",
         std::process::id()
     ));
     let executable = if unlink_binary {
@@ -216,8 +233,12 @@ fn image_gateway_round_trip(unlink_binary: bool) {
     let running_binary = executable.clone();
     let state = root.join("state");
     std::fs::create_dir_all(&state).unwrap();
-    let source = fixture(ImageFormat::Png, 8, 4);
-    std::fs::write(root.join("sample.png"), &source).unwrap();
+    let sources: Vec<_> = (0..requested_images)
+        .map(|index| fixture(ImageFormat::Png, 8 + index as u32, 4 + index as u32))
+        .collect();
+    for (index, source) in sources.iter().enumerate() {
+        std::fs::write(root.join(format!("sample-{index}.png")), source).unwrap();
+    }
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let address = listener.local_addr().unwrap();
@@ -243,15 +264,12 @@ fn image_gateway_round_trip(unlink_binary: bool) {
     let server = std::thread::spawn(move || {
         let started = Instant::now();
         let mut bodies = Vec::new();
-        while bodies.len() < 2 {
+        while bodies.len() <= batch_sizes.len() {
             let mut stream = loop {
                 match listener.accept() {
                     Ok((stream, _)) => break stream,
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        assert!(
-                            started.elapsed() < Duration::from_secs(20),
-                            "missing image request"
-                        );
+                        assert!(started.elapsed() < timeout, "missing image request");
                         std::thread::sleep(Duration::from_millis(5));
                     }
                     Err(error) => panic!("accept: {error}"),
@@ -306,15 +324,28 @@ fn image_gateway_round_trip(unlink_binary: bool) {
             bodies.push(
                 serde_json::from_slice::<Value>(&request[header_end..header_end + length]).unwrap(),
             );
-            let delta = if index == 0 {
-                if unlink_binary {
+            let delta = if index < batch_sizes.len() {
+                if index == 0 && unlink_binary {
                     std::fs::remove_file(&running_binary).unwrap();
                 }
-                json!({"tool_calls": [{"index": 0, "id": "image-call", "function": {"name": "read_image", "arguments": "{\"path\":\"sample.png\"}"}}]})
+                let first_image = batch_sizes[..index].iter().sum::<usize>();
+                let calls: Vec<_> = (0..batch_sizes[index])
+                    .map(|offset| {
+                        let image_index = first_image + offset;
+                        json!({"index": offset, "id": format!("image-call-{image_index}"), "function": {
+                            "name": "read_image", "arguments": json!({"path": format!("sample-{image_index}.png")}).to_string()
+                        }})
+                    })
+                    .collect();
+                json!({"tool_calls": calls})
             } else {
-                json!({"content": "Verified sample.png through read_image. The approved image is 8 by 4 pixels; the gateway received only a sanitized JPEG, not the original PNG."})
+                json!({"content": format!("Verified {admitted_images} approved images through read_image across {} batches. The gateway received only sanitized JPEGs, not the original PNGs. {} images were refused by the turn limit.", batch_sizes.len(), requested_images - admitted_images)})
             };
-            let finish = if index == 0 { "tool_calls" } else { "stop" };
+            let finish = if index < batch_sizes.len() {
+                "tool_calls"
+            } else {
+                "stop"
+            };
             let body = format!(
                 "data: {}\n\ndata: [DONE]\n\n",
                 json!({"choices": [{"delta": delta, "finish_reason": finish}]})
@@ -335,7 +366,7 @@ fn image_gateway_round_trip(unlink_binary: bool) {
             "--cd",
         ])
         .arg(&root)
-        .arg("Inspect sample.png with read_image.")
+        .arg(format!("Inspect sample-0.png through sample-{}.png with read_image; report any images refused by the turn limit.", requested_images - 1))
         .env_clear()
         .env("HOME", &root)
         .env("DEXT_HOME", &state)
@@ -346,7 +377,7 @@ fn image_gateway_round_trip(unlink_binary: bool) {
     if let Some(system_root) = std::env::var_os("SystemRoot") {
         command.env("SystemRoot", system_root);
     }
-    let output = capture_child(&mut command, b"", Duration::from_secs(30));
+    let output = capture_child(&mut command, b"", timeout + Duration::from_secs(10));
     let bodies = server.join().unwrap();
     assert!(
         output.status.success(),
@@ -354,26 +385,57 @@ fn image_gateway_round_trip(unlink_binary: bool) {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(!bodies[0].to_string().contains("data:image/"));
-    let images: Vec<_> = bodies[1]["messages"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|item| item["role"] == "user")
-        .flat_map(|item| item["content"].as_array().into_iter().flatten())
-        .filter(|block| block["type"] == "image_url")
-        .collect();
-    assert_eq!(images.len(), 1, "{}", bodies[1]);
-    let data = images[0]["image_url"]["url"]
-        .as_str()
-        .unwrap()
-        .strip_prefix("data:image/jpeg;base64,")
-        .unwrap();
-    let jpeg = base64::engine::general_purpose::STANDARD
-        .decode(data)
-        .unwrap();
-    assert_ne!(jpeg, source);
-    assert!(jpeg.len() <= 1_500 * 1024);
-    assert!(image::load_from_memory_with_format(&jpeg, ImageFormat::Jpeg).is_ok());
+    for (body, requested) in bodies[1..].iter().zip(expected_totals) {
+        let tool_results: Vec<_> = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["role"] == "tool")
+            .collect();
+        assert_eq!(tool_results.len(), requested);
+        let expected = requested.min(100);
+        assert_eq!(
+            tool_results
+                .iter()
+                .filter(|message| message["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("at most 100 successful images"))
+                .count(),
+            tool_results.len() - expected,
+            "unexpected image admission results: {tool_results:?}; stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let images: Vec<_> = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| item["role"] == "user")
+            .flat_map(|item| item["content"].as_array().into_iter().flatten())
+            .filter(|block| block["type"] == "image_url")
+            .collect();
+        assert_eq!(images.len(), expected, "{body}");
+        let mut total_bytes = 0;
+        for (index, image) in images.into_iter().enumerate() {
+            let data = image["image_url"]["url"]
+                .as_str()
+                .unwrap()
+                .strip_prefix("data:image/jpeg;base64,")
+                .unwrap();
+            let jpeg = base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .unwrap();
+            assert_ne!(jpeg, sources[index]);
+            total_bytes += jpeg.len();
+            assert!(jpeg.len() <= 1_500 * 1024);
+            let decoded = image::load_from_memory_with_format(&jpeg, ImageFormat::Jpeg).unwrap();
+            assert_eq!(
+                (decoded.width(), decoded.height()),
+                (8 + index as u32, 4 + index as u32)
+            );
+        }
+        assert!(total_bytes <= 20 * 1024 * 1024);
+    }
     let _ = std::fs::remove_dir_all(root);
 }
 

@@ -13,7 +13,10 @@ pub(crate) const SOURCE_BYTE_CAP: usize = 20 * 1024 * 1024;
 pub(crate) const DECODED_PIXEL_CAP: u64 = 40_000_000;
 pub(crate) const LONGEST_SIDE_CAP: u32 = 1_568;
 pub(crate) const ENCODED_BYTE_CAP: usize = 1_500 * 1024;
+pub(crate) const TURN_IMAGE_CAP: usize = 100;
+pub(crate) const TURN_ENCODED_BYTE_CAP: usize = 20 * 1024 * 1024;
 pub(crate) const APPROVED_SOURCE_SHA256_FIELD: &str = "_dext_approved_source_sha256";
+pub(crate) const APPROVED_SOURCE_PATH_FIELD: &str = "_dext_approved_source_path";
 const BACKGROUND: [u8; 3] = [240, 240, 240];
 pub(crate) const WORKER_ARG: &str = "--dext-image-worker";
 const WORKER_MEMORY_CAP: u64 = 768 * 1024 * 1024;
@@ -163,7 +166,7 @@ fn worker_command(executable: &Path) -> Command {
 }
 
 #[cfg(target_os = "macos")]
-fn worker_memory_within_limit(child: &Child) -> Result<(), String> {
+fn worker_memory_within_limit(child: &Child) -> Result<bool, String> {
     let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of_val(&info) as libc::c_int;
     let read = unsafe {
@@ -176,12 +179,32 @@ fn worker_memory_within_limit(child: &Child) -> Result<(), String> {
         )
     };
     if read != size {
-        return Err("could not inspect image worker memory".to_string());
+        return Ok(false);
     }
     if info.pti_resident_size > WORKER_MEMORY_CAP {
         return Err("image worker exceeded its resident-memory limit".to_string());
     }
-    Ok(())
+    Ok(true)
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Default)]
+struct WorkerMemoryMonitor {
+    unavailable_since: Option<Instant>,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl WorkerMemoryMonitor {
+    fn observe(&mut self, sample: Result<bool, String>, now: Instant) -> Result<(), String> {
+        if sample? {
+            self.unavailable_since = None;
+        } else if now.duration_since(*self.unavailable_since.get_or_insert(now))
+            >= Duration::from_millis(50)
+        {
+            return Err("could not inspect image worker memory".to_string());
+        }
+        Ok(())
+    }
 }
 
 fn check_worker_interrupt(interrupt: Option<&AtomicBool>) -> Result<(), String> {
@@ -234,6 +257,8 @@ fn run_worker(
             let mut output = Vec::new();
             stderr.take(4096).read_to_end(&mut output).map(|_| output)
         });
+        #[cfg(target_os = "macos")]
+        let mut memory_monitor = WorkerMemoryMonitor::default();
         let status = loop {
             if let Err(error) = check_worker_interrupt(interrupt) {
                 break Err(error);
@@ -242,11 +267,11 @@ fn run_worker(
                 Ok(Some(status)) => break Ok(status),
                 Ok(None) if start.elapsed() < timeout => {
                     #[cfg(target_os = "macos")]
-                    if let Err(error) = worker_memory_within_limit(&child.0) {
-                        // A worker can exit between try_wait and proc_pidinfo.
-                        if matches!(child.0.try_wait(), Ok(Some(_))) {
-                            continue;
-                        }
+                    // A worker can exit between try_wait and proc_pidinfo; allow
+                    // a bounded reap window without accepting an uninspectable live child.
+                    if let Err(error) =
+                        memory_monitor.observe(worker_memory_within_limit(&child.0), Instant::now())
+                    {
                         break Err(error);
                     }
                     std::thread::sleep(Duration::from_millis(5));
@@ -435,6 +460,49 @@ pub(crate) struct ImageReference {
 pub(crate) struct PreparedImage {
     pub(crate) reference: ImageReference,
     pub(crate) bytes: Vec<u8>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct ReadImageResult {
+    pub(crate) reference: ImageReference,
+    pub(crate) encoded_bytes: usize,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ImageBudget {
+    pub(crate) images: usize,
+    pub(crate) encoded_bytes: usize,
+}
+
+impl ImageBudget {
+    pub(crate) fn check_available(&self) -> Result<(), String> {
+        if self.images >= TURN_IMAGE_CAP {
+            return Err(format!(
+                "read_image allows at most {TURN_IMAGE_CAP} successful images per user turn; start another turn for additional images"
+            ));
+        }
+        if self.encoded_bytes >= TURN_ENCODED_BYTE_CAP {
+            return Err(Self::byte_limit_error());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn admit(&mut self, encoded_bytes: usize) -> Result<(), String> {
+        self.check_available()?;
+        if encoded_bytes == 0 || encoded_bytes > ENCODED_BYTE_CAP {
+            return Err("invalid sanitized image byte count".to_string());
+        }
+        if encoded_bytes > TURN_ENCODED_BYTE_CAP.saturating_sub(self.encoded_bytes) {
+            return Err(Self::byte_limit_error());
+        }
+        self.images += 1;
+        self.encoded_bytes += encoded_bytes;
+        Ok(())
+    }
+
+    fn byte_limit_error() -> String {
+        "read_image exceeds the 20 MiB total sanitized-image budget per user turn; use smaller images/crops or start another turn".to_string()
+    }
 }
 
 fn png_is_animated(bytes: &[u8]) -> bool {
@@ -719,7 +787,7 @@ pub(crate) fn prepare_if_unchanged(
     Ok(prepared)
 }
 
-fn workspace_path(root: &Path, input: &serde_json::Value) -> Result<PathBuf, String> {
+pub(crate) fn workspace_path(root: &Path, input: &serde_json::Value) -> Result<PathBuf, String> {
     let raw = input["path"].as_str().ok_or("missing path")?;
     let path = crate::canonical_read_path(root, raw)?;
     // Compare against the canonical root: symlinked ancestors (for example
@@ -759,14 +827,23 @@ pub(crate) fn read_tool(
     let expected = input[APPROVED_SOURCE_SHA256_FIELD]
         .as_str()
         .ok_or("missing internal read_image approval digest")?;
+    let approved_path = input[APPROVED_SOURCE_PATH_FIELD]
+        .as_str()
+        .ok_or("missing internal read_image approval path")?;
     let path = workspace_path(root, input)?;
+    if path != Path::new(approved_path) {
+        return Err("source path changed after read_image approval".to_string());
+    }
     let bytes = source_bytes(&path, interrupt)?;
     if crate::sha256_hex_bytes(&bytes) != expected {
         return Err("source changed after read_image approval".to_string());
     }
     let prepared = prepare_bytes(path, bytes, interrupt)?;
-    serde_json::to_string(&prepared.reference)
-        .map_err(|error| format!("could not serialize image reference: {error}"))
+    serde_json::to_string(&ReadImageResult {
+        encoded_bytes: prepared.bytes.len(),
+        reference: prepared.reference,
+    })
+    .map_err(|error| format!("could not serialize image result: {error}"))
 }
 
 #[cfg(test)]
@@ -788,6 +865,60 @@ mod tests {
         ImageBuffer::from_pixel(width, height, pixel)
             .save_with_format(path, ImageFormat::Png)
             .expect("write PNG fixture");
+    }
+
+    #[test]
+    fn image_budget_accepts_exact_byte_boundary_and_rejects_overflow_atomically() {
+        let mut budget = ImageBudget::default();
+        while TURN_ENCODED_BYTE_CAP - budget.encoded_bytes > ENCODED_BYTE_CAP {
+            budget.admit(ENCODED_BYTE_CAP).unwrap();
+        }
+        let remaining = TURN_ENCODED_BYTE_CAP - budget.encoded_bytes;
+        let before = (budget.images, budget.encoded_bytes);
+        assert!(budget.admit(remaining + 1).unwrap_err().contains("20 MiB"));
+        assert_eq!((budget.images, budget.encoded_bytes), before);
+        budget.admit(remaining).unwrap();
+        assert_eq!(budget.encoded_bytes, TURN_ENCODED_BYTE_CAP);
+        let before = (budget.images, budget.encoded_bytes);
+        assert!(budget.admit(1).is_err());
+        assert_eq!((budget.images, budget.encoded_bytes), before);
+    }
+
+    #[test]
+    fn image_budget_accepts_100_small_images_and_rejects_invalid_sizes() {
+        let mut budget = ImageBudget::default();
+        for invalid in [0, ENCODED_BYTE_CAP + 1, usize::MAX] {
+            assert!(budget.admit(invalid).is_err());
+            assert_eq!((budget.images, budget.encoded_bytes), (0, 0));
+        }
+        for _ in 0..TURN_IMAGE_CAP {
+            budget.admit(100).unwrap();
+        }
+        assert_eq!(budget.images, TURN_IMAGE_CAP);
+        assert_eq!(budget.encoded_bytes, 100 * TURN_IMAGE_CAP);
+        assert!(budget.admit(1).unwrap_err().contains("at most 100"));
+        assert_eq!(budget.images, TURN_IMAGE_CAP);
+    }
+
+    #[test]
+    fn read_image_result_reports_exact_sanitized_byte_count_without_pixels() {
+        let root = temp_dir("image-result-accounting");
+        let png = root.join("sample.png");
+        write_png(&png, 4, 3, Rgba([12, 34, 56, 255]));
+        let mut input = serde_json::json!({"path": png});
+        input[APPROVED_SOURCE_PATH_FIELD] = workspace_path(&root, &input)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .into();
+        input[APPROVED_SOURCE_SHA256_FIELD] = approval_digest(&root, &input, None).unwrap().into();
+        let output = read_tool(&root, &input, None).unwrap();
+        let result: ReadImageResult = serde_json::from_str(&output).unwrap();
+        let rebuilt = prepare_if_unchanged(&result.reference, None).unwrap();
+        assert_eq!(result.encoded_bytes, rebuilt.bytes.len());
+        assert!(!output.contains("base64"));
+        assert!(!output.contains("disclosure_target"));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -857,6 +988,39 @@ mod tests {
     }
 
     #[test]
+    fn worker_memory_monitor_bounds_missing_samples_and_resets_on_success() {
+        let mut monitor = WorkerMemoryMonitor::default();
+        let start = Instant::now();
+        assert!(monitor.observe(Ok(false), start).is_ok());
+        assert!(
+            monitor
+                .observe(Ok(false), start + Duration::from_millis(49))
+                .is_ok()
+        );
+        assert!(
+            monitor
+                .observe(Ok(false), start + Duration::from_millis(50))
+                .unwrap_err()
+                .contains("could not inspect")
+        );
+        assert!(
+            monitor
+                .observe(Ok(true), start + Duration::from_millis(51))
+                .is_ok()
+        );
+        assert!(
+            monitor
+                .observe(Ok(false), start + Duration::from_millis(100))
+                .is_ok()
+        );
+        let error = "image worker exceeded its resident-memory limit";
+        assert_eq!(
+            monitor.observe(Err(error.into()), start + Duration::from_millis(101)),
+            Err(error.into())
+        );
+    }
+
+    #[test]
     fn worker_supervisor_reaps_a_successful_child() {
         let mut command = Command::new(worker_executable().unwrap());
         command
@@ -908,6 +1072,11 @@ mod tests {
         let png = root.join("sample.png");
         write_png(&png, 2, 2, Rgba([0, 0, 0, 255]));
         let mut input = serde_json::json!({"path": png});
+        input[APPROVED_SOURCE_PATH_FIELD] = workspace_path(&root, &input)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .into();
         input[APPROVED_SOURCE_SHA256_FIELD] = approval_digest(&root, &input, None).unwrap().into();
         assert!(
             read_tool(&root, &input, Some(&interrupt))
@@ -1144,12 +1313,45 @@ mod tests {
         let png = root.join("approval.png");
         write_png(&png, 2, 2, Rgba([0, 0, 0, 255]));
         let mut input = serde_json::json!({"path": png});
+        input[APPROVED_SOURCE_PATH_FIELD] = workspace_path(&root, &input)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .into();
         let digest = approval_digest(&root, &input, None).expect("approval digest");
         write_png(&png, 2, 2, Rgba([255, 255, 255, 255]));
         input[APPROVED_SOURCE_SHA256_FIELD] = serde_json::Value::String(digest);
         assert_eq!(
             read_tool(&root, &input, None).unwrap_err(),
             "source changed after read_image approval"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_image_rejects_same_bytes_at_a_retargeted_approved_path() {
+        let root = temp_dir("image-approval-identical-retarget");
+        write_png(&root.join("public.png"), 2, 2, Rgba([12, 34, 56, 255]));
+        std::fs::copy(root.join("public.png"), root.join("private.key")).unwrap();
+        let alias = root.join("sample.png");
+        std::os::unix::fs::symlink("public.png", &alias).unwrap();
+        let mut input = serde_json::json!({"path": alias});
+        input[APPROVED_SOURCE_PATH_FIELD] = workspace_path(&root, &input)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .into();
+        input[APPROVED_SOURCE_SHA256_FIELD] = approval_digest(&root, &input, None).unwrap().into();
+        std::fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink("private.key", &alias).unwrap();
+        assert_eq!(
+            approval_digest(&root, &input, None).unwrap(),
+            input[APPROVED_SOURCE_SHA256_FIELD].as_str().unwrap()
+        );
+        assert_eq!(
+            read_tool(&root, &input, None).unwrap_err(),
+            "source path changed after read_image approval"
         );
         let _ = std::fs::remove_dir_all(root);
     }

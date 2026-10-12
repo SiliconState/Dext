@@ -217,7 +217,7 @@ fn test_agent(root: &Path) -> Agent {
         checkpoint_ordinal: 0,
         prompt_scan_cache: Mutex::new(None),
         prompt_scan_epoch: 0,
-        successful_images_this_turn: 0,
+        image_budget_this_turn: image::ImageBudget::default(),
         last_checkpoint_signature: None,
     }
 }
@@ -6884,6 +6884,325 @@ async fn non_aborting_runtime_control_keeps_pending_provider_response() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+#[tokio::test]
+async fn provider_retry_wait_preserves_deadline_after_status_control() {
+    let root = temp_test_dir("retry-wait-status");
+    let mut agent = test_agent(&root);
+    agent.session_enabled = false;
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    agent.install_runtime_controls(rx, tx.clone());
+    tx.send("/effort status".into()).unwrap();
+    let started = tokio::time::Instant::now();
+    let wait = agent.interrupt_aware_sleep(1);
+    tokio::pin!(wait);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut wait)
+            .await
+            .is_err(),
+        "status control bypassed retry wait"
+    );
+    let result = tokio::time::timeout(Duration::from_secs(5), &mut wait)
+        .await
+        .unwrap();
+    assert!(!result.aborted_stream);
+    assert_eq!(result.commands, 1);
+    assert!(started.elapsed() >= Duration::from_secs(1));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn provider_retry_wait_still_observes_interrupt_and_route_controls() {
+    let root = temp_test_dir("retry-wait-cancellation");
+    let mut agent = test_agent(&root);
+    agent.session_enabled = false;
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    agent.install_runtime_controls(rx, tx.clone());
+    tx.send("/effort status".into()).unwrap();
+    let interrupt = agent.interrupt.clone();
+    let cancel = async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        interrupt.store(true, Ordering::SeqCst);
+    };
+    let (result, ()) = tokio::join!(
+        tokio::time::timeout(Duration::from_secs(2), agent.interrupt_aware_sleep(60)),
+        cancel
+    );
+    assert!(!result.unwrap().aborted_stream);
+    agent.interrupt.store(false, Ordering::SeqCst);
+    agent.thinking_effort = ThinkingEffort::Medium;
+    tx.send("/effort high".into()).unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(2), agent.interrupt_aware_sleep(60))
+        .await
+        .unwrap();
+    assert!(result.aborted_stream);
+    assert!(result.changed_effort);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn provider_runtime_control_waiter_disables_closed_receivers() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    drop(tx);
+    let mut receiver = Some(rx);
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(25),
+            queued_runtime_control_waiter(&mut receiver)
+        )
+        .await
+        .is_err()
+    );
+    assert!(receiver.is_none());
+}
+
+#[tokio::test]
+async fn transient_503_burst_retries_through_six_attempts_before_success() {
+    assert_provider_http_retry_case(503, 6, true, false).await;
+}
+
+#[tokio::test]
+async fn provider_http_retry_budget_stops_after_six_failures() {
+    assert_provider_http_retry_case(503, 6, false, false).await;
+}
+
+#[tokio::test]
+async fn provider_http_retry_auth_and_schema_errors_fail_fast() {
+    for status in [401, 422] {
+        assert_provider_http_retry_case(status, 1, false, false).await;
+    }
+}
+
+#[tokio::test]
+async fn provider_http_retry_interrupt_does_not_send_another_request() {
+    assert_provider_http_retry_case(503, 1, false, true).await;
+}
+
+async fn assert_provider_http_retry_case(
+    status: u16,
+    requests: usize,
+    completes: bool,
+    interrupted: bool,
+) {
+    assert_provider_http_retry_contract_case(
+        status,
+        requests,
+        completes,
+        interrupted,
+        false,
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn chatgpt_http_503_recovery_and_exhaustion_remain_bounded() {
+    assert_provider_http_retry_contract_case(503, 6, true, false, true, false).await;
+    assert_provider_http_retry_contract_case(503, 6, false, false, true, false).await;
+}
+
+#[tokio::test]
+async fn chatgpt_large_request_gzip_retries_preserve_body_and_history() {
+    assert_provider_http_retry_contract_case(503, 6, true, false, true, true).await;
+    assert_provider_http_retry_contract_case(503, 6, false, false, true, true).await;
+    assert_provider_http_retry_contract_case(503, 1, false, true, true, true).await;
+}
+
+async fn assert_provider_http_retry_contract_case(
+    status: u16,
+    requests: usize,
+    completes: bool,
+    interrupted: bool,
+    chatgpt: bool,
+    large_body: bool,
+) {
+    struct RetrySink {
+        tx: tokio::sync::mpsc::UnboundedSender<AgentEvent>,
+        interrupt: Arc<AtomicBool>,
+        interrupted: bool,
+    }
+    impl EventSink for RetrySink {
+        fn request_permission(&mut self, _name: &str, _input: &Value) -> Choice {
+            Choice::Deny
+        }
+        fn emit(&mut self, event: AgentEvent) {
+            if self.interrupted && matches!(event, AgentEvent::HttpRetry { .. }) {
+                self.interrupt.store(true, Ordering::SeqCst);
+            }
+            let _ = self.tx.send(event);
+        }
+        fn local_auth_prompt(&mut self, _tool: &str, _message: &str) {}
+    }
+    let root = temp_test_dir(&format!(
+        "http-retry-{status}-{requests}-{completes}-{interrupted}"
+    ));
+    let root = std::fs::canonicalize(&root).expect("canonical temp dir");
+    let _cleanup = RemoveDirOnDrop(root.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+    let addr = listener.local_addr().expect("local addr");
+    let server = std::thread::spawn(move || {
+        let mut bodies = Vec::new();
+        for request_index in 0..requests {
+            let mut stream = accept_test_connection(&listener, Duration::from_secs(5))
+                .expect("accept streaming request");
+            let mut request = Vec::new();
+            let mut buf = [0u8; 1024];
+            let header_end = loop {
+                let read = stream.read(&mut buf).expect("read request headers");
+                assert!(read > 0, "client closed before sending request headers");
+                request.extend_from_slice(&buf[..read]);
+                assert!(request.len() <= 1024 * 1024, "request headers too large");
+                if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break end + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            assert_eq!(
+                headers
+                    .lines()
+                    .any(|line| line.eq_ignore_ascii_case("content-encoding: gzip")),
+                large_body,
+                "{headers}"
+            );
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                })
+                .expect("request content length");
+            assert!(content_length <= 1024 * 1024, "request body too large");
+            while request.len() < header_end + content_length {
+                let read = stream.read(&mut buf).expect("read request body");
+                assert!(read > 0, "client closed before request body completed");
+                request.extend_from_slice(&buf[..read]);
+            }
+            bodies.push(request[header_end..header_end + content_length].to_vec());
+            let response = if completes && request_index + 1 == requests {
+                let body = if chatgpt {
+                    "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n"
+                } else {
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+                };
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+            } else {
+                let body = "upstream connect error or disconnect/reset before headers";
+                format!(
+                    "HTTP/1.1 {status} Test Failure\r\nRetry-After: 0\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+            };
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+        }
+        let extra_request = accept_test_connection(&listener, Duration::from_millis(250));
+        assert!(
+            matches!(extra_request, Err(ref error) if error.kind() == io::ErrorKind::TimedOut),
+            "unexpected extra provider request"
+        );
+        bodies
+    });
+
+    let mut agent = test_agent(&root);
+    agent.session_enabled = false;
+    agent.api_provider = ApiProvider::OpenAi;
+    agent.provider_id = "local".to_string();
+    agent.provider_requires_api_key = false;
+    agent.api_key.clear();
+    agent.base_url = format!("http://{addr}");
+    agent.model = DEFAULT_LOCAL_MODEL.to_string();
+    if chatgpt {
+        configure_stream_recovery_agent(&mut agent, RequestContract::ChatGptResponses);
+    }
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    agent.set_sink(Box::new(RetrySink {
+        tx,
+        interrupt: agent.interrupt.clone(),
+        interrupted,
+    }));
+    agent.background.enabled = false;
+    agent.compact_threshold_chars = Some(usize::MAX);
+    let user_input = if large_body {
+        "synthetic λ \\\" result. ".repeat(60_000)
+    } else {
+        "hello".to_string()
+    };
+    let result = agent.chat(user_input.clone()).await;
+    let bodies = server.join().expect("server thread");
+    if large_body {
+        let mut decoded = Vec::new();
+        flate2::read::GzDecoder::new(bodies[0].as_slice())
+            .read_to_end(&mut decoded)
+            .unwrap();
+        assert!(decoded.len() > provider::CHATGPT_REQUEST_WIRE_LIMIT);
+        let body: Value = serde_json::from_slice(&decoded).unwrap();
+        assert!(
+            body["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["content"][0]["text"] == user_input)
+        );
+        assert!(agent.history.iter().any(|message| {
+            message
+                .content
+                .iter()
+                .any(|block| matches!(block, Block::Text { text } if text == &user_input))
+        }));
+    }
+    assert_eq!(result.is_ok(), completes, "{result:?}");
+    if !completes {
+        let error = result.unwrap_err().to_string();
+        assert!(
+            error.contains(if interrupted { "interrupted" } else { "HTTP" }),
+            "{error}"
+        );
+        if !interrupted && status == 503 {
+            assert!(error.contains("upstream connect error"), "{error}");
+            assert!(
+                error.contains(&format!(
+                    "Provider retry budget exhausted after {requests} attempts on {}/{}.",
+                    agent.provider_id, agent.model
+                )),
+                "{error}"
+            );
+            assert!(
+                error.contains("\nProvider retry budget exhausted"),
+                "{error}"
+            );
+            assert!(error.contains("/provider or /model"), "{error}");
+        } else {
+            assert!(!error.contains("retry budget exhausted"), "{error}");
+        }
+    }
+    assert_eq!(bodies.len(), requests);
+    assert!(bodies.windows(2).all(|pair| pair[0] == pair[1]));
+    let events = drain_events(&mut rx);
+    let retries: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::HttpRetry {
+                attempt, wait_secs, ..
+            } => Some((*attempt, *wait_secs)),
+            _ => None,
+        })
+        .collect();
+    let expected_retries = if interrupted { 1 } else { requests - 1 };
+    assert_eq!(
+        retries,
+        (1..=expected_retries as u32)
+            .map(|attempt| (attempt, 0))
+            .collect::<Vec<_>>()
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn steering_delivery_line_includes_preview_and_queue_status() {
     let text = crate::tui::steering_delivered_text_for_test(1, "fix rg border overflow", 80);
@@ -9376,6 +9695,11 @@ fn builtin_parallel_policy_only_allows_read_only_rounds() {
     ]));
     assert!(!should_parallelize_builtin_tools(&["bash"]));
     assert!(!should_parallelize_builtin_tools(&["http", "rg"]));
+    assert!(!should_parallelize_builtin_tools(&["read_image"]));
+    assert!(!should_parallelize_builtin_tools(&[
+        "read_file",
+        "read_image"
+    ]));
     assert!(!should_parallelize_builtin_tools(&[]));
 }
 
@@ -12785,52 +13109,28 @@ fn read_image_capability_gate_precedes_approval() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-#[test]
-fn read_image_enforces_two_successes_per_turn() {
-    let root = temp_test_dir("read-image-turn-limit");
-    for index in 0..3 {
-        write_test_png(
-            &root.join(format!("sample-{index}.png")),
-            [index as u8, 34, 56, 255],
-        );
-    }
-    let mut agent = test_agent(&root);
-    agent.session_enabled = false;
-    agent.set_approval_profile(ApprovalProfile::Always);
-    let profile = built_in_provider_profiles()
-        .into_iter()
-        .find(|profile| profile.id == "glm")
-        .expect("GLM profile");
-    agent.provider_profile = Some(profile);
-    agent.provider_id = "glm".to_string();
-    agent.model = "glm-5.3-flash".to_string();
+#[tokio::test]
+async fn read_image_batch_prompts_only_for_remaining_image_slots() {
+    let root = temp_test_dir("read-image-batch-approval");
+    write_test_png(&root.join("sample.png"), [12, 34, 56, 255]);
+    let mut agent = image_tool_agent_for_test(&root);
+    agent.image_budget_this_turn.images = image::TURN_IMAGE_CAP - 1;
+    let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    agent.set_approval_profile(ApprovalProfile::Ask);
+    agent.set_sink(Box::new(FixedPermissionSink {
+        choice: Choice::Once,
+        requests: requests.clone(),
+    }));
     let mut turn_state = orchestrator::TurnRuntimeState::new();
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-        .block_on(
-            agent.execute_tool_round(ToolRoundContext {
-                tool_calls: (0..3)
-                    .map(|index| {
-                        (
-                            format!("call-image-{index}"),
-                            "read_image".to_string(),
-                            json!({"path": format!("sample-{index}.png")}),
-                        )
-                    })
-                    .collect(),
-                iterations: 1,
-                turn_id: "turn-image-limit".to_string(),
-                objective_apply_fixes_allowed: false,
-                turn_state: &mut turn_state,
-                denied_signatures: HashSet::new(),
-                hooks_approval_decided: true,
-                hooks_approved: false,
-            }),
-        )
-        .expect("image limit round");
-    assert_eq!(agent.successful_images_this_turn, 2);
+    run_image_tool_batch_for_test(
+        &mut agent,
+        &mut turn_state,
+        vec!["sample.png".to_string(); 3],
+        1,
+    )
+    .await;
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+    assert_eq!(agent.image_budget_this_turn.images, image::TURN_IMAGE_CAP);
     assert_eq!(
         agent
             .history
@@ -12838,14 +13138,556 @@ fn read_image_enforces_two_successes_per_turn() {
             .flat_map(|message| &message.content)
             .filter(|block| matches!(block, Block::ImageReference { .. }))
             .count(),
-        2
+        1
+    );
+    let results: Vec<_> = agent
+        .history
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter_map(|block| match block {
+            Block::ToolResult { is_error, .. } => Some(is_error.unwrap_or(false)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(results, [false, true, true]);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn read_image_batch_denial_and_interrupt_stop_further_prompts_without_charging() {
+    struct InterruptingImageSink {
+        interrupt: Arc<AtomicBool>,
+        requests: Arc<AtomicUsize>,
+    }
+    impl EventSink for InterruptingImageSink {
+        fn emit(&mut self, _event: AgentEvent) {}
+        fn request_permission(&mut self, _name: &str, _input: &Value) -> Choice {
+            self.requests.fetch_add(1, Ordering::SeqCst);
+            self.interrupt.store(true, Ordering::SeqCst);
+            Choice::Once
+        }
+        fn local_auth_prompt(&mut self, _tool: &str, _message: &str) {}
+    }
+    let root = temp_test_dir("read-image-batch-denial-interrupt");
+    write_test_png(&root.join("sample.png"), [12, 34, 56, 255]);
+    for interrupted in [false, true] {
+        let mut agent = image_tool_agent_for_test(&root);
+        agent.set_approval_profile(ApprovalProfile::Ask);
+        let requests = Arc::new(AtomicUsize::new(0));
+        if interrupted {
+            agent.set_sink(Box::new(InterruptingImageSink {
+                interrupt: agent.interrupt.clone(),
+                requests: requests.clone(),
+            }));
+        } else {
+            agent.set_sink(Box::new(FixedPermissionSink {
+                choice: Choice::Deny,
+                requests: requests.clone(),
+            }));
+        }
+        let mut turn_state = orchestrator::TurnRuntimeState::new();
+        run_image_tool_batch_for_test(
+            &mut agent,
+            &mut turn_state,
+            vec!["sample.png".to_string(); 3],
+            1,
+        )
+        .await;
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            (
+                agent.image_budget_this_turn.images,
+                agent.image_budget_this_turn.encoded_bytes
+            ),
+            (0, 0)
+        );
+        assert_eq!(
+            agent
+                .history
+                .iter()
+                .flat_map(|message| &message.content)
+                .filter(|block| matches!(
+                    block,
+                    Block::ToolResult {
+                        is_error: Some(true),
+                        ..
+                    }
+                ))
+                .count(),
+            3
+        );
+        assert!(
+            agent
+                .history
+                .iter()
+                .flat_map(|message| &message.content)
+                .all(|block| !matches!(block, Block::ImageReference { .. }))
+        );
+    }
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn read_image_deferred_approval_preserves_always_never_and_explicit_denials() {
+    let root = temp_test_dir("read-image-deferred-approval-policy");
+    write_test_png(&root.join("sample.png"), [12, 34, 56, 255]);
+    for (profile, denied, choice, allowed, prompts, successes) in [
+        (ApprovalProfile::Ask, false, Choice::Always, false, 1, 3),
+        (ApprovalProfile::Never, false, Choice::Once, true, 0, 0),
+        (ApprovalProfile::Always, true, Choice::Once, false, 0, 0),
+        (ApprovalProfile::Ask, false, Choice::Once, true, 0, 3),
+    ] {
+        let mut agent = image_tool_agent_for_test(&root);
+        agent.set_approval_profile(profile);
+        if denied {
+            agent.deny_tools.insert("read_image".to_string());
+        }
+        if allowed {
+            agent.allowed.insert("read_image".to_string());
+        }
+        let requests = Arc::new(AtomicUsize::new(0));
+        agent.set_sink(Box::new(FixedPermissionSink {
+            choice,
+            requests: requests.clone(),
+        }));
+        let mut turn_state = orchestrator::TurnRuntimeState::new();
+        run_image_tool_batch_for_test(
+            &mut agent,
+            &mut turn_state,
+            vec!["sample.png".to_string(); 3],
+            1,
+        )
+        .await;
+        assert_eq!(requests.load(Ordering::SeqCst), prompts);
+        assert_eq!(agent.image_budget_this_turn.images, successes);
+    }
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn read_image_batch_byte_overflow_does_not_block_a_later_smaller_image() {
+    let root = temp_test_dir("read-image-batch-byte-overflow");
+    write_test_png(&root.join("small.png"), [12, 34, 56, 255]);
+    let large = root.join("large.png");
+    ::image::RgbImage::from_pixel(64, 64, ::image::Rgb([12, 34, 56]))
+        .save_with_format(&large, ::image::ImageFormat::Png)
+        .unwrap();
+    let small_bytes = image::prepare(root.join("small.png")).unwrap().bytes.len();
+    let large_bytes = image::prepare(large).unwrap().bytes.len();
+    assert!(large_bytes > small_bytes);
+    let mut agent = image_tool_agent_for_test(&root);
+    agent.image_budget_this_turn.encoded_bytes = image::TURN_ENCODED_BYTE_CAP - small_bytes;
+    agent.set_approval_profile(ApprovalProfile::Ask);
+    let requests = Arc::new(AtomicUsize::new(0));
+    agent.set_sink(Box::new(FixedPermissionSink {
+        choice: Choice::Once,
+        requests: requests.clone(),
+    }));
+    let mut turn_state = orchestrator::TurnRuntimeState::new();
+    run_image_tool_batch_for_test(
+        &mut agent,
+        &mut turn_state,
+        vec![
+            "large.png".to_string(),
+            "small.png".to_string(),
+            "small.png".to_string(),
+        ],
+        1,
+    )
+    .await;
+    assert_eq!(agent.image_budget_this_turn.images, 1);
+    assert_eq!(
+        agent.image_budget_this_turn.encoded_bytes,
+        image::TURN_ENCODED_BYTE_CAP
+    );
+    let outcomes: Vec<_> = agent
+        .history
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter_map(|block| match block {
+            Block::ToolResult { is_error, .. } => Some(is_error.unwrap_or(false)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(outcomes, [true, false, true]);
+    assert_eq!(requests.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        agent
+            .history
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter(|block| matches!(block, Block::ImageReference { .. }))
+            .count(),
+        1
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn read_image_rechecks_privacy_after_an_earlier_batched_tool_retargets_a_symlink() {
+    let root = temp_test_dir("read-image-batch-privacy-retarget");
+    write_test_png(&root.join("public.png"), [12, 34, 56, 255]);
+    write_test_png(&root.join("private.key"), [56, 34, 12, 255]);
+    std::os::unix::fs::symlink("public.png", root.join("sample.png")).unwrap();
+    let mut agent = image_tool_agent_for_test(&root);
+    agent.privacy.enabled = true;
+    agent.privacy.strict_paths = true;
+    agent.set_sandbox_profile(SandboxProfile::DangerFullAccess);
+    agent.set_approval_profile(ApprovalProfile::Ask);
+    agent.allowed.insert("bash".into());
+    let requests = Arc::new(AtomicUsize::new(0));
+    agent.set_sink(Box::new(FixedPermissionSink {
+        choice: Choice::Once,
+        requests: requests.clone(),
+    }));
+    let mut turn_state = orchestrator::TurnRuntimeState::new();
+    agent
+        .execute_tool_round(ToolRoundContext {
+            tool_calls: vec![
+                (
+                    "retarget".into(),
+                    "bash".into(),
+                    json!({"command": "rm sample.png && ln -s private.key sample.png"}),
+                ),
+                (
+                    "image".into(),
+                    "read_image".into(),
+                    json!({"path": "sample.png"}),
+                ),
+            ],
+            iterations: 1,
+            turn_id: "privacy-retarget".into(),
+            objective_apply_fixes_allowed: false,
+            turn_state: &mut turn_state,
+            denied_signatures: HashSet::new(),
+            hooks_approval_decided: true,
+            hooks_approved: false,
+        })
+        .await
+        .unwrap();
+    let (content, status) = last_tool_result(&agent.history).unwrap();
+    assert_eq!(status, "error", "{content}");
+    assert!(content.contains("strict path mode"), "{content}");
+    assert_eq!(requests.load(Ordering::SeqCst), 0);
+    assert_eq!(agent.image_budget_this_turn.images, 0);
+    assert!(
+        agent
+            .history
+            .iter()
+            .flat_map(|message| &message.content)
+            .all(|block| { !matches!(block, Block::ImageReference { .. }) })
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn read_image_binds_the_resolved_path_before_the_permission_reply() {
+    struct RetargetingSink {
+        root: PathBuf,
+    }
+    impl EventSink for RetargetingSink {
+        fn emit(&mut self, _event: AgentEvent) {}
+        fn request_permission(&mut self, _name: &str, _input: &Value) -> Choice {
+            std::fs::remove_file(self.root.join("sample.png")).unwrap();
+            std::os::unix::fs::symlink("private.key", self.root.join("sample.png")).unwrap();
+            Choice::Once
+        }
+        fn local_auth_prompt(&mut self, _tool: &str, _message: &str) {}
+    }
+    let root = temp_test_dir("read-image-approval-path-retarget");
+    write_test_png(&root.join("public.png"), [12, 34, 56, 255]);
+    std::fs::copy(root.join("public.png"), root.join("private.key")).unwrap();
+    std::os::unix::fs::symlink("public.png", root.join("sample.png")).unwrap();
+    let mut agent = image_tool_agent_for_test(&root);
+    agent.set_approval_profile(ApprovalProfile::Ask);
+    agent.set_sink(Box::new(RetargetingSink { root: root.clone() }));
+    let mut turn_state = orchestrator::TurnRuntimeState::new();
+    run_image_tool_batch_for_test(&mut agent, &mut turn_state, vec!["sample.png".into()], 1).await;
+    let (content, status) = last_tool_result(&agent.history).unwrap();
+    assert_eq!(status, "error", "{content}");
+    assert!(content.contains("source path changed"), "{content}");
+    assert_eq!(agent.image_budget_this_turn.images, 0);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn read_image_deferred_pre_hook_still_blocks_and_rechecks_approval_digest() {
+    let root = temp_test_dir("read-image-deferred-hook-digest");
+    for (hook, expected) in [
+        (
+            "printf image-hook-blocked; exit 42",
+            "pre_tool hook blocked",
+        ),
+        (
+            "printf changed-source > sample.png",
+            "source changed after read_image approval",
+        ),
+    ] {
+        write_test_png(&root.join("sample.png"), [12, 34, 56, 255]);
+        let mut agent = image_tool_agent_for_test(&root);
+        agent.set_sandbox_profile(SandboxProfile::DangerFullAccess);
+        agent.hooks.pre_tool.push(Hook {
+            tool_match: Some("read_image".to_string()),
+            command: hook.to_string(),
+        });
+        let mut turn_state = orchestrator::TurnRuntimeState::new();
+        agent
+            .execute_tool_round(ToolRoundContext {
+                tool_calls: vec![(
+                    "image-hook-call".to_string(),
+                    "read_image".to_string(),
+                    json!({"path": "sample.png"}),
+                )],
+                iterations: 1,
+                turn_id: "image-hook-turn".to_string(),
+                objective_apply_fixes_allowed: false,
+                turn_state: &mut turn_state,
+                denied_signatures: HashSet::new(),
+                hooks_approval_decided: true,
+                hooks_approved: true,
+            })
+            .await
+            .unwrap();
+        let (content, status) = last_tool_result(&agent.history).unwrap();
+        assert_eq!(status, "error");
+        assert!(content.contains(expected), "{content}");
+        assert_eq!(
+            (
+                agent.image_budget_this_turn.images,
+                agent.image_budget_this_turn.encoded_bytes
+            ),
+            (0, 0)
+        );
+        assert!(
+            agent
+                .history
+                .iter()
+                .flat_map(|message| &message.content)
+                .all(|block| !matches!(block, Block::ImageReference { .. }))
+        );
+    }
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn read_image_new_turn_fences_approvals_even_when_auth_refresh_fails() {
+    let _lock = env_lock();
+    let root = temp_test_dir("read-image-auth-refresh-fence");
+    let _env = PackEnvGuard::new(&root.join("state"));
+    write_test_png(&root.join("sample.png"), [12, 34, 56, 255]);
+    let mut agent = image_tool_agent_for_test(&root);
+    agent.provider_id = "missing-image-auth-fixture".to_string();
+    agent.auth_kind = RuntimeAuthKind::OAuth;
+    let previous_target = agent.image_disclosure_target();
+    agent.history = vec![
+        Message {
+            role: "user".to_string(),
+            content: vec![Block::Text {
+                text: "Previous turn".to_string(),
+            }],
+        },
+        Message {
+            role: "user".to_string(),
+            content: vec![image_reference_for_test(
+                &root.join("sample.png"),
+                &previous_target,
+            )],
+        },
+    ];
+    let previous_epoch = agent.prompt_scan_epoch;
+    agent.image_budget_this_turn.images = image::TURN_IMAGE_CAP;
+    agent.image_budget_this_turn.encoded_bytes = image::TURN_ENCODED_BYTE_CAP;
+    let error = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(agent.chat("New turn".to_string()))
+        .unwrap_err();
+    assert!(error.to_string().contains("unknown provider"), "{error:#}");
+    assert_eq!(agent.prompt_scan_epoch, previous_epoch.wrapping_add(1));
+    assert_ne!(agent.image_disclosure_target(), previous_target);
+    assert_eq!(
+        (
+            agent.image_budget_this_turn.images,
+            agent.image_budget_this_turn.encoded_bytes
+        ),
+        (0, 0)
+    );
+    let wire = anthropic_wire_messages(
+        &agent.history,
+        false,
+        &agent.image_disclosure_target(),
+        None,
+    )
+    .unwrap();
+    assert!(!serde_json::to_string(&wire).unwrap().contains("base64"));
+    assert_eq!(agent.history.len(), 2);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn read_image_enforces_shared_turn_budget_across_batches() {
+    let root = temp_test_dir("read-image-turn-limit");
+    for index in 0..=image::TURN_IMAGE_CAP {
+        write_test_png(
+            &root.join(format!("sample-{index}.png")),
+            [index as u8, 34, 56, 255],
+        );
+    }
+    let mut agent = image_tool_agent_for_test(&root);
+    let mut turn_state = orchestrator::TurnRuntimeState::new();
+    for (iteration, range) in [0..5, 5..image::TURN_IMAGE_CAP + 1].into_iter().enumerate() {
+        run_image_tool_batch_for_test(
+            &mut agent,
+            &mut turn_state,
+            range.map(|index| format!("sample-{index}.png")).collect(),
+            iteration as u32 + 1,
+        )
+        .await;
+    }
+    assert_eq!(agent.image_budget_this_turn.images, image::TURN_IMAGE_CAP);
+    assert!(agent.image_budget_this_turn.encoded_bytes > 0);
+    assert!(agent.image_budget_this_turn.encoded_bytes < image::TURN_ENCODED_BYTE_CAP);
+    assert_eq!(
+        agent
+            .history
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter(|block| matches!(block, Block::ImageReference { .. }))
+            .count(),
+        image::TURN_IMAGE_CAP
     );
     assert!(
         last_tool_result(&agent.history)
             .unwrap()
             .0
-            .contains("at most two successful images")
+            .contains("at most 100 successful images")
     );
+    let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    agent.set_approval_profile(ApprovalProfile::Ask);
+    agent.set_sink(Box::new(FixedPermissionSink {
+        choice: Choice::Once,
+        requests: requests.clone(),
+    }));
+    run_image_tool_batch_for_test(
+        &mut agent,
+        &mut turn_state,
+        vec!["sample-0.png".to_string()],
+        3,
+    )
+    .await;
+    assert_eq!(requests.load(Ordering::SeqCst), 0);
+    assert_eq!(last_tool_result(&agent.history).unwrap().1, "error");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+fn image_tool_agent_for_test(root: &Path) -> Agent {
+    let mut agent = test_agent(root);
+    agent.session_enabled = false;
+    agent.set_approval_profile(ApprovalProfile::Always);
+    agent.provider_profile = built_in_provider_profiles()
+        .into_iter()
+        .find(|profile| profile.id == "glm");
+    agent.provider_id = "glm".to_string();
+    agent.model = "glm-5.3-flash".to_string();
+    agent
+}
+
+async fn run_image_tool_batch_for_test(
+    agent: &mut Agent,
+    turn_state: &mut orchestrator::TurnRuntimeState,
+    paths: Vec<String>,
+    iterations: u32,
+) {
+    agent
+        .execute_tool_round(ToolRoundContext {
+            tool_calls: paths
+                .into_iter()
+                .enumerate()
+                .map(|(index, path)| {
+                    (
+                        format!("call-image-{iterations}-{index}"),
+                        "read_image".to_string(),
+                        json!({"path": path}),
+                    )
+                })
+                .collect(),
+            iterations,
+            turn_id: "turn-image-limit".to_string(),
+            objective_apply_fixes_allowed: false,
+            turn_state,
+            denied_signatures: HashSet::new(),
+            hooks_approval_decided: true,
+            hooks_approved: false,
+        })
+        .await
+        .expect("image batch round");
+}
+
+#[tokio::test]
+async fn read_image_rejects_byte_overflow_without_reference_or_budget_charge() {
+    let root = temp_test_dir("read-image-byte-limit");
+    write_test_png(&root.join("sample.png"), [12, 34, 56, 255]);
+    let mut agent = image_tool_agent_for_test(&root);
+    agent.image_budget_this_turn.encoded_bytes = image::TURN_ENCODED_BYTE_CAP - 1;
+    let mut turn_state = orchestrator::TurnRuntimeState::new();
+    run_image_tool_batch_for_test(
+        &mut agent,
+        &mut turn_state,
+        vec!["missing.png".to_string(), "sample.png".to_string()],
+        1,
+    )
+    .await;
+    assert_eq!(agent.image_budget_this_turn.images, 0);
+    assert_eq!(
+        agent.image_budget_this_turn.encoded_bytes,
+        image::TURN_ENCODED_BYTE_CAP - 1
+    );
+    assert!(
+        agent
+            .history
+            .iter()
+            .flat_map(|message| &message.content)
+            .all(|block| !matches!(block, Block::ImageReference { .. }))
+    );
+    let (content, status) = last_tool_result(&agent.history).unwrap();
+    assert_eq!(status, "error");
+    assert!(content.contains("20 MiB total sanitized-image budget"));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn read_image_failures_do_not_spend_budget_and_new_turn_resets_it() {
+    let root = temp_test_dir("read-image-budget-reset");
+    write_test_png(&root.join("sample.png"), [12, 34, 56, 255]);
+    std::fs::write(root.join("malformed.png"), b"not an image").unwrap();
+    let mut agent = image_tool_agent_for_test(&root);
+    let mut turn_state = orchestrator::TurnRuntimeState::new();
+    run_image_tool_batch_for_test(
+        &mut agent,
+        &mut turn_state,
+        vec!["malformed.png".to_string(), "sample.png".to_string()],
+        1,
+    )
+    .await;
+    assert_eq!(agent.image_budget_this_turn.images, 1);
+    assert_eq!(
+        agent.image_budget_this_turn.encoded_bytes,
+        image::prepare(root.join("sample.png")).unwrap().bytes.len()
+    );
+    agent.image_budget_this_turn.images = image::TURN_IMAGE_CAP;
+    agent.image_budget_this_turn.encoded_bytes = image::TURN_ENCODED_BYTE_CAP;
+    agent.provider_requires_api_key = true;
+    agent.api_key.clear();
+    let error = agent.chat("A new user turn".to_string()).await.unwrap_err();
+    assert!(
+        error.to_string().contains("missing credentials"),
+        "{error:#}"
+    );
+    assert_eq!(agent.image_budget_this_turn.images, 0);
+    assert_eq!(agent.image_budget_this_turn.encoded_bytes, 0);
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -13080,7 +13922,8 @@ async fn interrupted_image_approval_digest_never_creates_a_reference() {
             .flat_map(|message| &message.content)
             .all(|block| !matches!(block, Block::ImageReference { .. }))
     );
-    assert_eq!(agent.successful_images_this_turn, 0);
+    assert_eq!(agent.image_budget_this_turn.images, 0);
+    assert_eq!(agent.image_budget_this_turn.encoded_bytes, 0);
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -13090,6 +13933,11 @@ fn read_image_dispatch_forwards_native_interrupt() {
     let png = root.join("sample.png");
     write_test_png(&png, [12, 34, 56, 255]);
     let mut input = json!({"path": png});
+    input[image::APPROVED_SOURCE_PATH_FIELD] = image::workspace_path(&root, &input)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .into();
     input[image::APPROVED_SOURCE_SHA256_FIELD] =
         image::approval_digest(&root, &input, None).unwrap().into();
     let interrupt = AtomicBool::new(true);
@@ -13193,9 +14041,13 @@ fn read_image_serialization_observes_interrupt_on_every_contract() {
         .unwrap()
         .0;
     assert!(
-        active_image_wire(&reference, Some(agent.interrupt.as_ref()))
-            .unwrap_err()
-            .contains("interrupted")
+        active_image_wire(
+            &reference,
+            Some(agent.interrupt.as_ref()),
+            &mut image::ImageBudget::default(),
+        )
+        .unwrap_err()
+        .contains("interrupted")
     );
     let anthropic = anthropic_wire_messages(
         &agent.history,
@@ -13241,6 +14093,199 @@ fn read_image_serialization_observes_interrupt_on_every_contract() {
                 .contains("interrupted")
         );
     }
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn read_image_wire_budgets_bound_every_contract_and_leave_explicit_placeholders() {
+    use base64::Engine as _;
+
+    let root = temp_test_dir("read-image-wire-budgets");
+    let small = root.join("small.png");
+    write_test_png(&small, [12, 34, 56, 255]);
+    let noisy = root.join("noisy.png");
+    let mut pixels = ::image::RgbImage::new(512, 512);
+    let mut state = 1u32;
+    for pixel in pixels.pixels_mut() {
+        for channel in &mut pixel.0 {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *channel = (state >> 24) as u8;
+        }
+    }
+    pixels
+        .save_with_format(&noisy, ::image::ImageFormat::Png)
+        .unwrap();
+    let small = image::prepare(small).unwrap();
+    let noisy = image::prepare(noisy).unwrap();
+    let byte_limited_count = image::TURN_ENCODED_BYTE_CAP / noisy.bytes.len();
+    assert!(byte_limited_count < image::TURN_IMAGE_CAP);
+    let mut agent = test_agent(&root);
+    for contract in [
+        RequestContract::AnthropicMessages,
+        RequestContract::OpenAiChatCompletions,
+        RequestContract::OpenAiResponses,
+        RequestContract::ChatGptResponses,
+    ] {
+        let mut profile = built_in_provider_profiles()
+            .into_iter()
+            .find(|profile| profile.id == "openai")
+            .unwrap();
+        profile.api_provider = contract.api_provider();
+        profile.request_contract = Some(contract);
+        agent.api_provider = profile.api_provider;
+        agent.provider_profile = Some(profile);
+        agent.base_url = "http://127.0.0.1:12345/v1".to_string();
+        agent.model = "fixture-vision".to_string();
+        agent.thinking_effort = ThinkingEffort::Off;
+        for (prepared, allowed, error, append_smaller) in [
+            (
+                &small,
+                image::TURN_IMAGE_CAP,
+                "at most 100 successful images",
+                false,
+            ),
+            (
+                &noisy,
+                byte_limited_count,
+                "20 MiB total sanitized-image budget",
+                true,
+            ),
+        ] {
+            let target = agent.image_disclosure_target();
+            agent.history = vec![Message {
+                role: "user".to_string(),
+                content: vec![Block::Text {
+                    text: "Inspect images".to_string(),
+                }],
+            }];
+            let references = vec![
+                image_reference_block(prepared.reference.clone(), target.clone());
+                allowed + 1
+            ];
+            for chunk in references.chunks(20) {
+                agent.history.push(Message {
+                    role: "user".to_string(),
+                    content: chunk.to_vec(),
+                });
+            }
+            if append_smaller {
+                assert!(
+                    image::TURN_ENCODED_BYTE_CAP - allowed * prepared.bytes.len()
+                        >= small.bytes.len()
+                );
+                agent.history.push(Message {
+                    role: "user".to_string(),
+                    content: vec![image_reference_block(small.reference.clone(), target)],
+                });
+            }
+            let (_, request) = agent
+                .build_streaming_request("system", "", &[], &[], "image-budget-session")
+                .unwrap();
+            let body: Value = serde_json::from_slice(&request).unwrap();
+            let (messages, image_kind) = match contract {
+                RequestContract::AnthropicMessages => (&body["messages"], "image"),
+                RequestContract::OpenAiChatCompletions => (&body["messages"], "image_url"),
+                _ => (&body["input"], "input_image"),
+            };
+            let blocks: Vec<_> = messages
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|message| message["content"].as_array().into_iter().flatten())
+                .collect();
+            assert!(
+                messages.as_array().unwrap().iter().any(|message| {
+                    message["content"]
+                        .as_str()
+                        .is_some_and(|text| text.contains(error))
+                        || message["content"].as_array().is_some_and(|content| {
+                            content.iter().any(|block| {
+                                block["text"]
+                                    .as_str()
+                                    .is_some_and(|text| text.contains(error))
+                            })
+                        })
+                }),
+                "{contract:?}: missing overflow placeholder"
+            );
+            let images: Vec<_> = blocks
+                .into_iter()
+                .filter(|block| block["type"] == image_kind)
+                .collect();
+            assert_eq!(
+                images.len(),
+                allowed + usize::from(append_smaller),
+                "{contract:?}"
+            );
+            let mut total_bytes = 0;
+            for (index, image) in images.iter().enumerate() {
+                let data = match contract {
+                    RequestContract::AnthropicMessages => image["source"]["data"].as_str().unwrap(),
+                    RequestContract::OpenAiChatCompletions => image["image_url"]["url"]
+                        .as_str()
+                        .unwrap()
+                        .strip_prefix("data:image/jpeg;base64,")
+                        .unwrap(),
+                    _ => image["image_url"]
+                        .as_str()
+                        .unwrap()
+                        .strip_prefix("data:image/jpeg;base64,")
+                        .unwrap(),
+                };
+                let decoded = base64::engine::general_purpose::STANDARD
+                    .decode(data)
+                    .unwrap();
+                total_bytes += decoded.len();
+                assert_eq!(
+                    decoded.as_slice(),
+                    if index < allowed {
+                        prepared.bytes.as_slice()
+                    } else {
+                        small.bytes.as_slice()
+                    }
+                );
+            }
+            assert!(total_bytes <= image::TURN_ENCODED_BYTE_CAP);
+            let (_, repeated) = agent
+                .build_streaming_request("system", "", &[], &[], "image-budget-session")
+                .unwrap();
+            assert_eq!(
+                request, repeated,
+                "{contract:?}: request rebuilding changed its budget"
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn read_image_wire_budget_does_not_charge_changed_sources_or_encode_overflow() {
+    let root = temp_test_dir("read-image-wire-budget-errors");
+    let png = root.join("sample.png");
+    write_test_png(&png, [12, 34, 56, 255]);
+    let prepared = image::prepare(png.clone()).unwrap();
+    let mut budget = image::ImageBudget {
+        images: 0,
+        encoded_bytes: image::TURN_ENCODED_BYTE_CAP - prepared.bytes.len() + 1,
+    };
+    assert!(
+        active_image_wire(&prepared.reference, None, &mut budget)
+            .unwrap_err()
+            .contains("20 MiB")
+    );
+    assert_eq!(budget.images, 0);
+    assert_eq!(
+        budget.encoded_bytes,
+        image::TURN_ENCODED_BYTE_CAP - prepared.bytes.len() + 1
+    );
+    write_test_png(&png, [98, 76, 54, 255]);
+    budget = image::ImageBudget::default();
+    assert!(
+        active_image_wire(&prepared.reference, None, &mut budget)
+            .unwrap_err()
+            .contains("source changed")
+    );
+    assert_eq!((budget.images, budget.encoded_bytes), (0, 0));
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -15057,7 +16102,11 @@ async fn provider_total_timeout_bounds_headers_and_trickling_bodies() {
                 error.context("trickling body unexpectedly completed")?
             };
             anyhow::ensure!(
-                error.to_string().contains("total request timeout"),
+                error.to_string().contains(if mode == "headers" {
+                    "connect or total request timeout"
+                } else {
+                    "timeout while reading provider response body (request deadline or connection timeout)"
+                }),
                 "{mode}: {error:#}"
             );
             anyhow::ensure!(
@@ -15065,6 +16114,8 @@ async fn provider_total_timeout_bounds_headers_and_trickling_bodies() {
                 "{mode}: exceeded safety timeout"
             );
             if mode != "headers" {
+                anyhow::ensure!(orchestrator::classify_stream_error(&format!("{error:#}")).retry,
+                    "body timeouts must retain transient classification: {error:#}");
                 anyhow::ensure!(chunks_sent.load(Ordering::SeqCst) > 1, "{mode}: no trickle");
             }
             Ok(())
@@ -19871,8 +20922,9 @@ fn stream_recovery_reason_is_contract_scoped() {
         Some("unfinished_tool_call")
     );
     assert_eq!(
-        stream_recovery_reason(RequestContract::AnthropicMessages, Some("max_tokens"), 0),
-        None
+        stream_recovery_reason(RequestContract::AnthropicMessages, Some("max_tokens"), 0)
+            .as_deref(),
+        Some("output_token_limit")
     );
     assert_eq!(
         stream_recovery_reason(RequestContract::AnthropicMessages, Some("end_turn"), 0),
@@ -19905,8 +20957,9 @@ fn stream_recovery_reason_is_contract_scoped() {
         Some("unfinished_tool_call")
     );
     assert_eq!(
-        stream_recovery_reason(RequestContract::OpenAiChatCompletions, Some("length"), 0),
-        None
+        stream_recovery_reason(RequestContract::OpenAiChatCompletions, Some("length"), 0)
+            .as_deref(),
+        Some("output_token_limit")
     );
     assert_eq!(
         stream_recovery_reason(RequestContract::ChatGptResponses, Some("completed"), 1),
@@ -19916,6 +20969,597 @@ fn stream_recovery_reason_is_contract_scoped() {
         stream_recovery_reason(RequestContract::OpenAiResponses, Some("completed"), 1),
         None
     );
+}
+
+fn configure_stream_recovery_agent(agent: &mut Agent, contract: RequestContract) {
+    let id = match contract {
+        RequestContract::AnthropicMessages => "glm",
+        RequestContract::OpenAiChatCompletions => "deepseek",
+        RequestContract::OpenAiResponses => "openai",
+        RequestContract::ChatGptResponses => "chatgpt",
+    };
+    let mut profile = built_in_provider_profiles()
+        .into_iter()
+        .find(|profile| profile.id == id)
+        .unwrap();
+    profile.request_contract = Some(contract);
+    agent.provider_id = id.to_string();
+    agent.api_provider = profile.api_provider;
+    agent.model = profile.default_model.clone();
+    agent.provider_profile = Some(profile);
+    if contract == RequestContract::ChatGptResponses {
+        use base64::Engine as _;
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"https://api.openai.com/auth":{"chatgpt_account_id":"fixture_account"}}"#);
+        agent.api_key = format!("fixture.{payload}.unsigned");
+    }
+}
+
+fn stream_recovery_fixture(contract: RequestContract, mode: &str, text: &str) -> String {
+    let mut events = Vec::new();
+    if contract == RequestContract::AnthropicMessages {
+        events.push(json!({"type":"message_start","message":{"usage":{}}}));
+        let thinking = mode == "thinking" || mode == "limit";
+        events.push(
+            json!({"type":"content_block_start","index":0,"content_block":
+            if thinking { json!({"type":"thinking","thinking":"uncommitted reasoning"}) }
+            else { json!({"type":"text","text":text}) }}),
+        );
+        events.push(json!({"type":"content_block_stop","index":0}));
+        if matches!(mode, "success" | "limit" | "limit_text") {
+            events.push(json!({"type":"message_delta","delta":{"stop_reason":
+                if mode.starts_with("limit") {"max_tokens"} else {"end_turn"}}}));
+            events.push(json!({"type":"message_stop"}));
+        } else {
+            events.push(
+                json!({"type":"content_block_start","index":1,"content_block":
+                {"type":"tool_use","id":"not_executed","name":"write_file","input":{}}}),
+            );
+            events.push(json!({"type":"content_block_delta","index":1,"delta":
+                {"type":"input_json_delta","partial_json":"{\"path\":\"must-not-exist\",\"content\":\"unsafe\"}"}}));
+            events.push(json!({"type":"content_block_stop","index":1}));
+        }
+    } else if contract.is_responses() {
+        if mode == "thinking" || mode == "malformed" {
+            events.push(json!({"type":"response.reasoning_summary_text.delta","delta":"uncommitted reasoning"}));
+        } else {
+            events.push(json!({"type":"response.output_text.delta","delta":text}));
+        }
+        if mode == "success" {
+            events.push(
+                json!({"type":"response.completed","response":{"status":"completed","output":[]}}),
+            );
+        } else {
+            events.push(json!({"type":"response.output_item.added","item":
+                {"type":"function_call","id":"fc_1","call_id":"not_executed","name":"write_file","arguments":""}}));
+            events.push(
+                json!({"type":"response.function_call_arguments.done","item_id":"fc_1",
+                "arguments": if mode == "malformed" { "{\"path\":]" } else { "{\"path\":\"must-not-exist\",\"content\":\"unsafe\"}" }}),
+            );
+            if mode == "malformed" {
+                events.push(json!({"type":"response.completed","response":{"status":"completed","output":[]}}));
+            }
+        }
+    } else {
+        let delta = if mode == "thinking" || mode == "limit" {
+            json!({"reasoning_content":"uncommitted reasoning"})
+        } else {
+            json!({"content":text})
+        };
+        events.push(json!({"choices":[{"delta":delta,"finish_reason":null}]}));
+        if matches!(mode, "success" | "limit" | "limit_text") {
+            events.push(json!({"choices":[{"delta":{},"finish_reason":
+                if mode.starts_with("limit") {"length"} else {"stop"}}]}));
+        } else {
+            events.push(json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"not_executed",
+                "function":{"name":"write_file","arguments":"{\"path\":\"must-not-exist\",\"content\":\"unsafe\"}"}}]},"finish_reason":null}]}));
+        }
+    }
+    if mode == "server_error" {
+        if contract.is_responses() {
+            events.push(json!({"type":"response.failed","response":{"error":{
+                "code":"server_error","message":"An error occurred while processing your request. You can retry your request."}}}));
+        } else {
+            events.push(json!({"type":"error","error":{"code":"1234","message":"Internal network failure"}}));
+        }
+    }
+    if mode == "auth" || mode == "permanent" {
+        let code = if mode == "auth" {
+            "invalid_api_key"
+        } else {
+            "invalid_request_error"
+        };
+        events.push(json!({"type":"error","error":{"type":code,"code":code,"message":code}}));
+    }
+    events
+        .into_iter()
+        .map(|value| {
+            if contract == RequestContract::AnthropicMessages {
+                format!(
+                    "event: {}\ndata: {value}\n\n",
+                    value["type"].as_str().unwrap()
+                )
+            } else {
+                format!("data: {value}\n\n")
+            }
+        })
+        .collect()
+}
+
+async fn assert_stream_recovery_case(
+    contract: RequestContract,
+    mode: &'static str,
+    failures: usize,
+    completes: bool,
+    quiet: bool,
+    control: Option<&'static str>,
+) -> Result<()> {
+    struct RecoverySink {
+        tx: tokio::sync::mpsc::UnboundedSender<AgentEvent>,
+        interrupt: Arc<AtomicBool>,
+        controls: tokio::sync::mpsc::UnboundedSender<String>,
+        control: Option<&'static str>,
+    }
+    impl EventSink for RecoverySink {
+        fn request_permission(&mut self, _name: &str, _input: &Value) -> Choice {
+            panic!("failed-stream tool call reached permission dispatch");
+        }
+        fn local_auth_prompt(&mut self, _tool: &str, _message: &str) {}
+        fn emit(&mut self, event: AgentEvent) {
+            if matches!(event, AgentEvent::HttpRetry { .. }) {
+                if self.control == Some("interrupt") {
+                    self.interrupt.store(true, Ordering::SeqCst);
+                } else if let Some(control) = self.control.take() {
+                    self.controls.send(control.to_string()).unwrap();
+                }
+            }
+            let _ = self.tx.send(event);
+        }
+    }
+    let root = temp_test_dir("stream-recovery");
+    let _cleanup = RemoveDirOnDrop(root.clone());
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let address = listener.local_addr()?;
+    let server = std::thread::spawn(move || -> Result<Vec<Value>> {
+        let mut requests = Vec::new();
+        for index in 0..failures + usize::from(completes) {
+            let mut stream = accept_test_connection(&listener, Duration::from_secs(10))?;
+            stream.set_nonblocking(false)?;
+            stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+            stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+            let mut request = Vec::new();
+            let mut buffer = [0; 4096];
+            let header_end = loop {
+                let count = stream.read(&mut buffer)?;
+                anyhow::ensure!(
+                    count > 0 && request.len() < 4 * 1024 * 1024,
+                    "invalid test request"
+                );
+                request.extend_from_slice(&buffer[..count]);
+                if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break end + 4;
+                }
+            };
+            let length = String::from_utf8_lossy(&request[..header_end])
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")?
+                        .trim()
+                        .parse::<usize>()
+                        .ok()
+                })
+                .context("content length")?;
+            anyhow::ensure!(length < 4 * 1024 * 1024, "test request cap");
+            while request.len() < header_end + length {
+                let count = stream.read(&mut buffer)?;
+                anyhow::ensure!(count > 0, "truncated test request");
+                request.extend_from_slice(&buffer[..count]);
+            }
+            requests.push(serde_json::from_slice(
+                &request[header_end..header_end + length],
+            )?);
+            let success = index == failures;
+            let text = if success {
+                "Recovered.".to_string()
+            } else {
+                format!("partial draft {index}")
+            };
+            let response_mode = if success {
+                "success"
+            } else if mode == "mixed_malformed" {
+                if index + 1 == failures {
+                    "malformed"
+                } else {
+                    "thinking"
+                }
+            } else {
+                mode
+            };
+            let body = stream_recovery_fixture(contract, response_mode, &text);
+            if !success && matches!(mode, "broken" | "thinking" | "timeout") {
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{body}\r\n",
+                    body.len()
+                )?;
+                stream.flush()?;
+                // Deliver parsed text before an incomplete HTTP chunk closes the body.
+                if mode == "timeout" {
+                    std::thread::sleep(Duration::from_millis(800));
+                } else {
+                    std::thread::sleep(Duration::from_millis(40));
+                    stream.write_all(b"10\r\nx")?;
+                }
+            } else {
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )?;
+            }
+        }
+        anyhow::ensure!(
+            matches!(accept_test_connection(&listener, Duration::from_millis(150)),
+            Err(error) if error.kind() == io::ErrorKind::TimedOut),
+            "extra recovery request"
+        );
+        Ok(requests)
+    });
+    let mut agent = test_agent(&root);
+    configure_stream_recovery_agent(&mut agent, contract);
+    agent.base_url = format!("http://{address}");
+    if mode == "timeout" {
+        agent
+            .client
+            .set(
+                reqwest::Client::builder()
+                    .timeout(Duration::from_millis(500))
+                    .build()?,
+            )
+            .expect("uninitialized fixture client");
+    }
+    agent.history = vec![
+        Message {
+            role: "assistant".to_string(),
+            content: vec![Block::ToolUse {
+                id: "previous_call".to_string(),
+                name: "todo_read".to_string(),
+                input: json!({}),
+            }],
+        },
+        Message {
+            role: "user".to_string(),
+            content: vec![Block::ToolResult {
+                tool_use_id: "previous_call".to_string(),
+                content: "Earlier completed result".to_string(),
+                is_error: None,
+                metadata: ToolResultMetadata::default(),
+            }],
+        },
+    ];
+    agent.session_enabled = false;
+    agent.quiet_stream_events = quiet;
+    if control.is_some_and(|value| value != "interrupt") {
+        agent.max_iterations = Some(2);
+    }
+    let (controls, control_rx) = tokio::sync::mpsc::unbounded_channel();
+    agent.install_runtime_controls(control_rx, controls.clone());
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    agent.set_sink(Box::new(RecoverySink {
+        tx,
+        interrupt: agent.interrupt.clone(),
+        controls,
+        control,
+    }));
+    let result = agent.chat("Hello.".to_string()).await;
+    let requests = server
+        .join()
+        .expect("recovery fixture thread")
+        .with_context(|| {
+            format!("{contract:?} {mode} quiet={quiet} control={control:?}; client={result:?}")
+        })?;
+    let events = drain_events(&mut rx);
+    assert_eq!(result.is_ok(), completes, "{contract:?} {mode}: {result:?}");
+    assert!(!root.join("must-not-exist").exists());
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ToolCallStart { .. }))
+    );
+    assert!(
+        !agent
+            .history
+            .iter()
+            .flat_map(|message| &message.content)
+            .any(|block| matches!(block, Block::ToolUse { id, .. } if id != "previous_call"))
+    );
+    for request in &requests {
+        assert_eq!(
+            serde_json::to_string(request)?
+                .matches("Earlier completed result")
+                .count(),
+            1
+        );
+    }
+    if completes {
+        assert!(
+            agent
+                .history
+                .iter()
+                .flat_map(|message| &message.content)
+                .any(|block| matches!(block, Block::Text { text } if text == "Recovered."))
+        );
+    } else {
+        let error = format!("{:#}", result.unwrap_err());
+        if mode == "mixed_malformed" {
+            assert!(error.contains("has malformed arguments"), "{error}");
+            assert!(!error.contains("interrupted by user"), "{error}");
+        } else if failures == MAX_STREAM_ATTEMPTS as usize {
+            assert!(
+                error.contains("stream retry budget exhausted after 4 attempts"),
+                "{error}"
+            );
+            assert!(error.contains(&agent.provider_id), "{error}");
+            assert!(error.contains("/provider or /model"), "{error}");
+        } else if control == Some("interrupt") {
+            assert!(error.contains("interrupted"), "{error}");
+        } else {
+            assert!(
+                error.contains(if mode == "auth" {
+                    "invalid_api_key"
+                } else {
+                    "invalid_request_error"
+                }),
+                "{error}"
+            );
+        }
+        assert!(events.iter().any(|event| matches!(event,
+            AgentEvent::TurnEnd { failed, .. } if *failed == (control != Some("interrupt")))));
+    }
+    let retries = events
+        .iter()
+        .filter(|event| matches!(event, AgentEvent::HttpRetry { .. }))
+        .count();
+    let expected_retries = if mode.starts_with("limit") || mode == "auth" || mode == "permanent" {
+        0
+    } else if control == Some("interrupt") || completes {
+        failures
+    } else {
+        failures - 1
+    };
+    assert_eq!(retries, expected_retries, "{contract:?} {mode}");
+    if mode != "thinking" && !mode.starts_with("limit") && mode != "mixed_malformed" {
+        let partials = agent
+            .history
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter(|block| matches!(block, Block::PartialStream { .. }))
+            .count();
+        assert_eq!(partials, failures, "{contract:?} {mode}");
+        for (index, request) in requests.iter().enumerate().skip(1) {
+            let wire = serde_json::to_string(request)?;
+            assert!(
+                wire.contains(&format!("partial draft {}", index - 1)),
+                "{wire}"
+            );
+            assert!(wire.contains("No tool calls from that failed response were executed"));
+            assert!(!wire.contains("not_executed"));
+            assert!(!wire.contains("partial_stream"));
+            assert!(!wire.contains("uncommitted reasoning"));
+        }
+        if !quiet {
+            let committed = events
+                .iter()
+                .filter(|event| {
+                    matches!(event, AgentEvent::TextBlockComplete(text)
+                if text.contains("[stream interrupted; incomplete response]"))
+                })
+                .count();
+            assert_eq!(committed, failures);
+        }
+    } else if mode == "thinking" || mode == "mixed_malformed" {
+        assert!(requests.windows(2).all(|pair| pair[0] == pair[1]));
+    } else if mode.starts_with("limit") {
+        assert!(
+            serde_json::to_string(requests.last().unwrap())?
+                .contains("without producing an executable function call")
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn stream_recovery_preserves_partial_text_without_executing_failed_calls() -> Result<()> {
+    for contract in [
+        RequestContract::AnthropicMessages,
+        RequestContract::OpenAiChatCompletions,
+        RequestContract::OpenAiResponses,
+        RequestContract::ChatGptResponses,
+    ] {
+        assert_stream_recovery_case(contract, "broken", 1, true, false, None).await?;
+        assert_stream_recovery_case(contract, "broken", 1, true, true, None).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn stream_recovery_clean_eof_and_thinking_only_restart() -> Result<()> {
+    for contract in [
+        RequestContract::AnthropicMessages,
+        RequestContract::ChatGptResponses,
+        RequestContract::OpenAiChatCompletions,
+    ] {
+        assert_stream_recovery_case(contract, "eof", 1, true, false, None).await?;
+        assert_stream_recovery_case(contract, "server_error", 1, true, false, None).await?;
+        assert_stream_recovery_case(contract, "timeout", 1, true, false, None).await?;
+        assert_stream_recovery_case(contract, "thinking", 1, true, false, None).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn stream_recovery_exhaustion_and_fail_fast_errors_do_not_report_success() -> Result<()> {
+    for contract in [
+        RequestContract::AnthropicMessages,
+        RequestContract::ChatGptResponses,
+    ] {
+        assert_stream_recovery_case(contract, "broken", 4, false, false, None).await?;
+        assert_stream_recovery_case(contract, "auth", 1, false, false, None).await?;
+        assert_stream_recovery_case(contract, "permanent", 1, false, false, None).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn stream_recovery_special_case_cannot_add_a_fifth_attempt() -> Result<()> {
+    assert_stream_recovery_case(
+        RequestContract::ChatGptResponses,
+        "mixed_malformed",
+        4,
+        false,
+        false,
+        None,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn stream_recovery_interrupt_and_effort_controls_remain_responsive() -> Result<()> {
+    for contract in [
+        RequestContract::AnthropicMessages,
+        RequestContract::ChatGptResponses,
+    ] {
+        assert_stream_recovery_case(contract, "broken", 1, false, false, Some("interrupt")).await?;
+        assert_stream_recovery_case(contract, "broken", 1, true, false, Some("/effort high"))
+            .await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn stream_recovery_reasoning_only_output_limit_automatically_continues() -> Result<()> {
+    for contract in [
+        RequestContract::AnthropicMessages,
+        RequestContract::OpenAiChatCompletions,
+    ] {
+        assert_stream_recovery_case(contract, "limit", 1, true, false, None).await?;
+        assert_stream_recovery_case(contract, "limit_text", 1, true, false, None).await?;
+    }
+    Ok(())
+}
+
+#[test]
+fn stream_recovery_partial_buffer_respects_block_boundaries_and_discard() {
+    let root = temp_test_dir("partial-stream-buffer");
+    let _cleanup = RemoveDirOnDrop(root.clone());
+    let mut agent = test_agent(&root);
+    agent.session_enabled = false;
+    for quiet in [false, true] {
+        agent.quiet_stream_events = quiet;
+        agent.history.clear();
+        agent.partial_stream_text = None;
+        agent.emit_stream_updates(vec![
+            streaming::StreamUpdate::TextDelta("first".into()),
+            streaming::StreamUpdate::TextBlockComplete("first".into()),
+            streaming::StreamUpdate::TextDelta("second".into()),
+        ]);
+        assert!(agent.preserve_interrupted_stream());
+        assert!(matches!(agent.history.last().unwrap().content.as_slice(),
+            [Block::PartialStream { text }] if text == "first\n\nsecond\n\n[stream interrupted; incomplete response]"));
+        agent.emit_stream_updates(vec![
+            streaming::StreamUpdate::TextDelta("committed draft".into()),
+            streaming::StreamUpdate::TextBlockComplete("committed draft".into()),
+            streaming::StreamUpdate::TextDelta("discarded by terminal".into()),
+            streaming::StreamUpdate::TextPreviewDiscarded,
+        ]);
+        assert!(!agent.preserve_interrupted_stream());
+    }
+}
+
+#[test]
+fn stream_recovery_only_completes_the_unemitted_tail() {
+    let root = temp_test_dir("partial-stream-display");
+    let _cleanup = RemoveDirOnDrop(root.clone());
+    for with_tail in [false, true] {
+        let mut agent = test_agent(&root);
+        agent.session_enabled = false;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        agent.set_sink(Box::new(ChannelSink { tx }));
+        agent.emit_stream_updates(vec![
+            streaming::StreamUpdate::TextDelta("first é".into()),
+            streaming::StreamUpdate::TextBlockComplete("first é".into()),
+            streaming::StreamUpdate::TextDelta("second 日本".into()),
+            streaming::StreamUpdate::TextBlockComplete("second 日本".into()),
+        ]);
+        if with_tail {
+            agent.emit_stream_updates(vec![streaming::StreamUpdate::TextDelta("open tail".into())]);
+        }
+        assert!(agent.preserve_interrupted_stream());
+        let completions: Vec<_> = drain_events(&mut rx)
+            .into_iter()
+            .filter_map(|event| match event {
+                AgentEvent::TextBlockComplete(text) => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            completions,
+            [
+                "first é",
+                "second 日本",
+                if with_tail {
+                    "open tail\n\n[stream interrupted; incomplete response]"
+                } else {
+                    "[stream interrupted; incomplete response]"
+                }
+            ]
+        );
+        let expected = format!(
+            "first é\n\nsecond 日本{}\n\n[stream interrupted; incomplete response]",
+            if with_tail { "\n\nopen tail" } else { "" }
+        );
+        assert!(matches!(agent.history.last().unwrap().content.as_slice(),
+            [Block::PartialStream { text }] if text == &expected));
+    }
+}
+
+#[test]
+fn responses_discarded_terminal_text_cannot_reappear_after_failure() {
+    let root = temp_test_dir("discarded-stream-text");
+    let _cleanup = RemoveDirOnDrop(root.clone());
+    for contract in [
+        RequestContract::OpenAiResponses,
+        RequestContract::ChatGptResponses,
+    ] {
+        let mut parser = streaming::ProviderStreamParser::new(contract, false);
+        let mut agent = test_agent(&root);
+        agent.session_enabled = false;
+        agent.quiet_stream_events = true;
+        for payload in [
+            json!({"type":"response.output_text.delta","delta":"discarded draft"}),
+            json!({"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"content_filter"},"output":[]}}),
+        ] {
+            agent.emit_stream_updates(
+                parser
+                    .push_frame(streaming::SseFrame {
+                        event: None,
+                        data: Some(payload.to_string()),
+                    })
+                    .unwrap(),
+            );
+        }
+        assert!(
+            parser
+                .push_frame(streaming::SseFrame {
+                    event: None,
+                    data: Some(json!({"type":"error","error":{"code":"server_error"}}).to_string())
+                })
+                .is_err()
+        );
+        assert!(!agent.preserve_interrupted_stream());
+        assert!(agent.history.is_empty());
+    }
 }
 
 #[test]
@@ -22247,6 +23891,33 @@ fn hook_identity_env_cannot_be_replaced_by_pack_env() -> Result<()> {
     );
     assert_eq!(out[0].2, "\nreal-call\nnone");
     let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[cfg(windows)]
+#[test]
+fn session_operation_lock_retries_native_sharing_violation() -> Result<()> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    let _guard = env_lock();
+    let root = temp_test_dir("operation-lock-sharing");
+    let _cleanup = RemoveDirOnDrop(root.clone());
+    let path = root.join("operation.lock");
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(0)
+        .open(&path)?;
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        drop(held);
+    });
+    let acquired = session::SessionLockOperationGuard::acquire_at(&path);
+    release.join().unwrap();
+    drop(acquired?);
+    drop(session::SessionLockOperationGuard::acquire_at(&path)?);
     Ok(())
 }
 
@@ -29234,8 +30905,17 @@ fn anthropic_login_starts_subscription_oauth_even_when_api_key_env_exists() -> R
             login.message
         );
         assert!(login.message.contains("code=true"), "{}", login.message);
+        let pending: Value =
+            serde_json::from_slice(&std::fs::read(crate::provider::pending_oauth_path())?)?;
+        let redirect = reqwest::Url::parse(pending["redirect_uri"].as_str().unwrap())?;
+        assert_eq!(redirect.host_str(), Some("localhost"));
+        assert_eq!(redirect.path(), "/callback");
+        assert!(redirect.port().is_some_and(|port| port != 0));
         assert!(
-            login.message.contains("localhost%3A53692%2Fcallback"),
+            login.message.contains(&format!(
+                "localhost%3A{}%2Fcallback",
+                redirect.port().unwrap()
+            )),
             "{}",
             login.message
         );
@@ -29243,10 +30923,10 @@ fn anthropic_login_starts_subscription_oauth_even_when_api_key_env_exists() -> R
         Ok(())
     })();
 
+    let _ = cancel_pending_oauth_login();
     restore_env_var("DEXT_HOME", old_dext_home);
     restore_env_var("ANTHROPIC_API_KEY", old_anthropic_key);
     restore_env_var("DEXT_SKIP_BROWSER_OPEN", old_skip_browser);
-    let _ = cancel_pending_oauth_login();
     let _ = std::fs::remove_dir_all(&root);
     result
 }
@@ -31845,6 +33525,101 @@ fn chatgpt_summary_request_body_matches_current_responses_api_expectations() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+#[test]
+fn chatgpt_large_summary_request_gzip_preserves_json_and_summary_cap() -> Result<()> {
+    let root = temp_test_dir("chatgpt-summary-gzip");
+    let _cleanup = RemoveDirOnDrop(root.clone());
+    let mut agent = test_agent(&root);
+    configure_stream_recovery_agent(&mut agent, RequestContract::ChatGptResponses);
+    let text = "synthetic old context";
+    let evidence = "synthetic summary λ \\\" data. ".repeat(60_000);
+    let old = vec![Message {
+        role: "user".to_string(),
+        content: vec![Block::Text {
+            text: text.to_string(),
+        }],
+    }];
+    let summary = agent.prepare_summary_request(&old, &evidence)?;
+    assert_eq!(summary.request.headers()["content-encoding"], "gzip");
+    let wire = summary
+        .request
+        .body()
+        .and_then(reqwest::Body::as_bytes)
+        .unwrap();
+    assert!(wire.len() <= provider::CHATGPT_REQUEST_WIRE_LIMIT);
+    let mut decoded = Vec::new();
+    flate2::read::GzDecoder::new(wire).read_to_end(&mut decoded)?;
+    assert!(decoded.len() > provider::CHATGPT_REQUEST_WIRE_LIMIT);
+    let body: Value = serde_json::from_slice(&decoded)?;
+    assert_eq!(body["tool_choice"], "none");
+    assert_eq!(body["parallel_tool_calls"], false);
+    assert!(
+        body["input"][0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains(text)
+    );
+    assert!(
+        body["input"][0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains(evidence.trim())
+    );
+    let small = agent.prepare_summary_request(&old, "small evidence")?;
+    assert!(small.request.headers().get("content-encoding").is_none());
+    let error = agent
+        .prepare_summary_request(&old, &"x".repeat(PROVIDER_JSON_BODY_CAP + 1))
+        .err()
+        .expect("summary JSON cap");
+    assert!(
+        error
+            .to_string()
+            .contains("summary request exceeded byte limit"),
+        "{error}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn chatgpt_oversize_compressed_request_is_not_sent_or_compacted() -> Result<()> {
+    let root = temp_test_dir("chatgpt-oversize-gzip");
+    let _cleanup = RemoveDirOnDrop(root.clone());
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let mut agent = test_agent(&root);
+    configure_stream_recovery_agent(&mut agent, RequestContract::ChatGptResponses);
+    agent.base_url = format!("http://{}", listener.local_addr()?);
+    agent.session_enabled = false;
+    agent.background.enabled = false;
+    agent.compact_threshold_chars = Some(usize::MAX);
+    let mut seed = 0x98c7_41a3_192d_068f_u64;
+    let random: Vec<u8> = (0..2 * provider::CHATGPT_REQUEST_WIRE_LIMIT)
+        .map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed as u8
+        })
+        .collect();
+    let text = base64::engine::general_purpose::STANDARD.encode(random);
+    let error = agent
+        .chat(text.clone())
+        .await
+        .expect_err("wire limit")
+        .to_string();
+    assert!(error.contains("wire limit even with gzip"), "{error}");
+    assert!(!error.contains("retry budget exhausted"), "{error}");
+    assert!(agent.history.iter().any(|message| {
+        message
+            .content
+            .iter()
+            .any(|block| matches!(block, Block::Text { text: actual } if actual == &text))
+    }));
+    assert!(
+        matches!(accept_test_connection(&listener, Duration::from_millis(100)), Err(error) if error.kind() == io::ErrorKind::TimedOut)
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "current_thread")]
 #[allow(clippy::await_holding_lock)]
 async fn chatgpt_compact_summary_honors_summary_model_reasoning_capability() {
@@ -33004,6 +34779,18 @@ fn lean_tool_profile_keeps_descriptions_useful_and_schemas_slim() {
         "{}",
         wired[0].input_schema
     );
+
+    for profile in [ToolProfile::Lean, ToolProfile::Full] {
+        let read_image = provider_tool_definitions()
+            .into_iter()
+            .find(|tool| tool.name == "read_image")
+            .expect("read_image tool");
+        let wired = tools::wire_tools(&[read_image], profile);
+        assert!(wired[0].description.contains("approval"));
+        assert!(wired[0].description.contains("100"), "{:?}", profile);
+        assert!(wired[0].description.contains("20 MiB"), "{:?}", profile);
+        assert!(wired[0].description.contains("turn"), "{:?}", profile);
+    }
 
     let bash = provider_tool_definitions()
         .into_iter()
