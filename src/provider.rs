@@ -3961,6 +3961,11 @@ pub(crate) fn running_in_wsl() -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(any(not(unix), target_os = "macos"))]
+pub(crate) fn running_in_wsl() -> bool {
+    false
+}
+
 fn browser_launcher_timeout() -> Duration {
     let seconds = std::env::var("DEXT_BROWSER_OPEN_TIMEOUT_SECS")
         .ok()
@@ -6456,6 +6461,15 @@ mod tests {
             oauth_callback_port("http://localhost/callback").unwrap(),
             80
         );
+    }
+
+    #[cfg(any(not(unix), target_os = "macos"))]
+    #[test]
+    fn native_oauth_platforms_skip_wsl_port_query() {
+        assert!(!running_in_wsl());
+        for host in ["127.0.0.1", "::1"] {
+            assert!(wsl_oauth_unavailable_ports(host).is_empty());
+        }
     }
 
     #[test]
