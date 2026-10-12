@@ -402,7 +402,9 @@ fn image_gateway_round_trip(unlink_binary: bool, batch_sizes: &[usize]) {
                     .unwrap()
                     .contains("at most 100 successful images"))
                 .count(),
-            tool_results.len() - expected
+            tool_results.len() - expected,
+            "unexpected image admission results: {tool_results:?}; stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
         );
         let images: Vec<_> = body["messages"]
             .as_array()
