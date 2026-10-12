@@ -777,8 +777,9 @@ fn session_lock_process_guard() -> &'static Mutex<()> {
 }
 
 pub(crate) struct SessionLockOperationGuard {
-    _process_guard: std::sync::MutexGuard<'static, ()>,
+    // Close the OS-exclusive handle before releasing the in-process mutex.
     _file: std::fs::File,
+    _process_guard: std::sync::MutexGuard<'static, ()>,
 }
 
 impl SessionLockOperationGuard {
@@ -812,10 +813,10 @@ impl SessionLockOperationGuard {
                 Err(error)
                     if cfg!(windows)
                         && std::time::Instant::now() < deadline
-                        && matches!(
+                        && (matches!(
                             error.kind(),
                             io::ErrorKind::PermissionDenied | io::ErrorKind::WouldBlock
-                        ) =>
+                        ) || error.raw_os_error() == Some(32)) =>
                 {
                     std::thread::sleep(std::time::Duration::from_millis(25));
                 }

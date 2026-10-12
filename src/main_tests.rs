@@ -23894,6 +23894,33 @@ fn hook_identity_env_cannot_be_replaced_by_pack_env() -> Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
+#[test]
+fn session_operation_lock_retries_native_sharing_violation() -> Result<()> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    let _guard = env_lock();
+    let root = temp_test_dir("operation-lock-sharing");
+    let _cleanup = RemoveDirOnDrop(root.clone());
+    let path = root.join("operation.lock");
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(0)
+        .open(&path)?;
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        drop(held);
+    });
+    let acquired = session::SessionLockOperationGuard::acquire_at(&path);
+    release.join().unwrap();
+    drop(acquired?);
+    drop(session::SessionLockOperationGuard::acquire_at(&path)?);
+    Ok(())
+}
+
 #[test]
 fn hook_memo_concurrent_writers_observe_one_complete_value() -> Result<()> {
     let _guard = env_lock();

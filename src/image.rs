@@ -166,7 +166,7 @@ fn worker_command(executable: &Path) -> Command {
 }
 
 #[cfg(target_os = "macos")]
-fn worker_memory_within_limit(child: &Child) -> Result<(), String> {
+fn worker_memory_within_limit(child: &Child) -> Result<bool, String> {
     let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of_val(&info) as libc::c_int;
     let read = unsafe {
@@ -179,12 +179,32 @@ fn worker_memory_within_limit(child: &Child) -> Result<(), String> {
         )
     };
     if read != size {
-        return Err("could not inspect image worker memory".to_string());
+        return Ok(false);
     }
     if info.pti_resident_size > WORKER_MEMORY_CAP {
         return Err("image worker exceeded its resident-memory limit".to_string());
     }
-    Ok(())
+    Ok(true)
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Default)]
+struct WorkerMemoryMonitor {
+    unavailable_since: Option<Instant>,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl WorkerMemoryMonitor {
+    fn observe(&mut self, sample: Result<bool, String>, now: Instant) -> Result<(), String> {
+        if sample? {
+            self.unavailable_since = None;
+        } else if now.duration_since(*self.unavailable_since.get_or_insert(now))
+            >= Duration::from_millis(50)
+        {
+            return Err("could not inspect image worker memory".to_string());
+        }
+        Ok(())
+    }
 }
 
 fn check_worker_interrupt(interrupt: Option<&AtomicBool>) -> Result<(), String> {
@@ -237,6 +257,8 @@ fn run_worker(
             let mut output = Vec::new();
             stderr.take(4096).read_to_end(&mut output).map(|_| output)
         });
+        #[cfg(target_os = "macos")]
+        let mut memory_monitor = WorkerMemoryMonitor::default();
         let status = loop {
             if let Err(error) = check_worker_interrupt(interrupt) {
                 break Err(error);
@@ -245,11 +267,11 @@ fn run_worker(
                 Ok(Some(status)) => break Ok(status),
                 Ok(None) if start.elapsed() < timeout => {
                     #[cfg(target_os = "macos")]
-                    if let Err(error) = worker_memory_within_limit(&child.0) {
-                        // A worker can exit between try_wait and proc_pidinfo.
-                        if matches!(child.0.try_wait(), Ok(Some(_))) {
-                            continue;
-                        }
+                    // A worker can exit between try_wait and proc_pidinfo; allow
+                    // a bounded reap window without accepting an uninspectable live child.
+                    if let Err(error) =
+                        memory_monitor.observe(worker_memory_within_limit(&child.0), Instant::now())
+                    {
                         break Err(error);
                     }
                     std::thread::sleep(Duration::from_millis(5));
@@ -963,6 +985,39 @@ mod tests {
         let mut trailing = jpeg.clone();
         trailing.extend_from_slice(&[0xff, 0xd9]);
         assert!(worker_output(output(1, 1, &trailing)).is_err());
+    }
+
+    #[test]
+    fn worker_memory_monitor_bounds_missing_samples_and_resets_on_success() {
+        let mut monitor = WorkerMemoryMonitor::default();
+        let start = Instant::now();
+        assert!(monitor.observe(Ok(false), start).is_ok());
+        assert!(
+            monitor
+                .observe(Ok(false), start + Duration::from_millis(49))
+                .is_ok()
+        );
+        assert!(
+            monitor
+                .observe(Ok(false), start + Duration::from_millis(50))
+                .unwrap_err()
+                .contains("could not inspect")
+        );
+        assert!(
+            monitor
+                .observe(Ok(true), start + Duration::from_millis(51))
+                .is_ok()
+        );
+        assert!(
+            monitor
+                .observe(Ok(false), start + Duration::from_millis(100))
+                .is_ok()
+        );
+        let error = "image worker exceeded its resident-memory limit";
+        assert_eq!(
+            monitor.observe(Err(error.into()), start + Duration::from_millis(101)),
+            Err(error.into())
+        );
     }
 
     #[test]
