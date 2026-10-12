@@ -7,7 +7,13 @@ use std::time::{Duration, Instant};
 
 fn spawn(root: &std::path::Path, extra: &[&str]) -> Child {
     let path = std::env::var_os("PATH").unwrap_or_default();
-    Command::new(env!("CARGO_BIN_EXE_dext"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_dext"));
+    command.env_clear();
+    #[cfg(windows)]
+    if let Some(system_root) = std::env::var_os("SystemRoot") {
+        command.env("SystemRoot", system_root);
+    }
+    command
         .args([
             "--input",
             "ndjson",
@@ -19,10 +25,13 @@ fn spawn(root: &std::path::Path, extra: &[&str]) -> Child {
         .arg(root)
         .args(extra)
         .current_dir(root)
-        .env_clear()
         .env("PATH", path)
         .env("HOME", root)
         .env("DEXT_HOME", root.join(".dext"))
+        .env("DEXT_PROVIDER", "local")
+        .env("DEXT_BASE_URL", "http://127.0.0.1:1")
+        .env("DEXT_MODEL", "mock-model")
+        .env("DEXT_MODEL_FORCE", "1")
         .env("DEXT_APPROVAL", "never")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -89,6 +98,9 @@ fn ready_first_then_close_terminates_with_pure_json_stdout() {
     wait_within(&mut child, Duration::from_secs(20));
     assert_eq!(events[0]["event"], "ready", "{events:?}");
     assert_eq!(events[0]["data"]["input"], "ndjson");
+    assert_eq!(events[0]["data"]["provider"], "local");
+    assert_eq!(events[0]["data"]["model"], "mock-model");
+    assert!(!events.iter().any(|event| event["event"] == "turn_start"));
     assert_eq!(events[0]["data"]["ui_protocol"], 1);
     assert!(
         events[0]["data"]["frames"]
