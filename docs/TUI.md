@@ -90,10 +90,12 @@ The renderer dependencies are exact so unrelated lockfile refreshes cannot chang
 
 - `ratatui = 0.30.2`
 - `ratatui-core` and `ratatui-crossterm` from unmodified upstream revision `7767679c138b383933fef4227e7fbf077b7cfeca` (both report `0.1.2`)
-- `tui-markdown = 0.3.8`
-- `pulldown-cmark = 0.13.3` (the already-resolved Markdown parser, now directly reused for stable block boundaries)
+- `tui-markdown = 0.3.10` (syntax highlighting remains disabled)
+- `pulldown-cmark = 0.13.4` (also directly reused for stable block boundaries)
 - `crossterm = 0.29.0`
 - `unicode-width = 0.2.2`
+
+The reviewed October 12 dependency refresh updates only the Markdown renderer/parser within this stack. `tui-markdown` no longer includes its test helpers as production dependencies, removing nine unused transitive packages. Ratatui's Git revision, core/backend unification, Crossterm, Unicode width, and patched `lru` pins are unchanged; no syntax-highlighting dependencies are enabled.
 
 ## Unmodified upstream integration
 
