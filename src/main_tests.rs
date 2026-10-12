@@ -6983,6 +6983,22 @@ async fn assert_provider_http_retry_case(
     completes: bool,
     interrupted: bool,
 ) {
+    assert_provider_http_retry_contract_case(status, requests, completes, interrupted, false).await;
+}
+
+#[tokio::test]
+async fn chatgpt_http_503_recovery_and_exhaustion_remain_bounded() {
+    assert_provider_http_retry_contract_case(503, 6, true, false, true).await;
+    assert_provider_http_retry_contract_case(503, 6, false, false, true).await;
+}
+
+async fn assert_provider_http_retry_contract_case(
+    status: u16,
+    requests: usize,
+    completes: bool,
+    interrupted: bool,
+    chatgpt: bool,
+) {
     struct RetrySink {
         tx: tokio::sync::mpsc::UnboundedSender<AgentEvent>,
         interrupt: Arc<AtomicBool>,
@@ -7004,6 +7020,7 @@ async fn assert_provider_http_retry_case(
         "http-retry-{status}-{requests}-{completes}-{interrupted}"
     ));
     let root = std::fs::canonicalize(&root).expect("canonical temp dir");
+    let _cleanup = RemoveDirOnDrop(root.clone());
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
     let addr = listener.local_addr().expect("local addr");
     let server = std::thread::spawn(move || {
@@ -7039,7 +7056,11 @@ async fn assert_provider_http_retry_case(
             }
             bodies.push(request[header_end..header_end + content_length].to_vec());
             let response = if completes && request_index + 1 == requests {
-                let body = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+                let body = if chatgpt {
+                    "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n"
+                } else {
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+                };
                 format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),
@@ -7073,6 +7094,9 @@ async fn assert_provider_http_retry_case(
     agent.api_key.clear();
     agent.base_url = format!("http://{addr}");
     agent.model = DEFAULT_LOCAL_MODEL.to_string();
+    if chatgpt {
+        configure_stream_recovery_agent(&mut agent, RequestContract::ChatGptResponses);
+    }
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     agent.set_sink(Box::new(RetrySink {
         tx,
@@ -7090,9 +7114,17 @@ async fn assert_provider_http_retry_case(
         );
         if !interrupted && status == 503 {
             assert!(error.contains("upstream connect error"), "{error}");
-            assert!(error.contains(&format!(
-                "Provider retry budget exhausted after {requests} attempts on local/{DEFAULT_LOCAL_MODEL}."
-            )), "{error}");
+            assert!(
+                error.contains(&format!(
+                    "Provider retry budget exhausted after {requests} attempts on {}/{}.",
+                    agent.provider_id, agent.model
+                )),
+                "{error}"
+            );
+            assert!(
+                error.contains("\nProvider retry budget exhausted"),
+                "{error}"
+            );
             assert!(error.contains("/provider or /model"), "{error}");
         } else {
             assert!(!error.contains("retry budget exhausted"), "{error}");
@@ -16019,7 +16051,11 @@ async fn provider_total_timeout_bounds_headers_and_trickling_bodies() {
                 error.context("trickling body unexpectedly completed")?
             };
             anyhow::ensure!(
-                error.to_string().contains("total request timeout"),
+                error.to_string().contains(if mode == "headers" {
+                    "connect or total request timeout"
+                } else {
+                    "timeout while reading provider response body (request deadline or connection timeout)"
+                }),
                 "{mode}: {error:#}"
             );
             anyhow::ensure!(
@@ -16027,6 +16063,8 @@ async fn provider_total_timeout_bounds_headers_and_trickling_bodies() {
                 "{mode}: exceeded safety timeout"
             );
             if mode != "headers" {
+                anyhow::ensure!(orchestrator::classify_stream_error(&format!("{error:#}")).retry,
+                    "body timeouts must retain transient classification: {error:#}");
                 anyhow::ensure!(chunks_sent.load(Ordering::SeqCst) > 1, "{mode}: no trickle");
             }
             Ok(())
@@ -20833,8 +20871,9 @@ fn stream_recovery_reason_is_contract_scoped() {
         Some("unfinished_tool_call")
     );
     assert_eq!(
-        stream_recovery_reason(RequestContract::AnthropicMessages, Some("max_tokens"), 0),
-        None
+        stream_recovery_reason(RequestContract::AnthropicMessages, Some("max_tokens"), 0)
+            .as_deref(),
+        Some("output_token_limit")
     );
     assert_eq!(
         stream_recovery_reason(RequestContract::AnthropicMessages, Some("end_turn"), 0),
@@ -20867,8 +20906,9 @@ fn stream_recovery_reason_is_contract_scoped() {
         Some("unfinished_tool_call")
     );
     assert_eq!(
-        stream_recovery_reason(RequestContract::OpenAiChatCompletions, Some("length"), 0),
-        None
+        stream_recovery_reason(RequestContract::OpenAiChatCompletions, Some("length"), 0)
+            .as_deref(),
+        Some("output_token_limit")
     );
     assert_eq!(
         stream_recovery_reason(RequestContract::ChatGptResponses, Some("completed"), 1),
@@ -20878,6 +20918,597 @@ fn stream_recovery_reason_is_contract_scoped() {
         stream_recovery_reason(RequestContract::OpenAiResponses, Some("completed"), 1),
         None
     );
+}
+
+fn configure_stream_recovery_agent(agent: &mut Agent, contract: RequestContract) {
+    let id = match contract {
+        RequestContract::AnthropicMessages => "glm",
+        RequestContract::OpenAiChatCompletions => "deepseek",
+        RequestContract::OpenAiResponses => "openai",
+        RequestContract::ChatGptResponses => "chatgpt",
+    };
+    let mut profile = built_in_provider_profiles()
+        .into_iter()
+        .find(|profile| profile.id == id)
+        .unwrap();
+    profile.request_contract = Some(contract);
+    agent.provider_id = id.to_string();
+    agent.api_provider = profile.api_provider;
+    agent.model = profile.default_model.clone();
+    agent.provider_profile = Some(profile);
+    if contract == RequestContract::ChatGptResponses {
+        use base64::Engine as _;
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"https://api.openai.com/auth":{"chatgpt_account_id":"fixture_account"}}"#);
+        agent.api_key = format!("fixture.{payload}.unsigned");
+    }
+}
+
+fn stream_recovery_fixture(contract: RequestContract, mode: &str, text: &str) -> String {
+    let mut events = Vec::new();
+    if contract == RequestContract::AnthropicMessages {
+        events.push(json!({"type":"message_start","message":{"usage":{}}}));
+        let thinking = mode == "thinking" || mode == "limit";
+        events.push(
+            json!({"type":"content_block_start","index":0,"content_block":
+            if thinking { json!({"type":"thinking","thinking":"uncommitted reasoning"}) }
+            else { json!({"type":"text","text":text}) }}),
+        );
+        events.push(json!({"type":"content_block_stop","index":0}));
+        if matches!(mode, "success" | "limit" | "limit_text") {
+            events.push(json!({"type":"message_delta","delta":{"stop_reason":
+                if mode.starts_with("limit") {"max_tokens"} else {"end_turn"}}}));
+            events.push(json!({"type":"message_stop"}));
+        } else {
+            events.push(
+                json!({"type":"content_block_start","index":1,"content_block":
+                {"type":"tool_use","id":"not_executed","name":"write_file","input":{}}}),
+            );
+            events.push(json!({"type":"content_block_delta","index":1,"delta":
+                {"type":"input_json_delta","partial_json":"{\"path\":\"must-not-exist\",\"content\":\"unsafe\"}"}}));
+            events.push(json!({"type":"content_block_stop","index":1}));
+        }
+    } else if contract.is_responses() {
+        if mode == "thinking" || mode == "malformed" {
+            events.push(json!({"type":"response.reasoning_summary_text.delta","delta":"uncommitted reasoning"}));
+        } else {
+            events.push(json!({"type":"response.output_text.delta","delta":text}));
+        }
+        if mode == "success" {
+            events.push(
+                json!({"type":"response.completed","response":{"status":"completed","output":[]}}),
+            );
+        } else {
+            events.push(json!({"type":"response.output_item.added","item":
+                {"type":"function_call","id":"fc_1","call_id":"not_executed","name":"write_file","arguments":""}}));
+            events.push(
+                json!({"type":"response.function_call_arguments.done","item_id":"fc_1",
+                "arguments": if mode == "malformed" { "{\"path\":]" } else { "{\"path\":\"must-not-exist\",\"content\":\"unsafe\"}" }}),
+            );
+            if mode == "malformed" {
+                events.push(json!({"type":"response.completed","response":{"status":"completed","output":[]}}));
+            }
+        }
+    } else {
+        let delta = if mode == "thinking" || mode == "limit" {
+            json!({"reasoning_content":"uncommitted reasoning"})
+        } else {
+            json!({"content":text})
+        };
+        events.push(json!({"choices":[{"delta":delta,"finish_reason":null}]}));
+        if matches!(mode, "success" | "limit" | "limit_text") {
+            events.push(json!({"choices":[{"delta":{},"finish_reason":
+                if mode.starts_with("limit") {"length"} else {"stop"}}]}));
+        } else {
+            events.push(json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"not_executed",
+                "function":{"name":"write_file","arguments":"{\"path\":\"must-not-exist\",\"content\":\"unsafe\"}"}}]},"finish_reason":null}]}));
+        }
+    }
+    if mode == "server_error" {
+        if contract.is_responses() {
+            events.push(json!({"type":"response.failed","response":{"error":{
+                "code":"server_error","message":"An error occurred while processing your request. You can retry your request."}}}));
+        } else {
+            events.push(json!({"type":"error","error":{"code":"1234","message":"Internal network failure"}}));
+        }
+    }
+    if mode == "auth" || mode == "permanent" {
+        let code = if mode == "auth" {
+            "invalid_api_key"
+        } else {
+            "invalid_request_error"
+        };
+        events.push(json!({"type":"error","error":{"type":code,"code":code,"message":code}}));
+    }
+    events
+        .into_iter()
+        .map(|value| {
+            if contract == RequestContract::AnthropicMessages {
+                format!(
+                    "event: {}\ndata: {value}\n\n",
+                    value["type"].as_str().unwrap()
+                )
+            } else {
+                format!("data: {value}\n\n")
+            }
+        })
+        .collect()
+}
+
+async fn assert_stream_recovery_case(
+    contract: RequestContract,
+    mode: &'static str,
+    failures: usize,
+    completes: bool,
+    quiet: bool,
+    control: Option<&'static str>,
+) -> Result<()> {
+    struct RecoverySink {
+        tx: tokio::sync::mpsc::UnboundedSender<AgentEvent>,
+        interrupt: Arc<AtomicBool>,
+        controls: tokio::sync::mpsc::UnboundedSender<String>,
+        control: Option<&'static str>,
+    }
+    impl EventSink for RecoverySink {
+        fn request_permission(&mut self, _name: &str, _input: &Value) -> Choice {
+            panic!("failed-stream tool call reached permission dispatch");
+        }
+        fn local_auth_prompt(&mut self, _tool: &str, _message: &str) {}
+        fn emit(&mut self, event: AgentEvent) {
+            if matches!(event, AgentEvent::HttpRetry { .. }) {
+                if self.control == Some("interrupt") {
+                    self.interrupt.store(true, Ordering::SeqCst);
+                } else if let Some(control) = self.control.take() {
+                    self.controls.send(control.to_string()).unwrap();
+                }
+            }
+            let _ = self.tx.send(event);
+        }
+    }
+    let root = temp_test_dir("stream-recovery");
+    let _cleanup = RemoveDirOnDrop(root.clone());
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let address = listener.local_addr()?;
+    let server = std::thread::spawn(move || -> Result<Vec<Value>> {
+        let mut requests = Vec::new();
+        for index in 0..failures + usize::from(completes) {
+            let mut stream = accept_test_connection(&listener, Duration::from_secs(10))?;
+            stream.set_nonblocking(false)?;
+            stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+            stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+            let mut request = Vec::new();
+            let mut buffer = [0; 4096];
+            let header_end = loop {
+                let count = stream.read(&mut buffer)?;
+                anyhow::ensure!(
+                    count > 0 && request.len() < 4 * 1024 * 1024,
+                    "invalid test request"
+                );
+                request.extend_from_slice(&buffer[..count]);
+                if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break end + 4;
+                }
+            };
+            let length = String::from_utf8_lossy(&request[..header_end])
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")?
+                        .trim()
+                        .parse::<usize>()
+                        .ok()
+                })
+                .context("content length")?;
+            anyhow::ensure!(length < 4 * 1024 * 1024, "test request cap");
+            while request.len() < header_end + length {
+                let count = stream.read(&mut buffer)?;
+                anyhow::ensure!(count > 0, "truncated test request");
+                request.extend_from_slice(&buffer[..count]);
+            }
+            requests.push(serde_json::from_slice(
+                &request[header_end..header_end + length],
+            )?);
+            let success = index == failures;
+            let text = if success {
+                "Recovered.".to_string()
+            } else {
+                format!("partial draft {index}")
+            };
+            let response_mode = if success {
+                "success"
+            } else if mode == "mixed_malformed" {
+                if index + 1 == failures {
+                    "malformed"
+                } else {
+                    "thinking"
+                }
+            } else {
+                mode
+            };
+            let body = stream_recovery_fixture(contract, response_mode, &text);
+            if !success && matches!(mode, "broken" | "thinking" | "timeout") {
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{body}\r\n",
+                    body.len()
+                )?;
+                stream.flush()?;
+                // Deliver parsed text before an incomplete HTTP chunk closes the body.
+                if mode == "timeout" {
+                    std::thread::sleep(Duration::from_millis(800));
+                } else {
+                    std::thread::sleep(Duration::from_millis(40));
+                    stream.write_all(b"10\r\nx")?;
+                }
+            } else {
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )?;
+            }
+        }
+        anyhow::ensure!(
+            matches!(accept_test_connection(&listener, Duration::from_millis(150)),
+            Err(error) if error.kind() == io::ErrorKind::TimedOut),
+            "extra recovery request"
+        );
+        Ok(requests)
+    });
+    let mut agent = test_agent(&root);
+    configure_stream_recovery_agent(&mut agent, contract);
+    agent.base_url = format!("http://{address}");
+    if mode == "timeout" {
+        agent
+            .client
+            .set(
+                reqwest::Client::builder()
+                    .timeout(Duration::from_millis(500))
+                    .build()?,
+            )
+            .expect("uninitialized fixture client");
+    }
+    agent.history = vec![
+        Message {
+            role: "assistant".to_string(),
+            content: vec![Block::ToolUse {
+                id: "previous_call".to_string(),
+                name: "todo_read".to_string(),
+                input: json!({}),
+            }],
+        },
+        Message {
+            role: "user".to_string(),
+            content: vec![Block::ToolResult {
+                tool_use_id: "previous_call".to_string(),
+                content: "Earlier completed result".to_string(),
+                is_error: None,
+                metadata: ToolResultMetadata::default(),
+            }],
+        },
+    ];
+    agent.session_enabled = false;
+    agent.quiet_stream_events = quiet;
+    if control.is_some_and(|value| value != "interrupt") {
+        agent.max_iterations = Some(2);
+    }
+    let (controls, control_rx) = tokio::sync::mpsc::unbounded_channel();
+    agent.install_runtime_controls(control_rx, controls.clone());
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    agent.set_sink(Box::new(RecoverySink {
+        tx,
+        interrupt: agent.interrupt.clone(),
+        controls,
+        control,
+    }));
+    let result = agent.chat("Hello.".to_string()).await;
+    let requests = server
+        .join()
+        .expect("recovery fixture thread")
+        .with_context(|| {
+            format!("{contract:?} {mode} quiet={quiet} control={control:?}; client={result:?}")
+        })?;
+    let events = drain_events(&mut rx);
+    assert_eq!(result.is_ok(), completes, "{contract:?} {mode}: {result:?}");
+    assert!(!root.join("must-not-exist").exists());
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ToolCallStart { .. }))
+    );
+    assert!(
+        !agent
+            .history
+            .iter()
+            .flat_map(|message| &message.content)
+            .any(|block| matches!(block, Block::ToolUse { id, .. } if id != "previous_call"))
+    );
+    for request in &requests {
+        assert_eq!(
+            serde_json::to_string(request)?
+                .matches("Earlier completed result")
+                .count(),
+            1
+        );
+    }
+    if completes {
+        assert!(
+            agent
+                .history
+                .iter()
+                .flat_map(|message| &message.content)
+                .any(|block| matches!(block, Block::Text { text } if text == "Recovered."))
+        );
+    } else {
+        let error = format!("{:#}", result.unwrap_err());
+        if mode == "mixed_malformed" {
+            assert!(error.contains("has malformed arguments"), "{error}");
+            assert!(!error.contains("interrupted by user"), "{error}");
+        } else if failures == MAX_STREAM_ATTEMPTS as usize {
+            assert!(
+                error.contains("stream retry budget exhausted after 4 attempts"),
+                "{error}"
+            );
+            assert!(error.contains(&agent.provider_id), "{error}");
+            assert!(error.contains("/provider or /model"), "{error}");
+        } else if control == Some("interrupt") {
+            assert!(error.contains("interrupted"), "{error}");
+        } else {
+            assert!(
+                error.contains(if mode == "auth" {
+                    "invalid_api_key"
+                } else {
+                    "invalid_request_error"
+                }),
+                "{error}"
+            );
+        }
+        assert!(events.iter().any(|event| matches!(event,
+            AgentEvent::TurnEnd { failed, .. } if *failed == (control != Some("interrupt")))));
+    }
+    let retries = events
+        .iter()
+        .filter(|event| matches!(event, AgentEvent::HttpRetry { .. }))
+        .count();
+    let expected_retries = if mode.starts_with("limit") || mode == "auth" || mode == "permanent" {
+        0
+    } else if control == Some("interrupt") || completes {
+        failures
+    } else {
+        failures - 1
+    };
+    assert_eq!(retries, expected_retries, "{contract:?} {mode}");
+    if mode != "thinking" && !mode.starts_with("limit") && mode != "mixed_malformed" {
+        let partials = agent
+            .history
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter(|block| matches!(block, Block::PartialStream { .. }))
+            .count();
+        assert_eq!(partials, failures, "{contract:?} {mode}");
+        for (index, request) in requests.iter().enumerate().skip(1) {
+            let wire = serde_json::to_string(request)?;
+            assert!(
+                wire.contains(&format!("partial draft {}", index - 1)),
+                "{wire}"
+            );
+            assert!(wire.contains("No tool calls from that failed response were executed"));
+            assert!(!wire.contains("not_executed"));
+            assert!(!wire.contains("partial_stream"));
+            assert!(!wire.contains("uncommitted reasoning"));
+        }
+        if !quiet {
+            let committed = events
+                .iter()
+                .filter(|event| {
+                    matches!(event, AgentEvent::TextBlockComplete(text)
+                if text.contains("[stream interrupted; incomplete response]"))
+                })
+                .count();
+            assert_eq!(committed, failures);
+        }
+    } else if mode == "thinking" || mode == "mixed_malformed" {
+        assert!(requests.windows(2).all(|pair| pair[0] == pair[1]));
+    } else if mode.starts_with("limit") {
+        assert!(
+            serde_json::to_string(requests.last().unwrap())?
+                .contains("without producing an executable function call")
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn stream_recovery_preserves_partial_text_without_executing_failed_calls() -> Result<()> {
+    for contract in [
+        RequestContract::AnthropicMessages,
+        RequestContract::OpenAiChatCompletions,
+        RequestContract::OpenAiResponses,
+        RequestContract::ChatGptResponses,
+    ] {
+        assert_stream_recovery_case(contract, "broken", 1, true, false, None).await?;
+        assert_stream_recovery_case(contract, "broken", 1, true, true, None).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn stream_recovery_clean_eof_and_thinking_only_restart() -> Result<()> {
+    for contract in [
+        RequestContract::AnthropicMessages,
+        RequestContract::ChatGptResponses,
+        RequestContract::OpenAiChatCompletions,
+    ] {
+        assert_stream_recovery_case(contract, "eof", 1, true, false, None).await?;
+        assert_stream_recovery_case(contract, "server_error", 1, true, false, None).await?;
+        assert_stream_recovery_case(contract, "timeout", 1, true, false, None).await?;
+        assert_stream_recovery_case(contract, "thinking", 1, true, false, None).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn stream_recovery_exhaustion_and_fail_fast_errors_do_not_report_success() -> Result<()> {
+    for contract in [
+        RequestContract::AnthropicMessages,
+        RequestContract::ChatGptResponses,
+    ] {
+        assert_stream_recovery_case(contract, "broken", 4, false, false, None).await?;
+        assert_stream_recovery_case(contract, "auth", 1, false, false, None).await?;
+        assert_stream_recovery_case(contract, "permanent", 1, false, false, None).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn stream_recovery_special_case_cannot_add_a_fifth_attempt() -> Result<()> {
+    assert_stream_recovery_case(
+        RequestContract::ChatGptResponses,
+        "mixed_malformed",
+        4,
+        false,
+        false,
+        None,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn stream_recovery_interrupt_and_effort_controls_remain_responsive() -> Result<()> {
+    for contract in [
+        RequestContract::AnthropicMessages,
+        RequestContract::ChatGptResponses,
+    ] {
+        assert_stream_recovery_case(contract, "broken", 1, false, false, Some("interrupt")).await?;
+        assert_stream_recovery_case(contract, "broken", 1, true, false, Some("/effort high"))
+            .await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn stream_recovery_reasoning_only_output_limit_automatically_continues() -> Result<()> {
+    for contract in [
+        RequestContract::AnthropicMessages,
+        RequestContract::OpenAiChatCompletions,
+    ] {
+        assert_stream_recovery_case(contract, "limit", 1, true, false, None).await?;
+        assert_stream_recovery_case(contract, "limit_text", 1, true, false, None).await?;
+    }
+    Ok(())
+}
+
+#[test]
+fn stream_recovery_partial_buffer_respects_block_boundaries_and_discard() {
+    let root = temp_test_dir("partial-stream-buffer");
+    let _cleanup = RemoveDirOnDrop(root.clone());
+    let mut agent = test_agent(&root);
+    agent.session_enabled = false;
+    for quiet in [false, true] {
+        agent.quiet_stream_events = quiet;
+        agent.history.clear();
+        agent.partial_stream_text = None;
+        agent.emit_stream_updates(vec![
+            streaming::StreamUpdate::TextDelta("first".into()),
+            streaming::StreamUpdate::TextBlockComplete("first".into()),
+            streaming::StreamUpdate::TextDelta("second".into()),
+        ]);
+        assert!(agent.preserve_interrupted_stream());
+        assert!(matches!(agent.history.last().unwrap().content.as_slice(),
+            [Block::PartialStream { text }] if text == "first\n\nsecond\n\n[stream interrupted; incomplete response]"));
+        agent.emit_stream_updates(vec![
+            streaming::StreamUpdate::TextDelta("committed draft".into()),
+            streaming::StreamUpdate::TextBlockComplete("committed draft".into()),
+            streaming::StreamUpdate::TextDelta("discarded by terminal".into()),
+            streaming::StreamUpdate::TextPreviewDiscarded,
+        ]);
+        assert!(!agent.preserve_interrupted_stream());
+    }
+}
+
+#[test]
+fn stream_recovery_only_completes_the_unemitted_tail() {
+    let root = temp_test_dir("partial-stream-display");
+    let _cleanup = RemoveDirOnDrop(root.clone());
+    for with_tail in [false, true] {
+        let mut agent = test_agent(&root);
+        agent.session_enabled = false;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        agent.set_sink(Box::new(ChannelSink { tx }));
+        agent.emit_stream_updates(vec![
+            streaming::StreamUpdate::TextDelta("first é".into()),
+            streaming::StreamUpdate::TextBlockComplete("first é".into()),
+            streaming::StreamUpdate::TextDelta("second 日本".into()),
+            streaming::StreamUpdate::TextBlockComplete("second 日本".into()),
+        ]);
+        if with_tail {
+            agent.emit_stream_updates(vec![streaming::StreamUpdate::TextDelta("open tail".into())]);
+        }
+        assert!(agent.preserve_interrupted_stream());
+        let completions: Vec<_> = drain_events(&mut rx)
+            .into_iter()
+            .filter_map(|event| match event {
+                AgentEvent::TextBlockComplete(text) => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            completions,
+            [
+                "first é",
+                "second 日本",
+                if with_tail {
+                    "open tail\n\n[stream interrupted; incomplete response]"
+                } else {
+                    "[stream interrupted; incomplete response]"
+                }
+            ]
+        );
+        let expected = format!(
+            "first é\n\nsecond 日本{}\n\n[stream interrupted; incomplete response]",
+            if with_tail { "\n\nopen tail" } else { "" }
+        );
+        assert!(matches!(agent.history.last().unwrap().content.as_slice(),
+            [Block::PartialStream { text }] if text == &expected));
+    }
+}
+
+#[test]
+fn responses_discarded_terminal_text_cannot_reappear_after_failure() {
+    let root = temp_test_dir("discarded-stream-text");
+    let _cleanup = RemoveDirOnDrop(root.clone());
+    for contract in [
+        RequestContract::OpenAiResponses,
+        RequestContract::ChatGptResponses,
+    ] {
+        let mut parser = streaming::ProviderStreamParser::new(contract, false);
+        let mut agent = test_agent(&root);
+        agent.session_enabled = false;
+        agent.quiet_stream_events = true;
+        for payload in [
+            json!({"type":"response.output_text.delta","delta":"discarded draft"}),
+            json!({"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"content_filter"},"output":[]}}),
+        ] {
+            agent.emit_stream_updates(
+                parser
+                    .push_frame(streaming::SseFrame {
+                        event: None,
+                        data: Some(payload.to_string()),
+                    })
+                    .unwrap(),
+            );
+        }
+        assert!(
+            parser
+                .push_frame(streaming::SseFrame {
+                    event: None,
+                    data: Some(json!({"type":"error","error":{"code":"server_error"}}).to_string())
+                })
+                .is_err()
+        );
+        assert!(!agent.preserve_interrupted_stream());
+        assert!(agent.history.is_empty());
+    }
 }
 
 #[test]

@@ -377,13 +377,21 @@ fn stream_recovery_reason(
     chatgpt_incomplete_reason(contract, stop_reason)
         .map(str::to_string)
         .or_else(|| {
-            // Anthropic (max_tokens) and OpenAI Chat Completions (length)
-            // both report output-limit truncation through dropped tool calls.
-            (matches!(
+            if matches!(
                 contract,
                 RequestContract::AnthropicMessages | RequestContract::OpenAiChatCompletions
-            ) && unfinished_tool_calls > 0)
-                .then(|| "unfinished_tool_call".to_string())
+            ) && unfinished_tool_calls > 0
+            {
+                Some("unfinished_tool_call".to_string())
+            } else if matches!(
+                (contract, stop_reason),
+                (RequestContract::AnthropicMessages, Some("max_tokens"))
+                    | (RequestContract::OpenAiChatCompletions, Some("length"))
+            ) {
+                Some("output_token_limit".to_string())
+            } else {
+                None
+            }
         })
 }
 
@@ -404,7 +412,7 @@ fn stream_chunk_err(e: reqwest::Error) -> anyhow::Error {
 fn provider_body_chunk_err(error: reqwest::Error) -> anyhow::Error {
     if error.is_timeout() {
         anyhow::Error::new(error)
-            .context("provider total request timeout while reading response body")
+            .context("transient stream transport error: timeout while reading provider response body (request deadline or connection timeout)")
     } else {
         stream_chunk_err(error)
     }
@@ -712,6 +720,40 @@ fn assistant_blocks_for_context(blocks: &[Block], context_mode: ContextMode) -> 
         redact_pseudo_tool_protocol_blocks(blocks)
     } else {
         blocks.to_vec()
+    }
+}
+
+#[derive(Default)]
+struct PartialStreamText {
+    text: String,
+    active_start: usize,
+    block_complete: bool,
+}
+
+impl PartialStreamText {
+    fn push_delta(&mut self, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        if self.block_complete {
+            self.text.push_str("\n\n");
+            self.active_start = self.text.len();
+            self.block_complete = false;
+        }
+        self.text.push_str(delta);
+    }
+
+    fn complete_block(&mut self, full: &str) {
+        if self.block_complete {
+            if full.is_empty() {
+                return;
+            }
+            self.text.push_str("\n\n");
+            self.active_start = self.text.len();
+        }
+        self.text.truncate(self.active_start);
+        self.text.push_str(full);
+        self.block_complete = true;
     }
 }
 
@@ -2690,6 +2732,10 @@ fn anthropic_wire_messages(
         let mut content = Vec::new();
         let mut image_messages = Vec::new();
         for block in &message.content {
+            if let Block::PartialStream { text } = block {
+                content.push(json!({"type": "text", "text": text}));
+                continue;
+            }
             let Some((reference, disclosure_target)) = block_image_reference(block) else {
                 content.push(
                     serde_json::to_value(block)
@@ -13935,7 +13981,7 @@ struct Agent {
     suppress_checkpoints: bool,
     last_checkpoint_at: Option<std::time::Instant>,
     session_model_pins: HashMap<String, String>,
-    partial_stream_text: Option<String>,
+    partial_stream_text: Option<PartialStreamText>,
     quiet_stream_events: bool,
     background: compaction::BackgroundState,
     compact_threshold_chars: Option<usize>,
@@ -19355,6 +19401,7 @@ impl Agent {
                             let plan = orchestrator::classify_http_failure(code, &text);
 
                             if matches!(code, 400 | 500)
+                                && stream_attempt < MAX_STREAM_ATTEMPTS
                                 && !provider_workaround_used
                                 && is_provider_tool_result_id_bug(&text)
                                 && self.rewrite_latest_tool_results_as_text_fallback()
@@ -19373,6 +19420,7 @@ impl Agent {
                             }
 
                             if !context_overflow_compact_attempted
+                                && stream_attempt < MAX_STREAM_ATTEMPTS
                                 && matches!(code, 400 | 413)
                                 && orchestrator::stream_error_is_context_overflow(&text)
                             {
@@ -19490,14 +19538,18 @@ impl Agent {
                         break 'stream_retry ParsedProviderStream::stopped("runtime_control");
                     }
                     Err(e) => {
+                        if self.interrupt.load(Ordering::SeqCst) {
+                            return Err(e);
+                        }
                         let body = stream_error_body(&e);
                         self.record_provider_stream_failure(&body);
                         let plan = orchestrator::classify_stream_error(&body);
                         let visible_text_streamed = self
                             .partial_stream_text
-                            .as_deref()
-                            .is_some_and(|text| !text.is_empty());
+                            .as_ref()
+                            .is_some_and(|partial| !partial.text.is_empty());
                         if !context_overflow_compact_attempted
+                            && stream_attempt < MAX_STREAM_ATTEMPTS
                             && !visible_text_streamed
                             && orchestrator::stream_error_is_context_overflow(&body)
                         {
@@ -19507,6 +19559,7 @@ impl Agent {
                             }
                         }
                         if !malformed_tool_call_recovery_attempted
+                            && stream_attempt < MAX_STREAM_ATTEMPTS
                             && !visible_text_streamed
                             && malformed_responses_tool_arguments_error(
                                 self.request_contract(),
@@ -19539,16 +19592,23 @@ impl Agent {
                             self.partial_stream_text = None;
                             continue 'stream_retry;
                         }
-                        if plan.retry
-                            && !visible_text_streamed
-                            && stream_attempt < MAX_STREAM_ATTEMPTS
-                        {
+                        let partial_preserved = self.preserve_interrupted_stream();
+                        if plan.retry && stream_attempt < MAX_STREAM_ATTEMPTS {
+                            if partial_preserved {
+                                self.history.push(Message {
+                                    role: "user".to_string(),
+                                    content: vec![Block::Text {
+                                        text: "[runtime-note] The provider stream was interrupted. The preceding partial response is incomplete, not a completed answer. No tool calls from that failed response were executed. Earlier completed tool results remain valid. Continue from the saved history without repeating completed work or analysis; make the next concise tool call or finish the answer.".to_string(),
+                                    }],
+                                });
+                                self.checkpoint_latest_session("after_stream_continuation_note");
+                            }
                             let wait = jittered_backoff_secs(1u64 << (stream_attempt - 1));
                             self.append_latest_log(
                                 "stream_retry",
                                 &format!(
-                                    "attempt={stream_attempt} kind={} wait={wait}s body={body}",
-                                    plan.label()
+                                    "attempt={stream_attempt} kind={} route={}/{} contract={} partial_preserved={partial_preserved} wait={wait}s body={body}",
+                                    plan.label(), self.provider_id, self.model, self.request_contract().as_str()
                                 ),
                             );
                             last_retry_reason = Some(format!("{} stream error", plan.label()));
@@ -19567,33 +19627,17 @@ impl Agent {
                             }
                             continue 'stream_retry;
                         }
-                        if self.request_contract().is_responses() {
-                            let partial_blocks = self.partial_chatgpt_stream_blocks();
-                            if maybe_preserve_partial_stream(
-                                &partial_blocks,
-                                &mut self.history,
-                                self.context_mode,
-                            ) {
-                                self.checkpoint_latest_session("after_partial_stream_preserve");
-                                self.sink.emit(AgentEvent::Warn(
-                                    "provider closed the stream after partial text; preserved partial response instead of replaying the same turn".to_string(),
-                                ));
-                                break 'stream_retry ParsedProviderStream {
-                                    blocks: partial_blocks,
-                                    stop_reason: Some("partial_stream_eof".to_string()),
-                                    usage: Usage::default(),
-                                    unfinished_tool_calls: 0,
-                                };
-                            }
-                        }
                         self.append_latest_log(
                             "stream_error",
-                            &format!("kind={} {body}", plan.label()),
+                            &format!(
+                                "kind={} route={}/{} contract={} attempts={stream_attempt} partial_preserved={partial_preserved} {body}",
+                                plan.label(), self.provider_id, self.model, self.request_contract().as_str()
+                            ),
                         );
                         if plan.retry {
                             return Err(e.context(format!(
-                                "{} stream error after {stream_attempt} attempts; provider/upstream kept returning retryable SSE errors",
-                                plan.label()
+                                "Provider stream retry budget exhausted after {stream_attempt} attempts on {}/{}. Interrupted tool calls were not executed. Retry with `continue` or select another route with /provider or /model",
+                                self.provider_id, self.model
                             )));
                         }
                         return Err(e);
@@ -20252,19 +20296,30 @@ impl Agent {
     }
 
     fn emit_stream_updates(&mut self, updates: Vec<streaming::StreamUpdate>) {
-        if self.quiet_stream_events {
-            return;
-        }
         for update in updates {
+            if let streaming::StreamUpdate::TextDelta(text) = &update {
+                self.partial_stream_text
+                    .get_or_insert_with(PartialStreamText::default)
+                    .push_delta(text);
+            } else if let streaming::StreamUpdate::TextBlockComplete(text) = &update {
+                self.partial_stream_text
+                    .get_or_insert_with(PartialStreamText::default)
+                    .complete_block(text);
+            } else if matches!(update, streaming::StreamUpdate::TextPreviewDiscarded) {
+                self.partial_stream_text = None;
+            }
+            if self.quiet_stream_events {
+                continue;
+            }
             match update {
                 streaming::StreamUpdate::TextDelta(text) => {
-                    self.partial_stream_text
-                        .get_or_insert_with(String::new)
-                        .push_str(&text);
                     self.sink.emit(AgentEvent::TextDelta(text));
                 }
                 streaming::StreamUpdate::TextBlockComplete(text) => {
                     self.sink.emit(AgentEvent::TextBlockComplete(text));
+                }
+                streaming::StreamUpdate::TextPreviewDiscarded => {
+                    self.sink.emit(AgentEvent::TextBlockComplete(String::new()));
                 }
                 streaming::StreamUpdate::ThinkingDelta(text) => {
                     self.sink.emit(AgentEvent::ThinkingDelta(text));
@@ -20289,16 +20344,38 @@ impl Agent {
             .await
     }
 
-    fn partial_chatgpt_stream_blocks(&mut self) -> Vec<Block> {
-        let mut blocks = Vec::new();
-        let text = self.partial_stream_text.take().unwrap_or_default();
-        let text = text.trim_end();
-        if !text.is_empty() {
-            blocks.push(Block::PartialStream {
-                text: format!("{text}\n\n[stream ended early; preserved partial response]"),
-            });
+    fn preserve_interrupted_stream(&mut self) -> bool {
+        let partial = self.partial_stream_text.take().unwrap_or_default();
+        if partial.text.trim().is_empty() {
+            return false;
         }
-        blocks
+        // A failed parser never releases tool calls or reasoning for replay.
+        const MARKER: &str = "[stream interrupted; incomplete response]";
+        let text = format!("{}\n\n{MARKER}", partial.text.trim_end());
+        let blocks = [Block::PartialStream { text }];
+        if !maybe_preserve_partial_stream(&blocks, &mut self.history, self.context_mode) {
+            return false;
+        }
+        self.checkpoint_latest_session("after_partial_stream_preserve");
+        if !self.quiet_stream_events {
+            let tail = if partial.block_complete {
+                ""
+            } else {
+                partial.text[partial.active_start..].trim_end()
+            };
+            let display = if tail.is_empty() {
+                MARKER.to_string()
+            } else {
+                format!("{tail}\n\n{MARKER}")
+            };
+            self.sink.emit(AgentEvent::ThinkingPreviewDiscarded);
+            self.sink.emit(AgentEvent::TextBlockComplete(display));
+            self.sink.emit(AgentEvent::ThinkingPreviewCommitted);
+            self.sink.emit(AgentEvent::Warn(
+                "[provider stream interrupted] Partial response retained as incomplete; no calls from the failed response were executed.".to_string(),
+            ));
+        }
+        true
     }
 
     async fn read_stream_responses(

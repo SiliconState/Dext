@@ -8657,16 +8657,27 @@ fn line_to_text(item: &Line_, width: u16) -> Text<'static> {
             } else {
                 sanitized
             };
-            lines.push(Line::from(vec![
-                Span::styled("⚠ ", Style::default().fg(Color::Yellow)),
-                Span::styled(friendlier, Style::default().fg(Color::Yellow)),
-            ]));
+            for (index, seg) in friendlier.split('\n').enumerate() {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        if index == 0 { "⚠ " } else { "  " },
+                        Style::default().fg(Color::Yellow),
+                    ),
+                    Span::styled(seg.to_string(), Style::default().fg(Color::Yellow)),
+                ]));
+            }
         }
         Line_::Error(s) => {
-            lines.push(Line::from(vec![
-                Span::styled("✗ ", Style::default().fg(Color::Red)),
-                Span::styled(sanitize_display_text(s), Style::default().fg(Color::Red)),
-            ]));
+            let sanitized = sanitize_display_text(s);
+            for (index, seg) in sanitized.split('\n').enumerate() {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        if index == 0 { "✗ " } else { "  " },
+                        Style::default().fg(Color::Red),
+                    ),
+                    Span::styled(seg.to_string(), Style::default().fg(Color::Red)),
+                ]));
+            }
         }
         Line_::Retry(s) => {
             lines.push(Line::from(vec![
@@ -16231,6 +16242,102 @@ mod tests {
                     .all(|thinking| thinking.deferred_source.is_none())
             );
             assert!(state.active_answer.is_none());
+        }
+    }
+
+    #[test]
+    fn provider_diagnostics_keep_logical_newlines() {
+        let diagnostic =
+            "HTTP 503: remote connection failure\nProvider retry budget exhausted after 6 attempts";
+        for (item, marker) in [
+            (Line_::Error(diagnostic.into()), "✗ "),
+            (Line_::Warn(diagnostic.into()), "⚠ "),
+        ] {
+            for width in [20, 80, 160] {
+                let text = line_to_text(&item, width);
+                assert_eq!(text.lines.len(), 2);
+                assert_eq!(
+                    rendered_line_text(&text.lines[0]),
+                    format!("{marker}HTTP 503: remote connection failure")
+                );
+                assert_eq!(
+                    rendered_line_text(&text.lines[1]),
+                    "  Provider retry budget exhausted after 6 attempts"
+                );
+                assert!(
+                    text.lines
+                        .iter()
+                        .all(|line| !rendered_line_text(line).contains('\n'))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stream_recovery_commits_labeled_partial_before_retry_and_next_answer() {
+        let mut state = answer_test_state();
+        state.verbose = true;
+        state.apply_event(AgentEvent::ThinkingDelta("Unaccepted thought".into()));
+        state.apply_event(AgentEvent::TextDelta("Partial draft".into()));
+        state.apply_event(AgentEvent::ThinkingPreviewDiscarded);
+        let partial = "Partial draft\n\n[stream interrupted; incomplete response]";
+        state.apply_event(AgentEvent::TextBlockComplete(partial.into()));
+        state.apply_event(AgentEvent::ThinkingPreviewCommitted);
+        state.apply_event(AgentEvent::HttpRetry {
+            attempt: 1,
+            wait_secs: 1,
+            reason: "transient stream error".into(),
+        });
+        state.apply_event(AgentEvent::ThinkingPreviewDiscarded);
+        assert_eq!(answer_parts(&state), partial);
+        state.apply_event(AgentEvent::TextDelta("Recovered.".into()));
+        state.apply_event(AgentEvent::TextBlockComplete("Recovered.".into()));
+        state.apply_event(AgentEvent::ThinkingPreviewCommitted);
+        let answer = answer_parts(&state);
+        assert_eq!(answer.matches("Partial draft").count(), 1);
+        assert_eq!(
+            answer
+                .matches("[stream interrupted; incomplete response]")
+                .count(),
+            1
+        );
+        assert_eq!(answer.matches("Recovered.").count(), 1);
+    }
+
+    #[test]
+    fn stream_recovery_retains_completed_blocks_without_reemitting_them() {
+        for with_tail in [false, true] {
+            let mut state = answer_test_state();
+            for text in ["First completed block", "Second completed block"] {
+                state.apply_event(AgentEvent::TextDelta(text.into()));
+                state.apply_event(AgentEvent::TextBlockComplete(text.into()));
+            }
+            if with_tail {
+                state.apply_event(AgentEvent::TextDelta("Open tail".into()));
+            }
+            state.apply_event(AgentEvent::ThinkingPreviewDiscarded);
+            state.apply_event(AgentEvent::TextBlockComplete(if with_tail {
+                "Open tail\n\n[stream interrupted; incomplete response]".into()
+            } else {
+                "[stream interrupted; incomplete response]".into()
+            }));
+            state.apply_event(AgentEvent::ThinkingPreviewCommitted);
+            state.apply_event(AgentEvent::HttpRetry {
+                attempt: 1,
+                wait_secs: 1,
+                reason: "transient stream error".into(),
+            });
+            state.apply_event(AgentEvent::ThinkingPreviewDiscarded);
+            let answer = answer_parts(&state);
+            assert_eq!(answer.matches("First completed block").count(), 1);
+            assert_eq!(answer.matches("Second completed block").count(), 1);
+            assert_eq!(answer.matches("Open tail").count(), usize::from(with_tail));
+            assert_eq!(
+                answer
+                    .matches("[stream interrupted; incomplete response]")
+                    .count(),
+                1
+            );
         }
     }
 

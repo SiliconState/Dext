@@ -22,6 +22,7 @@ pub(crate) fn sse_event_cap(contract: RequestContract) -> usize {
 pub(crate) enum StreamUpdate {
     TextDelta(String),
     TextBlockComplete(String),
+    TextPreviewDiscarded,
     ThinkingDelta(String),
     ThinkingBlockComplete(String),
     ThinkingPreviewDiscarded,
@@ -81,6 +82,7 @@ struct OpenAiState {
     usage: Usage,
     unknown_events: usize,
     preserve_timing_cache: bool,
+    done: bool,
 }
 
 #[derive(Default)]
@@ -210,6 +212,28 @@ fn bounded_provider_message(raw: &str) -> String {
         message.push('…');
     }
     message
+}
+
+fn provider_stream_error(
+    contract: RequestContract,
+    error: &serde_json::Map<String, Value>,
+) -> anyhow::Error {
+    let mut detail = serde_json::Map::new();
+    for field in ["type", "code", "message"] {
+        if let Some(value) = error.get(field).and_then(Value::as_str) {
+            let value = if field == "message" {
+                bounded_provider_message(value)
+            } else {
+                bounded_label(value)
+            };
+            detail.insert(field.to_string(), Value::String(value));
+        }
+    }
+    anyhow!(
+        "provider stream error [{}]: {}",
+        contract.as_str(),
+        Value::Object(detail)
+    )
 }
 
 fn object<'a>(
@@ -374,7 +398,13 @@ fn parse_anthropic_frame(
         .get("type")
         .map(|value| string(contract, hint, value, "type"))
         .transpose()?;
-    let event = frame.event.as_deref().or(payload_type).unwrap_or("unknown");
+    let event = frame.event.as_deref().or(payload_type).unwrap_or_else(|| {
+        if data_object.contains_key("error") {
+            "error"
+        } else {
+            "unknown"
+        }
+    });
     if let (Some(frame_event), Some(payload_type)) = (frame.event.as_deref(), payload_type)
         && frame_event != payload_type
     {
@@ -508,11 +538,18 @@ fn parse_anthropic_frame(
                 }
                 _ => {}
             }
-            let initial_thinking =
-                (block.kind == "thinking" && !block.text.is_empty()).then(|| block.text.clone());
+            let initial_update = match block.kind.as_str() {
+                "thinking" if !block.text.is_empty() => {
+                    Some(StreamUpdate::ThinkingDelta(block.text.clone()))
+                }
+                "text" if !block.text.is_empty() => {
+                    Some(StreamUpdate::TextDelta(block.text.clone()))
+                }
+                _ => None,
+            };
             state.blocks.insert(idx, block);
-            if let Some(text) = initial_thinking {
-                return Ok(vec![StreamUpdate::ThinkingDelta(text)]);
+            if let Some(update) = initial_update {
+                return Ok(vec![update]);
             }
         }
         "content_block_delta" => {
@@ -704,14 +741,12 @@ fn parse_anthropic_frame(
             return Ok(updates);
         }
         "error" => {
-            let error_type = data
-                .pointer("/error/type")
-                .and_then(Value::as_str)
-                .unwrap_or("provider_error");
-            return Err(anyhow!(
-                "provider stream error [{}]: {}",
-                contract.as_str(),
-                bounded_label(error_type)
+            let error = data_object
+                .get("error")
+                .ok_or_else(|| protocol_error(contract, event, "missing error"))?;
+            return Err(provider_stream_error(
+                contract,
+                object(contract, event, error, "error")?,
             ));
         }
         _ => state.unknown_events = state.unknown_events.saturating_add(1),
@@ -843,22 +878,21 @@ fn parse_openai_frame(
         return Ok(Vec::new());
     };
     if data_str.trim() == "[DONE]" {
+        state.done = true;
         return Ok(Vec::new());
+    }
+    if state.done {
+        return Err(protocol_error(
+            contract,
+            "chunk",
+            "payload event arrived after stream completion",
+        ));
     }
     let data = parse_json_data(contract, "chunk", &data_str)?;
     let data_object = object(contract, "chunk", &data, "chunk")?;
     if let Some(error) = data_object.get("error") {
         let error = object(contract, "error", error, "error")?;
-        let code = error
-            .get("code")
-            .and_then(Value::as_str)
-            .or_else(|| error.get("type").and_then(Value::as_str))
-            .unwrap_or("provider_error");
-        return Err(anyhow!(
-            "provider stream error [{}]: {}",
-            contract.as_str(),
-            bounded_label(code)
-        ));
+        return Err(provider_stream_error(contract, error));
     }
     let mut recognized = false;
     let mut updates = Vec::new();
@@ -963,6 +997,13 @@ fn parse_openai_frame(
 }
 
 fn finish_openai(contract: RequestContract, state: OpenAiState) -> Result<ParsedStream> {
+    if !state.done && state.stop_reason.is_none() {
+        return Err(protocol_error(
+            contract,
+            "finalize",
+            "unexpected EOF before finish_reason or [DONE]; function calls were not accepted",
+        ));
+    }
     let mut blocks = Vec::new();
     if !state.reasoning.is_empty() {
         blocks.push(Block::Thinking {
@@ -1526,7 +1567,7 @@ fn parse_chatgpt_frame(
                 {
                     state.text.clear();
                     state.text_in_progress = false;
-                    updates.push(StreamUpdate::TextBlockComplete(String::new()));
+                    updates.push(StreamUpdate::TextPreviewDiscarded);
                 }
                 let discard_thinking_preview = state.reasoning_in_progress
                     || (discard_all_response_content && !state.reasoning.is_empty());
@@ -2368,6 +2409,12 @@ mod tests {
                     })
                     .unwrap();
                 assert!(parser.push_frame(null_frame()).unwrap().is_empty());
+                parser
+                    .push_frame(SseFrame {
+                        event: None,
+                        data: Some("[DONE]".into()),
+                    })
+                    .unwrap();
                 let known = parser.known_usage();
                 assert_eq!(known.input, 11);
                 assert_eq!(known.cache_read, 6);
@@ -2398,6 +2445,84 @@ mod tests {
                 .to_string();
             assert!(error.contains("usage must be an object"), "{error}");
             assert!(!error.contains("invalid-usage"), "{error}");
+        }
+    }
+
+    #[test]
+    fn openai_requires_completion_before_accepting_text_or_calls() {
+        let contract = RequestContract::OpenAiChatCompletions;
+        for payload in [
+            serde_json::json!({"content":"partial"}),
+            serde_json::json!({"tool_calls":[{"index":0,"id":"call_1","function":{"name":"write_file","arguments":"{}"}}]}),
+        ] {
+            for terminal in [None, Some("done"), Some("finish_reason")] {
+                let mut parser = ProviderStreamParser::new(contract, false);
+                parser
+                    .push_frame(SseFrame {
+                        event: None,
+                        data: Some(
+                            serde_json::json!({"choices":[{"delta":payload,"finish_reason":null}]})
+                                .to_string(),
+                        ),
+                    })
+                    .unwrap();
+                if let Some(terminal) = terminal {
+                    let data = if terminal == "done" {
+                        "[DONE]".to_string()
+                    } else {
+                        serde_json::json!({"choices":[{"delta":{},"finish_reason":"stop"}]})
+                            .to_string()
+                    };
+                    parser
+                        .push_frame(SseFrame {
+                            event: None,
+                            data: Some(data),
+                        })
+                        .unwrap();
+                    assert_eq!(parser.finish().unwrap().blocks.len(), 1);
+                } else {
+                    let error = parser.finish().unwrap_err().to_string();
+                    assert!(
+                        error.contains("unexpected EOF before finish_reason or [DONE]"),
+                        "{error}"
+                    );
+                    assert!(crate::orchestrator::classify_stream_error(&error).retry);
+                }
+            }
+        }
+        let mut parser = ProviderStreamParser::new(contract, false);
+        parser
+            .push_frame(SseFrame {
+                event: None,
+                data: Some("[DONE]".into()),
+            })
+            .unwrap();
+        let error = parser
+            .push_frame(SseFrame {
+                event: None,
+                data: Some(
+                    r#"{"choices":[{"delta":{"content":"late"},"finish_reason":null}]}"#.into(),
+                ),
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("payload event arrived after stream completion"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn responses_discarded_terminal_text_has_explicit_buffer_reset() {
+        for contract in [
+            RequestContract::OpenAiResponses,
+            RequestContract::ChatGptResponses,
+        ] {
+            let mut parser = ProviderStreamParser::new(contract, false);
+            parser.push_frame(SseFrame { event: None, data: Some(serde_json::json!({"type":"response.output_text.delta","delta":"discarded draft"}).to_string()) }).unwrap();
+            let updates = parser.push_frame(SseFrame { event: None, data: Some(serde_json::json!({"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"content_filter"},"output":[]}}).to_string()) }).unwrap();
+            assert_eq!(updates, [StreamUpdate::TextPreviewDiscarded]);
+            assert!(parser.finish().unwrap().blocks.is_empty());
         }
     }
 
@@ -2839,6 +2964,52 @@ mod tests {
             })
             .unwrap();
         assert!(chatgpt.finish().unwrap().blocks.is_empty());
+    }
+
+    #[test]
+    fn compatible_stream_errors_retain_bounded_classification_fields() {
+        for contract in [
+            RequestContract::AnthropicMessages,
+            RequestContract::OpenAiChatCompletions,
+        ] {
+            for (code, message, retry) in [
+                ("1234", "Internal network failure", true),
+                ("9999", "unrecognized failure", true),
+                ("invalid_api_key", "try again", false),
+                ("usage_limit_reached", "quota exhausted", false),
+                ("invalid_request_error", "invalid request; try again", false),
+                ("permission_error", "try again later", false),
+                ("insufficient_quota", "try again later", false),
+            ] {
+                let mut parser = ProviderStreamParser::new(contract, false);
+                let error = parser
+                    .push_frame(SseFrame {
+                        event: None,
+                        data: Some(
+                            serde_json::json!({"error":{"code":code,"message":message}})
+                                .to_string(),
+                        ),
+                    })
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains(code), "{error}");
+                assert_eq!(
+                    crate::orchestrator::classify_stream_error(&error).retry,
+                    retry,
+                    "{error}"
+                );
+            }
+            let mut parser = ProviderStreamParser::new(contract, false);
+            let error = parser.push_frame(SseFrame {
+                event: None,
+                data: Some(serde_json::json!({"error":{
+                    "code":"1234", "message":"\u{1b}\n".repeat(2000), "untrusted_extra":"not retained"
+                }}).to_string()),
+            }).unwrap_err().to_string();
+            assert!(error.len() < 800, "{}", error.len());
+            assert!(!error.contains("not retained"));
+            assert!(!error.contains('\u{1b}'));
+        }
     }
 
     #[test]

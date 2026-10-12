@@ -6319,8 +6319,27 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn oauth_callback_completion_drop_keeps_success_and_releases_listener() -> Result<()> {
+    #[tokio::test]
+    async fn oauth_callback_completion_drop_keeps_success_and_releases_listener() -> Result<()> {
+        const CHILD: &str = "DEXT_TEST_OAUTH_CALLBACK_LIFECYCLE";
+        if std::env::var_os(CHILD).is_none() {
+            // Isolate the close probe from concurrent socket reuse and forked descriptors.
+            let mut command = tokio::process::Command::new(std::env::current_exe()?);
+            command
+                .args(["--exact", "provider::tests::oauth_callback_completion_drop_keeps_success_and_releases_listener", "--nocapture"])
+                .env(CHILD, "1")
+                .kill_on_drop(true);
+            let output = tokio::time::timeout(Duration::from_secs(20), command.output())
+                .await
+                .context("callback lifecycle child timed out")??;
+            anyhow::ensure!(
+                output.status.success(),
+                "callback lifecycle child failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return Ok(());
+        }
         let occupied = std::net::TcpListener::bind("127.0.0.1:0")?;
         let preferred = occupied.local_addr()?.port();
         let redirect = format!("http://localhost:{preferred}/callback");
