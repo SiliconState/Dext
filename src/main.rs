@@ -18711,8 +18711,9 @@ impl Agent {
         }
         let mut builder = self
             .provider_post(provider_request_url(&self.base_url, contract))?
-            .header("content-type", "application/json")
-            .body(bytes);
+            .header("content-type", "application/json");
+        let body = provider::ProviderRequestBody::encode(contract, bytes, &self.interrupt)?;
+        builder = body.apply(builder);
         if contract.is_responses() {
             builder = builder.header("accept", "text/event-stream");
         }
@@ -19311,6 +19312,22 @@ impl Agent {
                     chatgpt_session_id.as_deref().unwrap_or("dext"),
                     request_effort_override,
                 )?;
+                let req_body = provider::ProviderRequestBody::encode(
+                    self.request_contract(),
+                    req_body,
+                    &self.interrupt,
+                )?;
+                if req_body.gzip {
+                    self.append_latest_log(
+                        "provider_request_encoding",
+                        &format!(
+                            "contract={} encoding=gzip json_bytes={} wire_bytes={}",
+                            self.request_contract().as_str(),
+                            req_body.json_bytes,
+                            req_body.bytes.len()
+                        ),
+                    );
+                }
                 stream_attempt += 1;
                 if stream_attempt > 1 && !self.quiet_stream_events {
                     self.sink.emit(AgentEvent::ThinkingPreviewDiscarded);
@@ -19336,7 +19353,7 @@ impl Agent {
                         chatgpt_session_id.as_deref()
                     };
                     let req = apply_provider_headers(
-                        builder.body(req_body.clone()),
+                        req_body.apply(builder),
                         self.request_contract(),
                         &self.api_key,
                         self.provider_profile.as_ref().is_some_and(|profile| {

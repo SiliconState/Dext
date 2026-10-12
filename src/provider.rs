@@ -2876,6 +2876,74 @@ pub(crate) fn provider_request_url(base_url: &str, contract: RequestContract) ->
     }
 }
 
+pub(crate) const CHATGPT_REQUEST_WIRE_LIMIT: usize = 1024 * 1024;
+
+pub(crate) struct ProviderRequestBody {
+    pub(crate) bytes: bytes::Bytes,
+    pub(crate) json_bytes: usize,
+    pub(crate) gzip: bool,
+}
+
+impl ProviderRequestBody {
+    pub(crate) fn encode(
+        contract: RequestContract,
+        json: Vec<u8>,
+        interrupt: &std::sync::atomic::AtomicBool,
+    ) -> Result<Self> {
+        let interrupted = || {
+            if interrupt.load(std::sync::atomic::Ordering::Relaxed) {
+                anyhow::bail!("interrupted by user during provider request encoding");
+            }
+            Ok(())
+        };
+        interrupted()?;
+        let json_bytes = json.len();
+        if contract != RequestContract::ChatGptResponses || json_bytes <= CHATGPT_REQUEST_WIRE_LIMIT
+        {
+            return Ok(Self {
+                bytes: json.into(),
+                json_bytes,
+                gzip: false,
+            });
+        }
+        // The Codex edge returns an upstream 503 for wire bodies over 1 MiB,
+        // including whitespace-only padding. Compress without changing JSON.
+        let check_size = |size: usize| {
+            if size > CHATGPT_REQUEST_WIRE_LIMIT {
+                anyhow::bail!(
+                    "ChatGPT request exceeds the {CHATGPT_REQUEST_WIRE_LIMIT}-byte wire limit even with gzip (JSON: {json_bytes} bytes). No request was sent. Use /compact or send fewer/smaller images; restarting or retrying the same history will not reduce its size."
+                );
+            }
+            Ok(())
+        };
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        for chunk in json.chunks(64 * 1024) {
+            interrupted()?;
+            encoder
+                .write_all(chunk)
+                .context("encoding ChatGPT request as gzip")?;
+            check_size(encoder.get_ref().len())?;
+        }
+        let bytes = encoder.finish().context("finishing ChatGPT request gzip")?;
+        interrupted()?;
+        check_size(bytes.len())?;
+        Ok(Self {
+            bytes: bytes.into(),
+            json_bytes,
+            gzip: true,
+        })
+    }
+
+    pub(crate) fn apply(&self, request: RequestBuilder) -> RequestBuilder {
+        let request = if self.gzip {
+            request.header(reqwest::header::CONTENT_ENCODING, "gzip")
+        } else {
+            request
+        };
+        request.body(self.bytes.clone())
+    }
+}
+
 pub(crate) fn normalize_chatgpt_model_slug(model: &str) -> String {
     let trimmed = model.trim();
     if trimmed.is_empty() {
@@ -6133,6 +6201,122 @@ mod tests {
         ));
         std::fs::create_dir_all(&path).expect("create temp home");
         path
+    }
+
+    #[test]
+    fn provider_request_encoding_preserves_plain_boundaries_and_other_contracts() -> Result<()> {
+        let interrupt = std::sync::atomic::AtomicBool::new(false);
+        let client = reqwest::Client::new();
+        for (contract, size) in [
+            (RequestContract::ChatGptResponses, 0),
+            (
+                RequestContract::ChatGptResponses,
+                CHATGPT_REQUEST_WIRE_LIMIT,
+            ),
+            (
+                RequestContract::OpenAiResponses,
+                CHATGPT_REQUEST_WIRE_LIMIT + 1,
+            ),
+            (
+                RequestContract::OpenAiChatCompletions,
+                CHATGPT_REQUEST_WIRE_LIMIT + 1,
+            ),
+            (
+                RequestContract::AnthropicMessages,
+                CHATGPT_REQUEST_WIRE_LIMIT + 1,
+            ),
+        ] {
+            let json = vec![b' '; size];
+            let body = ProviderRequestBody::encode(contract, json.clone(), &interrupt)?;
+            assert!(!body.gzip);
+            assert_eq!(body.json_bytes, size);
+            assert_eq!(body.bytes.as_ref(), json);
+            let request = body
+                .apply(client.post("http://localhost/responses"))
+                .build()?;
+            assert!(
+                request
+                    .headers()
+                    .get(reqwest::header::CONTENT_ENCODING)
+                    .is_none()
+            );
+            assert_eq!(
+                request.body().and_then(reqwest::Body::as_bytes),
+                Some(json.as_slice())
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn provider_request_encoding_gzip_is_lossless_and_reused() -> Result<()> {
+        let interrupt = std::sync::atomic::AtomicBool::new(false);
+        let mut json = serde_json::to_vec(&json!({"text": "λ\\n\"\\".repeat(180_000)}))?;
+        json.resize(json.len().max(CHATGPT_REQUEST_WIRE_LIMIT + 1), b' ');
+        let body = ProviderRequestBody::encode(
+            RequestContract::ChatGptResponses,
+            json.clone(),
+            &interrupt,
+        )?;
+        assert!(body.gzip);
+        assert_eq!(body.json_bytes, json.len());
+        assert!(body.bytes.len() <= CHATGPT_REQUEST_WIRE_LIMIT);
+        let mut decoded = Vec::new();
+        flate2::read::GzDecoder::new(body.bytes.as_ref()).read_to_end(&mut decoded)?;
+        assert_eq!(decoded, json);
+        let client = reqwest::Client::new();
+        for _ in 0..2 {
+            let request = body
+                .apply(client.post("http://localhost/responses"))
+                .build()?;
+            assert_eq!(request.headers()[reqwest::header::CONTENT_ENCODING], "gzip");
+            assert_eq!(
+                request.body().and_then(reqwest::Body::as_bytes),
+                Some(body.bytes.as_ref())
+            );
+        }
+        let again =
+            ProviderRequestBody::encode(RequestContract::ChatGptResponses, json, &interrupt)?;
+        assert_eq!(body.bytes, again.bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn provider_request_encoding_rejects_oversize_gzip_and_cancellation() {
+        let interrupt = std::sync::atomic::AtomicBool::new(false);
+        let mut seed = 0x42a7_391b_03d8_7ac9_u64;
+        let random: Vec<u8> = (0..2 * CHATGPT_REQUEST_WIRE_LIMIT)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed as u8
+            })
+            .collect();
+        let json = serde_json::to_vec(&json!({
+            "input": base64::engine::general_purpose::STANDARD.encode(random)
+        }))
+        .unwrap();
+        let error =
+            ProviderRequestBody::encode(RequestContract::ChatGptResponses, json, &interrupt)
+                .err()
+                .expect("incompressible body refused")
+                .to_string();
+        assert!(error.contains("wire limit even with gzip"), "{error}");
+        assert!(error.contains("No request was sent"), "{error}");
+        assert!(error.contains("/compact"), "{error}");
+        interrupt.store(true, std::sync::atomic::Ordering::Relaxed);
+        for size in [0, CHATGPT_REQUEST_WIRE_LIMIT + 1] {
+            let error = ProviderRequestBody::encode(
+                RequestContract::ChatGptResponses,
+                vec![b' '; size],
+                &interrupt,
+            )
+            .err()
+            .expect("cancelled encoding")
+            .to_string();
+            assert!(error.contains("interrupted by user"), "{error}");
+        }
     }
 
     #[test]

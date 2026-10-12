@@ -6983,13 +6983,28 @@ async fn assert_provider_http_retry_case(
     completes: bool,
     interrupted: bool,
 ) {
-    assert_provider_http_retry_contract_case(status, requests, completes, interrupted, false).await;
+    assert_provider_http_retry_contract_case(
+        status,
+        requests,
+        completes,
+        interrupted,
+        false,
+        false,
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn chatgpt_http_503_recovery_and_exhaustion_remain_bounded() {
-    assert_provider_http_retry_contract_case(503, 6, true, false, true).await;
-    assert_provider_http_retry_contract_case(503, 6, false, false, true).await;
+    assert_provider_http_retry_contract_case(503, 6, true, false, true, false).await;
+    assert_provider_http_retry_contract_case(503, 6, false, false, true, false).await;
+}
+
+#[tokio::test]
+async fn chatgpt_large_request_gzip_retries_preserve_body_and_history() {
+    assert_provider_http_retry_contract_case(503, 6, true, false, true, true).await;
+    assert_provider_http_retry_contract_case(503, 6, false, false, true, true).await;
+    assert_provider_http_retry_contract_case(503, 1, false, true, true, true).await;
 }
 
 async fn assert_provider_http_retry_contract_case(
@@ -6998,6 +7013,7 @@ async fn assert_provider_http_retry_contract_case(
     completes: bool,
     interrupted: bool,
     chatgpt: bool,
+    large_body: bool,
 ) {
     struct RetrySink {
         tx: tokio::sync::mpsc::UnboundedSender<AgentEvent>,
@@ -7040,6 +7056,13 @@ async fn assert_provider_http_retry_contract_case(
                 }
             };
             let headers = String::from_utf8_lossy(&request[..header_end]);
+            assert_eq!(
+                headers
+                    .lines()
+                    .any(|line| line.eq_ignore_ascii_case("content-encoding: gzip")),
+                large_body,
+                "{headers}"
+            );
             let content_length = headers
                 .lines()
                 .find_map(|line| {
@@ -7103,8 +7126,36 @@ async fn assert_provider_http_retry_contract_case(
         interrupt: agent.interrupt.clone(),
         interrupted,
     }));
-    let result = agent.chat("hello".to_string()).await;
+    agent.background.enabled = false;
+    agent.compact_threshold_chars = Some(usize::MAX);
+    let user_input = if large_body {
+        "synthetic λ \\\" result. ".repeat(60_000)
+    } else {
+        "hello".to_string()
+    };
+    let result = agent.chat(user_input.clone()).await;
     let bodies = server.join().expect("server thread");
+    if large_body {
+        let mut decoded = Vec::new();
+        flate2::read::GzDecoder::new(bodies[0].as_slice())
+            .read_to_end(&mut decoded)
+            .unwrap();
+        assert!(decoded.len() > provider::CHATGPT_REQUEST_WIRE_LIMIT);
+        let body: Value = serde_json::from_slice(&decoded).unwrap();
+        assert!(
+            body["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["content"][0]["text"] == user_input)
+        );
+        assert!(agent.history.iter().any(|message| {
+            message
+                .content
+                .iter()
+                .any(|block| matches!(block, Block::Text { text } if text == &user_input))
+        }));
+    }
     assert_eq!(result.is_ok(), completes, "{result:?}");
     if !completes {
         let error = result.unwrap_err().to_string();
@@ -33445,6 +33496,101 @@ fn chatgpt_summary_request_body_matches_current_responses_api_expectations() {
     assert!(body.get("reasoning").is_none(), "{body}");
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn chatgpt_large_summary_request_gzip_preserves_json_and_summary_cap() -> Result<()> {
+    let root = temp_test_dir("chatgpt-summary-gzip");
+    let _cleanup = RemoveDirOnDrop(root.clone());
+    let mut agent = test_agent(&root);
+    configure_stream_recovery_agent(&mut agent, RequestContract::ChatGptResponses);
+    let text = "synthetic old context";
+    let evidence = "synthetic summary λ \\\" data. ".repeat(60_000);
+    let old = vec![Message {
+        role: "user".to_string(),
+        content: vec![Block::Text {
+            text: text.to_string(),
+        }],
+    }];
+    let summary = agent.prepare_summary_request(&old, &evidence)?;
+    assert_eq!(summary.request.headers()["content-encoding"], "gzip");
+    let wire = summary
+        .request
+        .body()
+        .and_then(reqwest::Body::as_bytes)
+        .unwrap();
+    assert!(wire.len() <= provider::CHATGPT_REQUEST_WIRE_LIMIT);
+    let mut decoded = Vec::new();
+    flate2::read::GzDecoder::new(wire).read_to_end(&mut decoded)?;
+    assert!(decoded.len() > provider::CHATGPT_REQUEST_WIRE_LIMIT);
+    let body: Value = serde_json::from_slice(&decoded)?;
+    assert_eq!(body["tool_choice"], "none");
+    assert_eq!(body["parallel_tool_calls"], false);
+    assert!(
+        body["input"][0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains(text)
+    );
+    assert!(
+        body["input"][0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains(evidence.trim())
+    );
+    let small = agent.prepare_summary_request(&old, "small evidence")?;
+    assert!(small.request.headers().get("content-encoding").is_none());
+    let error = agent
+        .prepare_summary_request(&old, &"x".repeat(PROVIDER_JSON_BODY_CAP + 1))
+        .err()
+        .expect("summary JSON cap");
+    assert!(
+        error
+            .to_string()
+            .contains("summary request exceeded byte limit"),
+        "{error}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn chatgpt_oversize_compressed_request_is_not_sent_or_compacted() -> Result<()> {
+    let root = temp_test_dir("chatgpt-oversize-gzip");
+    let _cleanup = RemoveDirOnDrop(root.clone());
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let mut agent = test_agent(&root);
+    configure_stream_recovery_agent(&mut agent, RequestContract::ChatGptResponses);
+    agent.base_url = format!("http://{}", listener.local_addr()?);
+    agent.session_enabled = false;
+    agent.background.enabled = false;
+    agent.compact_threshold_chars = Some(usize::MAX);
+    let mut seed = 0x98c7_41a3_192d_068f_u64;
+    let random: Vec<u8> = (0..2 * provider::CHATGPT_REQUEST_WIRE_LIMIT)
+        .map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed as u8
+        })
+        .collect();
+    let text = base64::engine::general_purpose::STANDARD.encode(random);
+    let error = agent
+        .chat(text.clone())
+        .await
+        .expect_err("wire limit")
+        .to_string();
+    assert!(error.contains("wire limit even with gzip"), "{error}");
+    assert!(!error.contains("retry budget exhausted"), "{error}");
+    assert!(agent.history.iter().any(|message| {
+        message
+            .content
+            .iter()
+            .any(|block| matches!(block, Block::Text { text: actual } if actual == &text))
+    }));
+    assert!(
+        matches!(accept_test_connection(&listener, Duration::from_millis(100)), Err(error) if error.kind() == io::ErrorKind::TimedOut)
+    );
+    Ok(())
 }
 
 #[tokio::test(flavor = "current_thread")]
