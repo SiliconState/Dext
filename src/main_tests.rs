@@ -4873,6 +4873,122 @@ fn potential_login_secret_is_not_serialized_to_provider_request() {
 }
 
 #[cfg(unix)]
+#[tokio::test]
+async fn local_auth_console_pty_hides_secret_and_restores_echo() {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    for cancel in [false, true] {
+        let mut master = -1;
+        let mut slave = -1;
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+        let mut master = unsafe { std::fs::File::from_raw_fd(master) };
+        let slave = unsafe { std::fs::File::from_raw_fd(slave) };
+        for fd in [master.as_raw_fd(), slave.as_raw_fd()] {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            assert_ne!(flags, -1);
+            assert_ne!(
+                unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+                -1
+            );
+        }
+        let observer = slave.try_clone().unwrap();
+        let original = unsafe {
+            let mut settings: libc::termios = std::mem::zeroed();
+            assert_eq!(libc::tcgetattr(observer.as_raw_fd(), &mut settings), 0);
+            settings
+        };
+        let prompt = read_local_auth_secret_from_terminal(slave, "fixture prompt");
+        let driver = async {
+            let mut output = String::new();
+            loop {
+                let mut buf = [0u8; 256];
+                match master.read(&mut buf) {
+                    Ok(n) => output.push_str(&String::from_utf8_lossy(&buf[..n])),
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(e) => panic!("read pty: {e}"),
+                }
+                if output.contains("Password:") {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            let mut hidden: libc::termios = unsafe { std::mem::zeroed() };
+            assert_eq!(
+                unsafe { libc::tcgetattr(observer.as_raw_fd(), &mut hidden) },
+                0
+            );
+            assert_eq!(hidden.c_lflag & libc::ECHO, 0);
+            if cancel {
+                master.write_all(b"partial-password").unwrap();
+            } else {
+                master
+                    .write_all("pāss word\nleftover-password\n".as_bytes())
+                    .unwrap();
+            }
+            output
+        };
+        let (result, output) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(
+                tokio::time::timeout(std::time::Duration::from_millis(200), prompt),
+                driver
+            )
+        })
+        .await
+        .expect("pty bounded");
+        if cancel {
+            assert!(result.is_err());
+        } else {
+            assert!(
+                matches!(result.unwrap(), LocalAuthSecret::Secret(value) if value == "pāss word")
+            );
+        }
+        let mut restored: libc::termios = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::tcgetattr(observer.as_raw_fd(), &mut restored) },
+            0
+        );
+        assert_eq!(restored.c_lflag, original.c_lflag);
+        let mut tail = [0u8; 256];
+        let mut output = output;
+        while let Ok(n) = master.read(&mut tail) {
+            if n == 0 {
+                break;
+            }
+            output.push_str(&String::from_utf8_lossy(&tail[..n]));
+        }
+        assert!(!output.contains("pāss word"));
+        assert!(!output.contains("password"));
+        // Finishing a line after cancellation must not release the old secret.
+        master.write_all(b"\n").unwrap();
+        let mut observer = observer;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            match observer.read(&mut tail) {
+                Ok(n) => {
+                    assert_eq!(&tail[..n], b"\n");
+                    break;
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    assert!(tokio::time::Instant::now() < deadline);
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                Err(e) => panic!("read restored terminal: {e}"),
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
 #[test]
 fn sudo_askpass_script_reads_fifo_and_never_echoes_chat_guidance() {
     let script = sudo_askpass_script_content_with_paths(
@@ -4891,6 +5007,7 @@ fn sudo_askpass_script_reads_fifo_and_never_echoes_chat_guidance() {
     assert!(!script.contains("/dev/tty"), "{script}");
     assert!(!script.contains("chat/steering"), "{script}");
     assert!(script.contains("'\\''"), "{script}");
+    assert!(script.contains("cancel button \"Cancel\""), "{script}");
 }
 
 #[cfg(unix)]
@@ -5164,27 +5281,24 @@ fn clear_secret_string_zeroes_then_empties() {
 
 #[cfg(unix)]
 #[test]
-fn sudo_wrapper_prefix_uses_noninteractive_and_no_askpass_env() {
+fn sudo_wrapper_prefix_avoids_functions_and_askpass_when_preauth_done() {
     let auth = LocalSudoAuth {
         askpass: Some(PathBuf::from("/nonexistent/askpass.sh")),
         sudo_path: PathBuf::from("/usr/bin/sudo"),
         sudo_shim_dir: PathBuf::from("/tmp/dext-sudo/bin"),
+        prompt_requests: None,
         password_fifo: None,
-        password: None,
+        request_fifo: None,
         preauth_required: false,
     };
     let prefix = sudo_wrapper_prefix(&auth);
-    assert!(prefix.contains("-n \"$@\""), "{prefix}");
-    assert!(prefix.contains("sudo()"), "{prefix}");
-    assert!(prefix.contains("function /usr/bin/sudo"), "{prefix}");
+    assert!(prefix.is_empty(), "{prefix}");
     // After pre-auth, the wrapper must NOT export askpass env vars into the
     // bash child (pre-auth already established the sudo timestamp; leaking
     // askpass would risk re-prompting via the script's fallback paths).
     assert!(!prefix.contains("SUDO_ASKPASS"), "{prefix}");
     assert!(!prefix.contains("DEXT_SUDO_ASKPASS"), "{prefix}");
     assert!(!prefix.contains("DEXT_SUDO_PASSWORD_FIFO"), "{prefix}");
-    assert!(sudo_shell_function_name_is_safe("/usr/bin/sudo"));
-    assert!(!sudo_shell_function_name_is_safe("/tmp/sudo;evil"));
 }
 
 #[cfg(unix)]
@@ -5241,16 +5355,312 @@ fn sudo_command_shim_invokes_real_sudo_noninteractive_and_is_private() {
 #[cfg(unix)]
 #[tokio::test]
 async fn sudo_preauth_runs_inside_bash_session_before_noninteractive_sudo() {
+    run_sudo_prompt_fixture(
+        false,
+        vec![LocalAuthSecret::Secret("hunter2".into())],
+        1,
+        true,
+    )
+    .await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sudo_cached_auth_never_requests_password() {
+    run_sudo_prompt_fixture(true, vec![], 0, true).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sudo_rejected_password_gets_fresh_prompt() {
+    run_sudo_prompt_fixture(
+        false,
+        vec![
+            LocalAuthSecret::Secret("wrong".into()),
+            LocalAuthSecret::Secret("hunter2".into()),
+        ],
+        2,
+        true,
+    )
+    .await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sudo_cancel_does_not_run_payload_or_reprompt() {
+    run_sudo_prompt_fixture(false, vec![LocalAuthSecret::Canceled], 1, false).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sudo_retries_stop_at_three_without_running_payload() {
+    run_sudo_prompt_fixture(
+        false,
+        (0..3)
+            .map(|_| LocalAuthSecret::Secret("wrong".into()))
+            .collect(),
+        3,
+        false,
+    )
+    .await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sudo_unavailable_uses_desktop_helper_but_cancel_never_does() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = temp_test_dir("sudo-desktop-fallback");
+    let root = std::fs::canonicalize(root).unwrap();
+    let helper = root.join("desktop-helper");
+    let marker = root.join("called");
+    std::fs::write(
+        &helper,
+        format!(
+            "#!/bin/sh\nprintf called > {}\nprintf 'desktop-fixture\\n'\n",
+            shell_single_quote(&marker.to_string_lossy())
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let askpass = root.join("askpass.sh");
+    std::fs::write(
+        &askpass,
+        sudo_askpass_script_content_with_paths(
+            &helper.to_string_lossy(),
+            "/nonexistent",
+            "/nonexistent",
+        ),
+    )
+    .unwrap();
+    for canceled in [false, true] {
+        let _ = std::fs::remove_file(&marker);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let mut auth = LocalSudoAuth {
+            askpass: Some(askpass.clone()),
+            sudo_path: PathBuf::from("/nonexistent"),
+            sudo_shim_dir: root.join("bin"),
+            prompt_requests: Some(tx),
+            password_fifo: None,
+            request_fifo: None,
+            preauth_required: true,
+        };
+        let runtime = start_sudo_prompt_runtime(&mut auth).unwrap().unwrap();
+        let response_path = auth.password_fifo.as_ref().unwrap().clone();
+        let request_path = auth.request_fifo.as_ref().unwrap().clone();
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .arg(&askpass)
+            .env(SUDO_PASSWORD_FIFO_ENV, &response_path)
+            .env("DEXT_SUDO_REQUEST_FIFO", &request_path)
+            .kill_on_drop(true);
+        let driver = async {
+            let request = rx.recv().await.unwrap();
+            assert_eq!(request.attempt, 1);
+            let value = if canceled {
+                LocalAuthSecret::Canceled
+            } else {
+                LocalAuthSecret::Unavailable
+            };
+            assert!(request.response.send(SudoPromptResponse(value)).is_ok());
+        };
+        let (output, ()) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(command.output(), driver)
+        })
+        .await
+        .expect("askpass finishes");
+        let output = output.unwrap();
+        assert_eq!(output.status.success(), !canceled);
+        assert_eq!(marker.exists(), !canceled);
+        if canceled {
+            assert!(output.stdout.is_empty());
+        } else {
+            assert_eq!(output.stdout, b"desktop-fixture\n");
+        }
+        drop(runtime);
+        assert!(!response_path.exists());
+        assert!(!request_path.exists());
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sudo_drop_and_spawn_failure_remove_pipes_without_running_payload() {
+    use std::os::unix::fs::PermissionsExt;
+    for spawn_failure in [false, true] {
+        let root = std::fs::canonicalize(temp_test_dir("sudo-drop-cleanup")).unwrap();
+        let fake_sudo = root.join("fake-sudo");
+        std::fs::write(
+            &fake_sudo,
+            "#!/bin/sh\n[ \"$1\" = -A ] || exit 1\nexec \"$SUDO_ASKPASS\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_sudo, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let askpass = root.join("askpass.sh");
+        std::fs::write(&askpass, sudo_askpass_script_content()).unwrap();
+        std::fs::set_permissions(&askpass, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let auth = LocalSudoAuth {
+            askpass: Some(askpass),
+            sudo_path: fake_sudo,
+            sudo_shim_dir: root.join("bin"),
+            prompt_requests: Some(tx),
+            password_fifo: None,
+            request_fifo: None,
+            preauth_required: true,
+        };
+        let cwd = if spawn_failure {
+            root.join("missing")
+        } else {
+            root.clone()
+        };
+        let command = format!(
+            "printf unexpected > {}",
+            shell_single_quote(&root.join("payload").to_string_lossy())
+        );
+        let mut execution = Box::pin(execute_bash_async_prepared(
+            &command,
+            &cwd,
+            Arc::new(AtomicBool::new(false)),
+            std::time::Duration::from_secs(5),
+            Some(auth),
+            SandboxProfile::DangerFullAccess,
+            None,
+            &[],
+        ));
+        if spawn_failure {
+            assert!(execution.await.unwrap_err().contains("spawn failed"));
+            assert!(rx.try_recv().is_err());
+        } else {
+            let request = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                tokio::select! {
+                    result = &mut execution => panic!("unexpected completion: {result:?}"),
+                    request = rx.recv() => request.unwrap(),
+                }
+            })
+            .await
+            .expect("askpass requests input");
+            assert!(std::fs::read_dir(&root).unwrap().any(|entry| {
+                entry
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|ext| ext == "fifo")
+            }));
+            drop(execution);
+            assert!(
+                request
+                    .response
+                    .send(SudoPromptResponse(LocalAuthSecret::Canceled))
+                    .is_err()
+            );
+        }
+        assert!(!root.join("payload").exists());
+        assert!(std::fs::read_dir(&root).unwrap().all(|entry| {
+            entry
+                .unwrap()
+                .path()
+                .extension()
+                .is_none_or(|ext| ext != "fifo")
+        }));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sudo_invalid_secret_fails_closed() {
+    for secret in ["bad\nsecret".to_string(), "x".repeat(501), String::new()] {
+        run_sudo_prompt_fixture(false, vec![LocalAuthSecret::Secret(secret)], 1, false).await;
+    }
+}
+
+#[cfg(unix)]
+struct SudoTestSink {
+    responses: std::collections::VecDeque<LocalAuthSecret>,
+    prompts: usize,
+    wait: bool,
+    interrupt: Option<Arc<AtomicBool>>,
+}
+
+#[cfg(unix)]
+impl EventSink for SudoTestSink {
+    fn emit(&mut self, _: AgentEvent) {}
+    fn request_permission(&mut self, _: &str, _: &Value) -> Choice {
+        Choice::Deny
+    }
+    fn local_auth_prompt(&mut self, _: &str, _: &str) {}
+    fn request_local_auth_secret_async<'a>(
+        &'a mut self,
+        tool: &'a str,
+        message: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = LocalAuthSecret> + Send + 'a>> {
+        Box::pin(async move {
+            if self.wait {
+                self.prompts += 1;
+                if let Some(interrupt) = &self.interrupt {
+                    interrupt.store(true, Ordering::SeqCst);
+                }
+                std::future::pending().await
+            } else {
+                self.request_local_auth_secret(tool, message)
+            }
+        })
+    }
+    fn request_local_auth_secret(&mut self, _: &str, message: &str) -> LocalAuthSecret {
+        self.prompts += 1;
+        if self.prompts > 1 {
+            assert!(message.contains("again"));
+        }
+        self.responses
+            .pop_front()
+            .expect("unexpected password prompt")
+    }
+}
+
+#[cfg(unix)]
+async fn run_sudo_prompt_fixture(
+    cached: bool,
+    responses: Vec<LocalAuthSecret>,
+    prompts: usize,
+    success: bool,
+) {
+    run_sudo_prompt_fixture_with_abort(cached, responses, prompts, success, None).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sudo_timeout_while_prompt_open_reaps_and_cleans_pipes() {
+    run_sudo_prompt_fixture_with_abort(false, vec![], 1, false, Some(false)).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sudo_interrupt_while_prompt_open_reaps_and_cleans_pipes() {
+    run_sudo_prompt_fixture_with_abort(false, vec![], 1, false, Some(true)).await;
+}
+
+#[cfg(unix)]
+async fn run_sudo_prompt_fixture_with_abort(
+    cached: bool,
+    responses: Vec<LocalAuthSecret>,
+    prompts: usize,
+    success: bool,
+    abort: Option<bool>,
+) {
     let root = temp_test_dir("sudo-preauth-noninteractive");
     let root = std::fs::canonicalize(&root).expect("canonical temp dir");
     let fake_sudo = root.join("fake-sudo");
     let state_dir = root.join("sudo-state");
     std::fs::create_dir_all(&state_dir).expect("create sudo state dir");
+    if cached {
+        std::fs::write(state_dir.join("authenticated"), "").unwrap();
+    }
     let state_dir = shell_single_quote(&state_dir.to_string_lossy());
     std::fs::write(
         &fake_sudo,
         format!(
-            "#!/bin/sh\nset -eu\nstate_dir={state_dir}\nstate=\"$state_dir/authenticated\"\nif [ \"${{1:-}}\" = -n ] && [ \"${{2:-}}\" = -v ]; then\n  test -f \"$state\"\n  exit $?\nfi\nif [ \"${{1:-}}\" = -A ] && [ \"${{2:-}}\" = -v ]; then\n  ask=\"${{SUDO_ASKPASS:-}}\"\n  if [ -z \"$ask\" ]; then ask=\"${{DEXT_SUDO_ASKPASS:-}}\"; fi\n  [ -n \"$ask\" ] || exit 1\n  pass=$(\"$ask\" 'fake sudo prompt') || exit 1\n  [ \"$pass\" = hunter2 ] || exit 1\n  : > \"$state\"\n  exit 0\nfi\nwhile [ \"${{1:-}}\" = -n ]; do shift; done\nif [ -f \"$state\" ]; then exec \"$@\"; fi\nprintf '%s\\n' 'sudo: interactive authentication is required' >&2\nexit 1\n"
+            "#!/bin/sh\nset -eu\nstate_dir={state_dir}\nstate=\"$state_dir/authenticated\"\nif [ \"${{1:-}}\" = -n ] && [ \"${{2:-}}\" = -v ]; then\n  test -f \"$state\"\n  exit $?\nfi\nif [ \"${{1:-}}\" = -A ] && [ \"${{2:-}}\" = -v ]; then\n  ask=\"${{SUDO_ASKPASS:-}}\"\n  if [ -z \"$ask\" ]; then ask=\"${{DEXT_SUDO_ASKPASS:-}}\"; fi\n  [ -n \"$ask\" ] || exit 1\n  for attempt in 1 2 3 4 5; do\n    pass=$(\"$ask\" 'fake sudo prompt') || exit 1\n    if [ \"$pass\" = hunter2 ]; then printf '%s' \"$PPID\" > \"$state\"; exit 0; fi\n  done\n  exit 1\nfi\nwhile [ \"${{1:-}}\" = -n ]; do shift; done\nif [ -f \"$state\" ]; then\n  owner=$(cat \"$state\")\n  [ -z \"$owner\" ] || [ \"$owner\" = \"$PPID\" ] || exit 42\n  exec \"$@\"\nfi\nprintf '%s\\n' 'sudo: interactive authentication is required' >&2\nexit 1\n"
         ),
     )
     .expect("write fake sudo");
@@ -5264,7 +5674,7 @@ async fn sudo_preauth_runs_inside_bash_session_before_noninteractive_sudo() {
     let target_dir = temp_test_dir("sudo-preauth-target");
     let target = target_dir.join("out.txt");
 
-    let (sudo_shim_dir, askpass, fifo) = {
+    let (sudo_shim_dir, askpass) = {
         let _guard = env_lock();
         let old_sessions_dir = std::env::var_os("DEXT_SESSIONS_DIR");
         unsafe {
@@ -5273,38 +5683,76 @@ async fn sudo_preauth_runs_inside_bash_session_before_noninteractive_sudo() {
         let result = (
             write_sudo_command_shim(&root, "test-session", &fake_sudo).expect("write sudo shim"),
             write_sudo_askpass_script(&root, "test-session").expect("write askpass"),
-            create_sudo_password_fifo(&root, "test-session").expect("create sudo fifo"),
         );
         restore_env_var("DEXT_SESSIONS_DIR", old_sessions_dir);
         result
     };
+    let prompt_dir = sudo_shim_dir.parent().unwrap().to_path_buf();
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
     let auth = LocalSudoAuth {
         askpass: Some(askpass),
-        sudo_path: fake_sudo,
+        sudo_path: fake_sudo.clone(),
         sudo_shim_dir,
-        password_fifo: Some(fifo),
-        password: Some("hunter2".to_string()),
+        prompt_requests: Some(tx),
+        password_fifo: None,
+        request_fifo: None,
         preauth_required: true,
     };
+    let interrupt = Arc::new(AtomicBool::new(false));
+    let mut sink = SudoTestSink {
+        responses: responses.into(),
+        prompts: 0,
+        wait: abort.is_some(),
+        interrupt: abort.filter(|value| *value).map(|_| interrupt.clone()),
+    };
     let command = format!(
-        "printf ok | sudo -n tee {} >/dev/null",
-        shell_single_quote(&target.to_string_lossy())
+        "printf ok | sudo -n tee {target} >/dev/null && printf ok | command sudo tee {target} >/dev/null && printf ok | env sudo tee {target} >/dev/null && printf ok | {absolute} -n tee {target} >/dev/null",
+        target = shell_single_quote(&target.to_string_lossy()),
+        absolute = shell_single_quote(&fake_sudo.to_string_lossy()),
     );
-    let out = execute_bash_async_prepared(
+    let execution = execute_bash_async_prepared(
         &command,
         &root,
-        Arc::new(AtomicBool::new(false)),
-        std::time::Duration::from_secs(10),
+        interrupt,
+        std::time::Duration::from_secs(if abort.is_some() { 1 } else { 5 }),
         Some(auth),
         SandboxProfile::ReadOnly,
         None,
         &[],
-    )
-    .await
-    .expect("preauthed sudo command runs");
-
-    assert!(out.contains("exit: 0"), "{out}");
-    assert_eq!(std::fs::read_to_string(&target).expect("read target"), "ok");
+    );
+    let result = execute_with_sudo_prompts(execution, rx, &mut sink).await;
+    let out = if let Some(interrupted) = abort {
+        let error = result.expect_err("unfinished prompt must honor tool deadline/interrupt");
+        assert!(
+            error.contains(if interrupted {
+                "interrupt"
+            } else {
+                "timed out"
+            }),
+            "{error}"
+        );
+        error
+    } else {
+        result.expect("sudo finishes without timeout")
+    };
+    assert_eq!(out.contains("exit: 0"), success, "{out}");
+    assert_eq!(sink.prompts, prompts);
+    assert!(!out.contains("hunter2"), "secret in output");
+    assert_eq!(
+        target.exists(),
+        success,
+        "payload must not run after auth failure"
+    );
+    if success {
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "ok");
+    }
+    assert!(std::fs::read_dir(prompt_dir).unwrap().all(|entry| {
+        entry
+            .unwrap()
+            .path()
+            .extension()
+            .is_none_or(|ext| ext != "fifo")
+    }));
     let _ = std::fs::remove_file(&target);
     if let Some(dir) = target.parent() {
         let _ = std::fs::remove_dir(dir);

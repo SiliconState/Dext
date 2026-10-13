@@ -2,6 +2,10 @@
 
 Dext's interactive interface is an inline Ratatui application in the regular terminal buffer. It uses native terminal scrollback during ordinary operation instead of taking over the alternate screen. On every effective transcript-pane width change, Dext deliberately replaces that scrollback immediately with a complete replay at the new width. The backend viewer is the only alternate-screen surface.
 
+## Local sudo prompts
+
+Sudo opens the masked local prompt only when askpass requests a password. Cached authorization skips it; retries collect a fresh response with a three-prompt ceiling. Sudo replies use a nonblocking one-shot channel with a drop-cleared secret envelope; timeout/interrupt keeps running while the prompt awaits input. Cleanup is tied to the exact request, so a stale cancellation cannot dismiss a newer prompt, and closed requests are not displayed. A disconnected TUI cancels authentication rather than switching to a desktop dialog. The TUI rejects internal CR/LF/NUL in pasted local-auth input rather than joining lines; trailing paste line endings still submit. Sudo input is capped at 500 UTF-8 bytes before submission. Backspace clears removed bytes before shortening the buffer. No password is sent through the composer or provider transcript.
+
 ## Behavior contract
 
 TUI and dependency changes must preserve these behaviors:

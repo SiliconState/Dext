@@ -1050,53 +1050,9 @@ impl Agent {
                 } else {
                     None
                 };
-                if let Some(auth) = local_sudo_auth.as_mut()
-                    && auth.preauth_required
-                {
-                    let message = SUDO_AUTH_GUIDANCE.to_string();
-                    match self.sink.request_local_auth_secret("bash", &message) {
-                        LocalAuthSecret::Secret(password) => {
-                            match create_sudo_password_fifo(&root, &session_id) {
-                                Ok(fifo) => {
-                                    auth.password_fifo = Some(fifo);
-                                    auth.password = Some(password);
-                                }
-                                Err(e) => {
-                                    let mut password = password;
-                                    clear_secret_string(&mut password);
-                                    let outcome = Err(e);
-                                    if let Some(error) = persist_tool_journal_terminal(
-                                        &root,
-                                        &session_id,
-                                        plans[idx].journal_record_id.as_deref(),
-                                        &n,
-                                        &outcome,
-                                    ) {
-                                        journal_terminal_errors.push(error);
-                                    }
-                                    builtin_outputs.insert(idx, outcome);
-                                    continue;
-                                }
-                            }
-                        }
-                        LocalAuthSecret::Canceled => {
-                            let outcome = Err("sudo authentication canceled by user".to_string());
-                            if let Some(error) = persist_tool_journal_terminal(
-                                &root,
-                                &session_id,
-                                plans[idx].journal_record_id.as_deref(),
-                                &n,
-                                &outcome,
-                            ) {
-                                journal_terminal_errors.push(error);
-                            }
-                            builtin_outputs.insert(idx, outcome);
-                            continue;
-                        }
-                        LocalAuthSecret::Unavailable => {
-                            self.sink.local_auth_prompt("bash", SUDO_AUTH_GUIDANCE);
-                        }
-                    }
+                let (sudo_requests, sudo_prompts) = tokio::sync::mpsc::channel(1);
+                if let Some(auth) = local_sudo_auth.as_mut() {
+                    auth.prompt_requests = Some(sudo_requests);
                 }
                 let live_output =
                     live_output_for_tool(self.sink.as_ref(), &plans[idx].event_call_id, &n, &inp);
@@ -1112,21 +1068,25 @@ impl Agent {
                     self.execute_pack_runtime_tool(&n, &inp, &turn_id, iterations)
                         .await
                 } else {
-                    execute_builtin_call_for_context(
-                        n.clone(),
-                        inp,
-                        root.clone(),
-                        self.interrupt.clone(),
-                        Some(read_cache.clone()),
-                        Some(session_id.clone()),
-                        local_sudo_auth,
-                        git_credential_for_call,
-                        prepared_mutation,
-                        self.sandbox_profile,
-                        hooks_approved,
-                        live_output,
-                        call_env,
-                        context_mode,
+                    execute_with_sudo_prompts(
+                        execute_builtin_call_for_context(
+                            n.clone(),
+                            inp,
+                            root.clone(),
+                            self.interrupt.clone(),
+                            Some(read_cache.clone()),
+                            Some(session_id.clone()),
+                            local_sudo_auth,
+                            git_credential_for_call,
+                            prepared_mutation,
+                            self.sandbox_profile,
+                            hooks_approved,
+                            live_output,
+                            call_env,
+                            context_mode,
+                        ),
+                        sudo_prompts,
+                        self.sink.as_mut(),
                     )
                     .await
                 };

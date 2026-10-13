@@ -26,6 +26,14 @@ cd Dext
 cargo install --path . --force --locked
 ```
 
+## Local sudo authentication
+
+Sudo remains a separately approved privileged operation. Dext validates authorization inside the bash session that will run the command; it does not ask for a password when that validation succeeds without one. Otherwise sudo's askpass request opens the local masked prompt. Enter the password there, never in chat. A rejection can open a fresh prompt, up to three prompts per tool call; host sudo/PAM policy can stop sooner. Escape cancels in the TUI. Console input uses a no-echo terminal line (an empty line or EOF cancels). Timeout and interrupt still stop the tool while it waits for input. Console cleanup discards partial/pasted input before restoring echo. TUI submission does not block rendering, and delayed cancellation cannot close a newer prompt. Multiline/NUL or oversized sudo pastes are rejected without changing the current input; a trailing line ending still submits. The macOS fallback provides an explicit Cancel button.
+
+The request/response bridge uses private FIFOs, not regular password files or argv. Local responses must be nonempty, at most 500 UTF-8 bytes, and contain no CR/LF/NUL. Cancellation or invalid input does not fall through to desktop dialogs. When local input is unavailable, askpass can use zenity, kdialog, or macOS osascript. The payload starts only after successful validation. Bare sudo, `command sudo`, and `env sudo` use an executable PATH shim that execs real sudo with `-n`, preserving the shell parent even in pipelines. Absolute sudo paths bypass that shim; include `-n` explicitly when using them. Preauth helper variables are cleared before payload execution. A disconnected TUI cancels instead of launching desktop fallback. Arbitrary multi-factor PAM conversations, command-specific timestamp exceptions, nested-shell parent scopes, and expired authorization during long-running payloads are not supported.
+
+Automated regression tests cover cached authorization, fresh authentication, rejected-password retry, cancellation, the attempt limit, invalid input, timeout/interrupt, and FIFO cleanup using fake sudo. These are not proof that a particular host PAM policy accepts a real password. For live acceptance, use a harmless `sudo id -u` through Dext and confirm `0`; check fresh authentication and cancellation separately. Do not deliberately submit bad real passwords without checking the host's account-lockout policy. A successful command alone does not prove the password was consumed if authorization was already available.
+
 ## CLI overview
 
 ```text

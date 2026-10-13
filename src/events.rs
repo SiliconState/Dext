@@ -220,6 +220,13 @@ pub(crate) trait EventSink: Send + Sync {
     fn live_output_sender(&self) -> Option<tokio::sync::mpsc::Sender<AgentEvent>> {
         None
     }
+    fn request_local_auth_secret_async<'a>(
+        &'a mut self,
+        tool: &'a str,
+        message: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = LocalAuthSecret> + Send + 'a>> {
+        Box::pin(async move { self.request_local_auth_secret(tool, message) })
+    }
     fn request_local_auth_secret(&mut self, tool: &str, message: &str) -> LocalAuthSecret {
         self.local_auth_prompt(tool, message);
         LocalAuthSecret::Unavailable

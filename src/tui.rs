@@ -231,10 +231,37 @@ struct PendingPermission {
     responder: std::sync::mpsc::SyncSender<Choice>,
 }
 
+enum LocalAuthResponder {
+    Sync(std::sync::mpsc::SyncSender<LocalAuthSecret>),
+    Async(tokio::sync::oneshot::Sender<crate::SudoPromptResponse>),
+}
+
+impl From<std::sync::mpsc::SyncSender<LocalAuthSecret>> for LocalAuthResponder {
+    fn from(sender: std::sync::mpsc::SyncSender<LocalAuthSecret>) -> Self {
+        Self::Sync(sender)
+    }
+}
+
+impl LocalAuthResponder {
+    fn send(self, secret: LocalAuthSecret) -> Result<(), LocalAuthSecret> {
+        match self {
+            Self::Sync(sender) => sender.send(secret).map_err(|error| error.0),
+            Self::Async(sender) => {
+                sender
+                    .send(crate::SudoPromptResponse(secret))
+                    .map_err(|mut response| {
+                        std::mem::replace(&mut response.0, LocalAuthSecret::Canceled)
+                    })
+            }
+        }
+    }
+}
+
 struct PendingLocalAuth {
     tool: String,
     message: String,
-    responder: std::sync::mpsc::SyncSender<LocalAuthSecret>,
+    responder: LocalAuthResponder,
+    request: Option<Arc<()>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -335,6 +362,13 @@ enum ToTui {
         message: String,
         responder: std::sync::mpsc::SyncSender<LocalAuthSecret>,
     },
+    AsyncLocalAuthSecretRequest {
+        tool: String,
+        message: String,
+        responder: tokio::sync::oneshot::Sender<crate::SudoPromptResponse>,
+        request: Arc<()>,
+    },
+    CancelLocalAuth(Arc<()>),
     GitSummary {
         root: PathBuf,
         epoch: u64,
@@ -415,6 +449,37 @@ impl EventSink for TuiSink {
         Some(self.live_tx.clone())
     }
 
+    fn request_local_auth_secret_async<'a>(
+        &'a mut self,
+        tool: &'a str,
+        message: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = LocalAuthSecret> + Send + 'a>> {
+        Box::pin(async move {
+            let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+            let request = Arc::new(());
+            if self
+                .tx
+                .send(ToTui::AsyncLocalAuthSecretRequest {
+                    tool: tool.to_string(),
+                    message: message.to_string(),
+                    responder: resp_tx,
+                    request: request.clone(),
+                })
+                .is_err()
+            {
+                return LocalAuthSecret::Canceled;
+            }
+            let _guard = LocalAuthOverlayGuard {
+                tx: self.tx.clone(),
+                request,
+            };
+            match resp_rx.await {
+                Ok(mut response) => std::mem::replace(&mut response.0, LocalAuthSecret::Canceled),
+                Err(_) => LocalAuthSecret::Canceled,
+            }
+        })
+    }
+
     fn request_local_auth_secret(&mut self, tool: &str, message: &str) -> LocalAuthSecret {
         let (resp_tx, resp_rx) = std::sync::mpsc::sync_channel(0);
         if self
@@ -429,6 +494,17 @@ impl EventSink for TuiSink {
             return LocalAuthSecret::Unavailable;
         }
         resp_rx.recv().unwrap_or(LocalAuthSecret::Canceled)
+    }
+}
+
+struct LocalAuthOverlayGuard {
+    tx: tokio::sync::mpsc::UnboundedSender<ToTui>,
+    request: Arc<()>,
+}
+
+impl Drop for LocalAuthOverlayGuard {
+    fn drop(&mut self) {
+        let _ = self.tx.send(ToTui::CancelLocalAuth(self.request.clone()));
     }
 }
 
@@ -9978,7 +10054,7 @@ fn queue_local_auth_secret_request(
     state: &mut TuiState,
     tool: String,
     message: String,
-    responder: std::sync::mpsc::SyncSender<LocalAuthSecret>,
+    responder: impl Into<LocalAuthResponder>,
 ) {
     let previous = state.pending_local_auth.take();
     clear_secret_string(&mut state.local_auth_input);
@@ -9995,7 +10071,8 @@ fn queue_local_auth_secret_request(
     state.pending_local_auth = Some(PendingLocalAuth {
         tool,
         message,
-        responder,
+        responder: responder.into(),
+        request: None,
     });
 }
 
@@ -10790,6 +10867,35 @@ fn apply_tui_message(state: &mut TuiState, msg: ToTui) {
         } => {
             state.close_backend_viewer();
             queue_local_auth_secret_request(state, tool, message, responder);
+        }
+        ToTui::AsyncLocalAuthSecretRequest {
+            tool,
+            message,
+            responder,
+            request,
+        } => {
+            if !responder.is_closed() {
+                state.close_backend_viewer();
+                queue_local_auth_secret_request(
+                    state,
+                    tool,
+                    message,
+                    LocalAuthResponder::Async(responder),
+                );
+                if let Some(pending) = &mut state.pending_local_auth {
+                    pending.request = Some(request);
+                }
+            }
+        }
+        ToTui::CancelLocalAuth(request) => {
+            if state
+                .pending_local_auth
+                .as_ref()
+                .and_then(|pending| pending.request.as_ref())
+                .is_some_and(|active| Arc::ptr_eq(active, &request))
+            {
+                cancel_local_auth_secret(state);
+            }
         }
         ToTui::GitSummary {
             root,
@@ -11586,10 +11692,19 @@ fn handle_paste(state: &mut TuiState, mut pasted: String) {
     }
     if state.pending_local_auth.is_some() {
         let submit = pasted.ends_with('\n') || pasted.ends_with('\r');
-        pasted.retain(|ch| !matches!(ch, '\r' | '\n'));
-        if !pasted.is_empty() {
-            state.local_auth_input.push_str(&pasted);
+        let content = pasted.trim_end_matches(['\r', '\n']);
+        let sudo = state
+            .pending_local_auth
+            .as_ref()
+            .is_some_and(|pending| pending.tool == "bash");
+        if content.contains(['\r', '\n', '\0'])
+            || (sudo && state.local_auth_input.len().saturating_add(content.len()) > 500)
+        {
+            clear_secret_string(&mut pasted);
+            state.status = "local auth paste rejected: single line, sudo limit 500 bytes".into();
+            return;
         }
+        state.local_auth_input.push_str(content);
         clear_secret_string(&mut pasted);
         if submit {
             submit_local_auth_secret(state);
@@ -11746,7 +11861,7 @@ fn submit_local_auth_secret(state: &mut TuiState) {
             state.status = format!("local auth submitted for {}", pending.tool);
         }
         Err(err) => {
-            if let LocalAuthSecret::Secret(mut unsent) = err.0 {
+            if let LocalAuthSecret::Secret(mut unsent) = err {
                 clear_secret_string(&mut unsent);
             }
             state.status = format!("local auth unavailable for {}", pending.tool);
@@ -11784,7 +11899,12 @@ fn handle_local_auth_key(state: &mut TuiState, key: KeyEvent) -> bool {
             state.status = "local auth input cleared".to_string();
         }
         (KeyCode::Backspace, _) => {
-            state.local_auth_input.pop();
+            if let Some((last, _)) = state.local_auth_input.char_indices().next_back() {
+                unsafe {
+                    state.local_auth_input.as_mut_vec()[last..].fill(0);
+                }
+                state.local_auth_input.truncate(last);
+            }
             state.status = local_auth_input_status(state);
         }
         (KeyCode::Delete, _) => {
@@ -11798,8 +11918,16 @@ fn handle_local_auth_key(state: &mut TuiState, key: KeyEvent) -> bool {
                     | KeyModifiers::META,
             ) =>
         {
-            state.local_auth_input.push(c);
-            state.status = local_auth_input_status(state);
+            let sudo = state
+                .pending_local_auth
+                .as_ref()
+                .is_some_and(|pending| pending.tool == "bash");
+            if c.is_control() || (sudo && state.local_auth_input.len() + c.len_utf8() > 500) {
+                state.status = "local auth input rejected: sudo limit 500 bytes".into();
+            } else {
+                state.local_auth_input.push(c);
+                state.status = local_auth_input_status(state);
+            }
         }
         _ => {}
     }
@@ -23202,6 +23330,160 @@ mod tests {
             state.pending_insert.as_slice(),
             [Line_::Warn(s)] if s.contains("paste withheld")
         ));
+    }
+
+    #[tokio::test]
+    async fn local_auth_async_submit_reaches_waiter_without_echo() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (live_tx, _live_rx) = tokio::sync::mpsc::channel(1);
+        let mut sink = TuiSink { tx, live_tx };
+        let ui = std::thread::spawn(move || {
+            let mut state = TuiState::new(
+                "glm-5.1".to_string(),
+                model_context_window("glm-5.1"),
+                ".".to_string(),
+                ApprovalProfile::Ask,
+                ThinkingEffort::Medium,
+            );
+            apply_tui_message(&mut state, rx.blocking_recv().unwrap());
+            state.local_auth_input = "local-test-secret".to_string();
+            submit_local_auth_secret(&mut state);
+            assert!(state.local_auth_input.is_empty());
+            assert!(state.input.is_empty());
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            sink.request_local_auth_secret_async("bash", "sudo auth"),
+        )
+        .await
+        .expect("prompt responds");
+        assert!(matches!(result, LocalAuthSecret::Secret(secret) if secret == "local-test-secret"));
+        ui.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_auth_async_timeout_closes_overlay_and_clears_input() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (live_tx, _live_rx) = tokio::sync::mpsc::channel(1);
+        let mut sink = TuiSink { tx, live_tx };
+        let mut state = TuiState::new(
+            "glm-5.1".to_string(),
+            model_context_window("glm-5.1"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        let result = {
+            let prompt = sink.request_local_auth_secret_async("bash", "sudo auth");
+            tokio::pin!(prompt);
+            tokio::select! {
+                _ = &mut prompt => panic!("prompt completed without input"),
+                message = rx.recv() => apply_tui_message(&mut state, message.unwrap()),
+            }
+            assert!(state.pending_local_auth.is_some());
+            state.local_auth_input = "partial-secret".to_string();
+            tokio::time::timeout(Duration::from_millis(30), prompt).await
+        };
+        assert!(result.is_err());
+        apply_tui_message(&mut state, rx.try_recv().unwrap());
+        assert!(state.pending_local_auth.is_none());
+        assert!(state.local_auth_input.is_empty());
+    }
+
+    #[tokio::test]
+    async fn local_auth_closed_tui_cancels_without_desktop_fallback() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(rx);
+        let (live_tx, _live_rx) = tokio::sync::mpsc::channel(1);
+        let mut sink = TuiSink { tx, live_tx };
+        assert!(matches!(
+            sink.request_local_auth_secret_async("bash", "sudo auth")
+                .await,
+            LocalAuthSecret::Canceled
+        ));
+    }
+
+    #[test]
+    fn local_auth_stale_cancel_and_closed_request_preserve_new_prompt() {
+        let mut state = TuiState::new(
+            "glm-5.1".into(),
+            model_context_window("glm-5.1"),
+            ".".into(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        let old = Arc::new(());
+        let active = Arc::new(());
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        apply_tui_message(
+            &mut state,
+            ToTui::AsyncLocalAuthSecretRequest {
+                tool: "bash".into(),
+                message: "active".into(),
+                responder: tx,
+                request: active,
+            },
+        );
+        state.local_auth_input = "secret".into();
+        apply_tui_message(&mut state, ToTui::CancelLocalAuth(old.clone()));
+        let (tx, closed) = tokio::sync::oneshot::channel();
+        drop(closed);
+        apply_tui_message(
+            &mut state,
+            ToTui::AsyncLocalAuthSecretRequest {
+                tool: "bash".into(),
+                message: "obsolete".into(),
+                responder: tx,
+                request: old,
+            },
+        );
+        assert_eq!(state.pending_local_auth.as_ref().unwrap().message, "active");
+        assert_eq!(state.local_auth_input, "secret");
+        // No receiver is polling: submission must not block the render thread.
+        submit_local_auth_secret(&mut state);
+        let response = rx.try_recv().expect("nonblocking response queued");
+        assert!(matches!(&response.0, LocalAuthSecret::Secret(secret) if secret == "secret"));
+        assert!(state.local_auth_input.is_empty());
+    }
+
+    #[test]
+    fn local_auth_rejects_multiline_and_oversize_paste_without_changing_secret() {
+        let mut state = TuiState::new(
+            "glm-5.1".into(),
+            model_context_window("glm-5.1"),
+            ".".into(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        queue_local_auth_secret_request(&mut state, "bash".into(), "sudo".into(), tx);
+        state.local_auth_input = "existing".into();
+        for paste in [
+            "first\nsecond\n".into(),
+            "bad\0secret".into(),
+            "x".repeat(501),
+        ] {
+            handle_paste(&mut state, paste);
+            assert_eq!(state.local_auth_input, "existing");
+            assert!(state.pending_local_auth.is_some());
+            assert!(rx.try_recv().is_err());
+        }
+        state.local_auth_input = "x".repeat(499);
+        handle_local_auth_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('é'), KeyModifiers::NONE),
+        );
+        assert_eq!(state.local_auth_input.len(), 499);
+        handle_local_auth_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+        );
+        assert_eq!(state.local_auth_input.len(), 500);
+        handle_local_auth_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        );
+        assert_eq!(state.local_auth_input.len(), 499);
     }
 
     #[test]
