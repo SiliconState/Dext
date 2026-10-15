@@ -16,7 +16,8 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, macos-15-intel, windows-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    # Intel macOS runners are compile-bound: clippy plus two release builds take ~25 min before tests.
+    timeout-minutes: ${{ matrix.os == 'macos-15-intel' && 45 || 30 }}
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
