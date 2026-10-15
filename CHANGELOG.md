@@ -16,6 +16,10 @@
 
 - Retry waits now preserve their deadline through status-only runtime controls; closed control channels no longer spin. Cancellation and route changes remain responsive. Exhausted HTTP errors retain the upstream response and add route, attempt count and explicit recovery options without automatic provider switching. Thinking/tool activity receives the same short-pane retention and single-line bounds as answers, and slash popups shrink or hide instead of covering the composer.
 
+### Security
+
+- Lockfile-only update: quinn-proto 0.11.15 to 0.11.19 (RUSTSEC-2026-0338 through 0342: remote panics and receive-buffer/memory-exhaustion bypasses) and Rustls 0.23.45 to 0.23.46 (RUSTSEC-2026-0346 through 0349: secret-bearing `Debug` output, ECH-rejection data leak, pre-auth Brotli certificate allocation, ServerHello key-exchange downgrade). quinn-proto's transitive `rand` moves from 0.9 to 0.10. `Cargo.toml`, source and existing exact pins are unchanged; `cargo audit --deny warnings` passes again.
+
 ## v0.2.1 - 2026-10-07
 
 Patch release replacing the unpublished `v0.2.0`, whose release workflow stopped before publication; the `v0.2.0` tag is retained unchanged.
