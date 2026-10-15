@@ -16,6 +16,8 @@
 
 - Retry waits now preserve their deadline through status-only runtime controls; closed control channels no longer spin. Cancellation and route changes remain responsive. Exhausted HTTP errors retain the upstream response and add route, attempt count and explicit recovery options without automatic provider switching. Thinking/tool activity receives the same short-pane retention and single-line bounds as answers, and slash popups shrink or hide instead of covering the composer.
 
+- Branch CI `test (macos-15-intel)` now has a 45-minute job limit (other platforms keep 30, matching the release workflow's 45). The job was compile-bound (Clippy ~5 min, TUI-test release build ~13 min) and hit 30 minutes mid-way through release tests on `main` and PR #69 with no test failures; the same tests pass locally on Intel macOS.
+
 ### Security
 
 - Lockfile-only update: quinn-proto 0.11.15 to 0.11.19 (RUSTSEC-2026-0338 through 0342: remote panics and receive-buffer/memory-exhaustion bypasses) and Rustls 0.23.45 to 0.23.46 (RUSTSEC-2026-0346 through 0349: secret-bearing `Debug` output, ECH-rejection data leak, pre-auth Brotli certificate allocation, ServerHello key-exchange downgrade). quinn-proto's transitive `rand` moves from 0.9 to 0.10. `Cargo.toml`, source and existing exact pins are unchanged; `cargo audit --deny warnings` passes again.
