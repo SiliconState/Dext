@@ -10,11 +10,14 @@ const TOOL_ARGUMENT_BUFFER_CAP: usize = 256_000;
 const REASONING_BUFFER_CAP: usize = 4 * 1024 * 1024;
 
 pub(crate) fn sse_event_cap(contract: RequestContract) -> usize {
-    // Responses terminals include full output snapshots and opaque reasoning items.
-    if contract.is_responses() {
-        crate::PROVIDER_JSON_BODY_CAP
-    } else {
-        256_000
+    // Responses terminals include full output snapshots and opaque reasoning items;
+    // a Messages signature_delta carries the whole opaque thinking signature in one
+    // event, which exceeds 256,000 bytes at high reasoning effort.
+    match contract {
+        RequestContract::AnthropicMessages
+        | RequestContract::OpenAiResponses
+        | RequestContract::ChatGptResponses => crate::PROVIDER_JSON_BODY_CAP,
+        RequestContract::OpenAiChatCompletions => 256_000,
     }
 }
 
@@ -2839,6 +2842,76 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_large_signature_frames_preserve_thinking_signature() {
+        let contract = RequestContract::AnthropicMessages;
+        let signature = "s".repeat(300_000);
+        let frames = [
+            (
+                "message_start",
+                serde_json::json!({"type":"message_start","message":{"usage":{}}}),
+            ),
+            (
+                "content_block_start",
+                serde_json::json!({"type":"content_block_start","index":0,
+                "content_block":{"type":"thinking","thinking":"","signature":""}}),
+            ),
+            (
+                "content_block_delta",
+                serde_json::json!({"type":"content_block_delta","index":0,
+                "delta":{"type":"signature_delta","signature":signature}}),
+            ),
+            (
+                "content_block_stop",
+                serde_json::json!({"type":"content_block_stop","index":0}),
+            ),
+            (
+                "content_block_start",
+                serde_json::json!({"type":"content_block_start","index":1,
+                "content_block":{"type":"text","text":""}}),
+            ),
+            (
+                "content_block_delta",
+                serde_json::json!({"type":"content_block_delta","index":1,
+                "delta":{"type":"text_delta","text":"visible answer"}}),
+            ),
+            (
+                "content_block_stop",
+                serde_json::json!({"type":"content_block_stop","index":1}),
+            ),
+            (
+                "message_delta",
+                serde_json::json!({"type":"message_delta",
+                "delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":9}}),
+            ),
+            ("message_stop", serde_json::json!({"type":"message_stop"})),
+        ];
+        let wire = frames
+            .iter()
+            .map(|(event, data)| format!("event: {event}\ndata: {data}\n\n"))
+            .collect::<String>();
+        assert!(SseDecoder::new(256_000).push(wire.as_bytes()).is_err());
+        for chunk_size in [4093, wire.len()] {
+            let mut decoder = SseDecoder::new(sse_event_cap(contract));
+            let mut parser = ProviderStreamParser::new(contract, false);
+            for chunk in wire.as_bytes().chunks(chunk_size) {
+                for frame in decoder.push(chunk).unwrap() {
+                    parser.push_frame(frame).unwrap();
+                }
+            }
+            for frame in decoder.finish().unwrap() {
+                parser.push_frame(frame).unwrap();
+            }
+            let parsed = parser.finish().unwrap();
+            assert_eq!(parsed.stop_reason.as_deref(), Some("end_turn"));
+            assert_eq!(parsed.usage.output, 9);
+            assert!(matches!(&parsed.blocks[..], [
+                Block::Thinking { text, signature: Some(sig) },
+                Block::Text { text: answer },
+            ] if text.is_empty() && *sig == signature && answer == "visible answer"));
+        }
+    }
+
+    #[test]
     fn responses_event_caps_still_reject_oversized_frames_and_tool_arguments() {
         for contract in [
             RequestContract::AnthropicMessages,
@@ -2849,10 +2922,10 @@ mod tests {
             let cap = sse_event_cap(contract);
             assert_eq!(
                 cap,
-                if contract.is_responses() {
-                    4 * 1024 * 1024
-                } else {
+                if contract == RequestContract::OpenAiChatCompletions {
                     256_000
+                } else {
+                    4 * 1024 * 1024
                 }
             );
             let mut decoder = SseDecoder::new(cap);
