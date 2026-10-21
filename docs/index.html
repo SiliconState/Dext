@@ -962,8 +962,8 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <tr><th>Phase</th><th>Description</th></tr>
 <tr><td><code>Probe</code></td><td>Initial exploration — reading files, searching, understanding the codebase</td></tr>
 <tr><td><code>Scale</code></td><td>Expanded collection — triggered when probe passes for external hosts</td></tr>
-<tr><td><code>Implement</code></td><td>Applying requested changes — entered on the first side-effecting tool call when fixes are in scope; later mutations keep this phase instead of advancing to final delivery</td></tr>
-<tr><td><code>Synthesize</code></td><td>Final delivery — entered on the final response, steering, or partial-delivery fallback; deliverable writes outside implementation scope also enter it</td></tr>
+<tr><td><code>Implement</code></td><td>Applying requested changes — entered on every side-effecting tool call when fixes are in scope, including after a final-response attempt that resumed work; later mutations and queued user updates keep this phase instead of advancing to final delivery</td></tr>
+<tr><td><code>Synthesize</code></td><td>Final delivery — entered on the final response or partial-delivery fallback, and on steering outside implementation; deliverable writes outside implementation scope also enter it</td></tr>
 </table>
 <h3>Guard Systems</h3>
 <ul>

@@ -52,19 +52,22 @@ pub(crate) fn phase_transition(
             WorkPhase::Probe => WorkPhase::Scale,
             _ => current,
         },
-        // Applying changes is not the final response: implementation turns keep
-        // mutating until the model itself decides to answer.
-        PhaseTrigger::Fix => match current {
-            WorkPhase::Synthesize => current,
-            _ => WorkPhase::Implement,
-        },
+        // Applying changes is not the final response. A mutation after a final-response
+        // attempt (objective reminder, queued update) means work resumed, so it re-enters
+        // Implement instead of staying labelled as wrap-up.
+        PhaseTrigger::Fix => WorkPhase::Implement,
         PhaseTrigger::DeliverableWrite => match current {
             WorkPhase::Implement => current,
             _ => WorkPhase::Synthesize,
         },
-        PhaseTrigger::FinalResponse
-        | PhaseTrigger::PartialDeliveryFallback
-        | PhaseTrigger::Steering => WorkPhase::Synthesize,
+        // A queued user update mid-implementation adds scope; it is not a wrap-up signal.
+        PhaseTrigger::Steering => match current {
+            WorkPhase::Implement => current,
+            _ => WorkPhase::Synthesize,
+        },
+        PhaseTrigger::FinalResponse | PhaseTrigger::PartialDeliveryFallback => {
+            WorkPhase::Synthesize
+        }
     };
 
     if next == current {
@@ -2705,11 +2708,29 @@ mod tests {
         );
         assert!(state.advance_phase(PhaseTrigger::ScaleCollection).is_none());
         assert_eq!(state.phase(), WorkPhase::Implement);
+        assert!(
+            state.advance_phase(PhaseTrigger::Steering).is_none(),
+            "a queued update mid-implementation keeps working"
+        );
         let (next, _) = state
             .advance_phase(PhaseTrigger::FinalResponse)
             .expect("final response ends implementation");
         assert_eq!(next, WorkPhase::Synthesize);
+        let (next, _) = state
+            .advance_phase(PhaseTrigger::Fix)
+            .expect("an edit after a final-response attempt resumes implementation");
+        assert_eq!(next, WorkPhase::Implement);
         assert!(state.advance_phase(PhaseTrigger::Fix).is_none());
+    }
+
+    #[test]
+    fn steering_outside_implementation_still_redirects_to_synthesize() {
+        let mut state = TurnRuntimeState::new();
+        let (next, msg) = state
+            .advance_phase(PhaseTrigger::Steering)
+            .expect("probe redirects on steering");
+        assert_eq!(next, WorkPhase::Synthesize);
+        assert!(msg.contains("user input"), "{msg}");
     }
 
     #[test]
