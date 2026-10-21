@@ -16899,7 +16899,7 @@ impl Agent {
             ledger.next_actions.clear();
             if matches!(
                 ledger.current_phase.as_str(),
-                "probe" | "execute" | "verify" | "synthesize"
+                "probe" | "execute" | "implement" | "verify" | "synthesize"
             ) {
                 ledger.current_phase = "done".to_string();
             }

@@ -4397,7 +4397,7 @@ fn phase_status_text(line: &str) -> Option<String> {
         "scale" => "Scale",
         "discover" => "Discovery",
         "tool" | "tools" => "Tools",
-        "fix" => "Applying changes",
+        "fix" | "implement" => "Applying changes",
         "synthesize" => "Final response",
         other if !other.is_empty() => other,
         _ => "Progress",

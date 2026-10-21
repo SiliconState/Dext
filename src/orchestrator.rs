@@ -8,6 +8,7 @@ const MIN_DYNAMIC_TOOL_RESULT_CAP: usize = 6_000;
 pub(crate) enum WorkPhase {
     Probe,
     Scale,
+    Implement,
     Synthesize,
 }
 
@@ -16,6 +17,7 @@ impl WorkPhase {
         match self {
             Self::Probe => "probe",
             Self::Scale => "scale",
+            Self::Implement => "implement",
             Self::Synthesize => "synthesize",
         }
     }
@@ -50,11 +52,19 @@ pub(crate) fn phase_transition(
             WorkPhase::Probe => WorkPhase::Scale,
             _ => current,
         },
-        PhaseTrigger::DeliverableWrite
-        | PhaseTrigger::FinalResponse
+        // Applying changes is not the final response: implementation turns keep
+        // mutating until the model itself decides to answer.
+        PhaseTrigger::Fix => match current {
+            WorkPhase::Synthesize => current,
+            _ => WorkPhase::Implement,
+        },
+        PhaseTrigger::DeliverableWrite => match current {
+            WorkPhase::Implement => current,
+            _ => WorkPhase::Synthesize,
+        },
+        PhaseTrigger::FinalResponse
         | PhaseTrigger::PartialDeliveryFallback
-        | PhaseTrigger::Steering
-        | PhaseTrigger::Fix => WorkPhase::Synthesize,
+        | PhaseTrigger::Steering => WorkPhase::Synthesize,
     };
 
     if next == current {
@@ -69,7 +79,7 @@ pub(crate) fn phase_transition(
             "consolidate partial results and request user decision"
         }
         PhaseTrigger::Steering => "redirecting based on user input",
-        PhaseTrigger::Fix => "fix/apply requested; code changes are in scope",
+        PhaseTrigger::Fix => "applying requested changes; keep editing until the work is done",
     };
 
     Some((next, message))
@@ -2677,6 +2687,29 @@ mod tests {
         assert!(msg.contains("deliverable"), "{msg}");
         assert_eq!(state.phase(), WorkPhase::Synthesize);
         assert!(state.advance_phase(PhaseTrigger::FinalResponse).is_none());
+    }
+
+    #[test]
+    fn fix_enters_implement_and_stays_there_across_mutations() {
+        let mut state = TurnRuntimeState::new();
+        let (_, msg) = state
+            .advance_phase(PhaseTrigger::Fix)
+            .expect("probe should advance to implement");
+        assert!(msg.contains("keep editing"), "{msg}");
+        assert_eq!(state.phase(), WorkPhase::Implement);
+        assert!(state.advance_phase(PhaseTrigger::Fix).is_none());
+        assert!(
+            state
+                .advance_phase(PhaseTrigger::DeliverableWrite)
+                .is_none()
+        );
+        assert!(state.advance_phase(PhaseTrigger::ScaleCollection).is_none());
+        assert_eq!(state.phase(), WorkPhase::Implement);
+        let (next, _) = state
+            .advance_phase(PhaseTrigger::FinalResponse)
+            .expect("final response ends implementation");
+        assert_eq!(next, WorkPhase::Synthesize);
+        assert!(state.advance_phase(PhaseTrigger::Fix).is_none());
     }
 
     #[test]
