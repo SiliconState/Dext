@@ -95,11 +95,13 @@ The renderer dependencies are exact so unrelated lockfile refreshes cannot chang
 - `ratatui = 0.30.2`
 - `ratatui-core` and `ratatui-crossterm` from unmodified upstream revision `7767679c138b383933fef4227e7fbf077b7cfeca` (both report `0.1.2`)
 - `tui-markdown = 0.3.10` (syntax highlighting remains disabled)
-- `pulldown-cmark = 0.13.4` (also directly reused for stable block boundaries)
+- `pulldown-cmark = 0.13.5` (also directly reused for stable block boundaries)
 - `crossterm = 0.29.0`
 - `unicode-width = 0.2.2`
 
 The reviewed October 12 dependency refresh updates only the Markdown renderer/parser within this stack. `tui-markdown` no longer includes its test helpers as production dependencies, removing nine unused transitive packages. Ratatui's Git revision, core/backend unification, Crossterm, Unicode width, and patched `lru` pins are unchanged; no syntax-highlighting dependencies are enabled.
+
+The October 28 security patch updates only `pulldown-cmark` from `0.13.4` to `0.13.5`, fixing [RUSTSEC-2026-0414](https://rustsec.org/advisories/RUSTSEC-2026-0414) (exponential event growth with `ENABLE_WIKILINKS`). The advisory requires that optional parser extension; a vulnerable dependency is not proof of an exploitable Dext path. Upstream's patch also includes parser correctness fixes, so focused renderer and real-PTY gates remain required. Other renderer versions and source pins are unchanged.
 
 ## Unmodified upstream integration
 

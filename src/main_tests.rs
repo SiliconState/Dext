@@ -29150,9 +29150,9 @@ fn process_output_warns_on_suspicious_stderr_with_success_status() {
 }
 
 #[tokio::test]
-async fn bash_prepends_cargo_json_diagnostics_summary() {
+async fn bash_cargo_diagnostics_preserve_exit_status() {
     let root = temp_test_dir("bash-cargo-json-summary");
-    let root = std::fs::canonicalize(&root).unwrap();
+    let _cleanup = RemoveDirOnDrop(root.clone());
     let line = json!({
         "reason": "compiler-message",
         "message": {
@@ -29168,23 +29168,41 @@ async fn bash_prepends_cargo_json_diagnostics_summary() {
         }
     })
     .to_string();
-    let escaped = serde_json::to_string(&line).unwrap();
 
-    let out = execute_bash_async_with_timeout(
-        &format!("printf '%s\\n' {escaped}"),
-        &root,
-        Arc::new(AtomicBool::new(false)),
-        std::time::Duration::from_secs(5),
-        SandboxProfile::WorkspaceWrite,
-    )
-    .await
-    .expect("bash should succeed");
+    for status in [0, 101] {
+        let out = execute_bash_async_with_timeout(
+            &format!(
+                "printf '%s\\n' {}; exit {status}",
+                shell_single_quote(&line)
+            ),
+            &root,
+            Arc::new(AtomicBool::new(false)),
+            std::time::Duration::from_secs(5),
+            SandboxProfile::WorkspaceWrite,
+        )
+        .await
+        .expect("bash should return its output even on a nonzero exit");
 
-    assert!(out.starts_with("cargo diagnostics summary"), "{out}");
-    assert!(out.contains("- error [E0308]: src/main.rs:10:7"), "{out}");
-    assert!(out.contains("exit: 0"), "{out}");
-
-    let _ = std::fs::remove_dir_all(&root);
+        assert!(out.starts_with(&format!("exit: {status}\n")), "{out}");
+        assert!(out.contains("cargo diagnostics summary"), "{out}");
+        assert!(out.contains("- error [E0308]: src/main.rs:10:7"), "{out}");
+        assert!(out.contains(&line), "raw diagnostics were lost: {out}");
+        assert_eq!(parse_bash_exit_code(&out), Some(status));
+        assert_eq!(
+            tool_journal_terminal_status("bash", &Ok(out.clone())),
+            if status == 0 {
+                tool_journal::ToolJournalStatus::Completed
+            } else {
+                tool_journal::ToolJournalStatus::Failed
+            }
+        );
+        let mut noted = out;
+        insert_runtime_notes(&mut noted, &["inspect the diagnostics".to_string()]);
+        assert_eq!(
+            parse_tool_exit_code("bash", status == 0, &noted),
+            Some(status)
+        );
+    }
 }
 
 #[test]
@@ -33771,6 +33789,380 @@ fn anthropic_request_strips_dext_only_tool_result_metadata() -> Result<()> {
     assert!(result.get("metadata").is_none(), "{result}");
 
     let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
+fn provider_requests_preserve_tool_result_failures_without_mutating_history() -> Result<()> {
+    let root = temp_test_dir("provider-tool-result-failures");
+    let _cleanup = RemoveDirOnDrop(root.clone());
+    let mut agent = test_agent(&root);
+    let cases = [
+        ("empty-error", "", Some(true), "(failed with no output)"),
+        (
+            "blank-error",
+            " \n\t",
+            Some(true),
+            "(failed with no output)",
+        ),
+        (
+            "text-error",
+            "exit: 1\ncompile failed",
+            Some(true),
+            "(failed)\nexit: 1\ncompile failed",
+        ),
+        ("empty-success", "", Some(false), ""),
+        ("blank-success", " \n\t", Some(false), " \n\t"),
+        ("empty-unflagged", "", None, ""),
+        ("blank-unflagged", " \n\t", None, " \n\t"),
+        (
+            "unicode-blank-error",
+            "\u{2003}\u{00a0}",
+            Some(true),
+            "(failed with no output)",
+        ),
+        ("text-success", "exit: 0", Some(false), "exit: 0"),
+        ("text-unflagged", "failure is data", None, "failure is data"),
+    ];
+    agent.history = vec![
+        Message {
+            role: "assistant".to_string(),
+            content: cases
+                .iter()
+                .map(|(id, _, _, _)| Block::ToolUse {
+                    id: (*id).to_string(),
+                    name: "bash".to_string(),
+                    input: json!({"command": "test -f missing"}),
+                })
+                .collect(),
+        },
+        Message {
+            role: "user".to_string(),
+            content: cases
+                .iter()
+                .map(|(id, content, is_error, _)| tool_result_block(id, content, *is_error))
+                .collect(),
+        },
+    ];
+    let saved_history = serde_json::to_value(&agent.history)?;
+    let system = [SystemBlock {
+        kind: "text",
+        text: "sys",
+        cache_control: None,
+    }];
+
+    for (provider_id, contract) in [
+        ("anthropic", RequestContract::AnthropicMessages),
+        ("deepseek", RequestContract::OpenAiChatCompletions),
+        ("openai", RequestContract::OpenAiResponses),
+        ("chatgpt", RequestContract::ChatGptResponses),
+    ] {
+        let mut profile = built_in_provider_profiles()
+            .into_iter()
+            .find(|profile| profile.id == provider_id)
+            .context("provider profile")?;
+        profile.request_contract = Some(contract);
+        agent.provider_id = provider_id.to_string();
+        agent.api_provider = profile.api_provider;
+        agent.model = profile.default_model.clone();
+        agent.provider_profile = Some(profile);
+        let (_, body) = agent.build_streaming_request("sys", "env", &system, &[], "sess")?;
+        let body: Value = serde_json::from_slice(&body)?;
+
+        for (id, content, is_error, flagless_content) in cases {
+            let (result, text_key) = match contract {
+                RequestContract::AnthropicMessages => (
+                    body["messages"][1]["content"]
+                        .as_array()
+                        .context("Anthropic tool results")?
+                        .iter()
+                        .find(|result| result["tool_use_id"] == id)
+                        .context("Anthropic tool result")?,
+                    "content",
+                ),
+                RequestContract::OpenAiChatCompletions => (
+                    body["messages"]
+                        .as_array()
+                        .context("Chat Completions messages")?
+                        .iter()
+                        .find(|result| result["role"] == "tool" && result["tool_call_id"] == id)
+                        .context("Chat Completions tool result")?,
+                    "content",
+                ),
+                RequestContract::OpenAiResponses | RequestContract::ChatGptResponses => (
+                    body["input"]
+                        .as_array()
+                        .context("Responses input")?
+                        .iter()
+                        .find(|result| {
+                            result["type"] == "function_call_output" && result["call_id"] == id
+                        })
+                        .context("Responses tool result")?,
+                    "output",
+                ),
+            };
+            let expected = if contract == RequestContract::AnthropicMessages {
+                assert_eq!(
+                    result.get("is_error"),
+                    is_error.map(|flag| json!(flag)).as_ref()
+                );
+                if is_error == Some(true) && content.trim().is_empty() {
+                    "(failed with no output)"
+                } else {
+                    content
+                }
+            } else {
+                assert!(result.get("is_error").is_none(), "{result}");
+                flagless_content
+            };
+            assert_eq!(result[text_key], expected, "{provider_id}: {id}");
+            assert!(result.get("metadata").is_none(), "{result}");
+        }
+        assert_eq!(serde_json::to_value(&agent.history)?, saved_history);
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn failed_tool_continues_after_provider_retry_without_reexecuting() -> Result<()> {
+    fn tool_response(contract: RequestContract, id: &str, name: &str, input: Value) -> String {
+        let arguments = input.to_string();
+        let events = match contract {
+            RequestContract::AnthropicMessages => vec![
+                json!({"type":"message_start", "message":{"usage":{}}}),
+                json!({"type":"content_block_start", "index":0, "content_block":{
+                    "type":"tool_use", "id":id, "name":name, "input":{}}}),
+                json!({"type":"content_block_delta", "index":0, "delta":{
+                    "type":"input_json_delta", "partial_json":arguments}}),
+                json!({"type":"content_block_stop", "index":0}),
+                json!({"type":"message_delta", "delta":{"stop_reason":"tool_use"}}),
+                json!({"type":"message_stop"}),
+            ],
+            RequestContract::OpenAiChatCompletions => vec![json!({"choices":[{
+                "delta":{"tool_calls":[{"index":0, "id":id, "function":{
+                    "name":name, "arguments":arguments}}]}, "finish_reason":"tool_calls"}]})],
+            RequestContract::OpenAiResponses | RequestContract::ChatGptResponses => {
+                let item_id = format!("fc_{id}");
+                vec![
+                    json!({"type":"response.output_item.added", "item":{
+                        "type":"function_call", "id":item_id, "call_id":id,
+                        "name":name, "arguments":""}}),
+                    json!({"type":"response.function_call_arguments.done",
+                        "item_id":item_id, "arguments":arguments}),
+                    json!({"type":"response.completed", "response":{
+                        "status":"completed", "output":[{"type":"function_call",
+                            "id":item_id, "call_id":id, "name":name, "arguments":arguments}]}}),
+                ]
+            }
+        };
+        events
+            .into_iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect()
+    }
+
+    for contract in [
+        RequestContract::AnthropicMessages,
+        RequestContract::OpenAiChatCompletions,
+        RequestContract::OpenAiResponses,
+        RequestContract::ChatGptResponses,
+    ] {
+        for diagnostics in [false, true] {
+            let root = temp_test_dir("failed-tool-continuation");
+            let _cleanup = RemoveDirOnDrop(root.clone());
+            std::fs::write(root.join("input.txt"), "available")?;
+            let status = if diagnostics { 101 } else { 7 };
+            let line = json!({"reason":"compiler-message", "message":{
+                "level":"error", "message":"mismatched types", "spans":[]}})
+            .to_string();
+            let command = if diagnostics {
+                format!(
+                    "printf x >> attempts.txt; printf '%s\\n' {}; exit {status}",
+                    shell_single_quote(&line)
+                )
+            } else {
+                format!("printf x >> attempts.txt; exit {status}")
+            };
+            let responses = [
+                tool_response(contract, "call_failed", "bash", json!({"command":command})),
+                "temporary upstream failure".to_string(),
+                tool_response(
+                    contract,
+                    "call_recovery",
+                    "read_file",
+                    json!({"path":"input.txt"}),
+                ),
+                stream_recovery_fixture(contract, "success", "Recovered."),
+            ];
+            let listener = TcpListener::bind("127.0.0.1:0")?;
+            let address = listener.local_addr()?;
+            let server = std::thread::spawn(move || -> Result<Vec<Value>> {
+                let mut requests = Vec::new();
+                for (index, response) in responses.into_iter().enumerate() {
+                    let mut stream = accept_test_connection(&listener, Duration::from_secs(10))?;
+                    let mut request = Vec::new();
+                    let mut buffer = [0; 4096];
+                    let header_end = loop {
+                        let count = stream.read(&mut buffer)?;
+                        anyhow::ensure!(count > 0, "truncated request headers");
+                        request.extend_from_slice(&buffer[..count]);
+                        anyhow::ensure!(request.len() <= 2 * 1024 * 1024, "request cap");
+                        if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+                        {
+                            break end + 4;
+                        }
+                    };
+                    let length = String::from_utf8_lossy(&request[..header_end])
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")?
+                                .trim()
+                                .parse::<usize>()
+                                .ok()
+                        })
+                        .context("request content length")?;
+                    anyhow::ensure!(length <= 2 * 1024 * 1024, "request body cap");
+                    while request.len() < header_end + length {
+                        let count = stream.read(&mut buffer)?;
+                        anyhow::ensure!(count > 0, "truncated request body");
+                        request.extend_from_slice(&buffer[..count]);
+                    }
+                    requests.push(serde_json::from_slice(
+                        &request[header_end..header_end + length],
+                    )?);
+                    let status = if index == 1 {
+                        "503 Service Unavailable"
+                    } else {
+                        "200 OK"
+                    };
+                    write!(
+                        stream,
+                        "HTTP/1.1 {status}\r\nContent-Type: text/event-stream\r\nRetry-After: 0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                        response.len()
+                    )?;
+                }
+                anyhow::ensure!(
+                    matches!(accept_test_connection(&listener, Duration::from_millis(100)),
+                        Err(error) if error.kind() == io::ErrorKind::TimedOut),
+                    "unexpected extra provider request"
+                );
+                Ok(requests)
+            });
+
+            let mut agent = test_agent(&root);
+            configure_stream_recovery_agent(&mut agent, contract);
+            agent.base_url = format!("http://{address}");
+            agent.thinking_effort = ThinkingEffort::Off;
+            agent.set_approval_profile(ApprovalProfile::Always);
+            agent.session_enabled = false;
+            agent.max_iterations = Some(3);
+            agent.history = vec![
+                Message {
+                    role: "assistant".to_string(),
+                    content: vec![Block::ToolUse {
+                        id: "call_old_blank_failure".to_string(),
+                        name: "bash".to_string(),
+                        input: json!({"command":"test -f missing"}),
+                    }],
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: vec![tool_result_block("call_old_blank_failure", "", Some(true))],
+                },
+            ];
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            agent.set_sink(Box::new(ChannelSink { tx }));
+            let result = tokio::time::timeout(
+                Duration::from_secs(20),
+                agent.chat("Continue the existing work.".to_string()),
+            )
+            .await;
+            let requests = server.join().expect("continuation server")?;
+            result.context("continuation deadline")??;
+            assert_eq!(requests.len(), 4, "{contract:?}, diagnostics={diagnostics}");
+            assert_eq!(requests[1], requests[2], "HTTP retry changed tool history");
+            assert_eq!(std::fs::read_to_string(root.join("attempts.txt"))?, "x");
+            let failed = agent
+                .history
+                .iter()
+                .flat_map(|message| &message.content)
+                .find_map(|block| {
+                    if let Block::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error,
+                        metadata,
+                    } = block
+                        && tool_use_id == "call_failed"
+                    {
+                        Some((content, is_error, metadata))
+                    } else {
+                        None
+                    }
+                })
+                .context("failed tool result")?;
+            assert_eq!(*failed.1, Some(true));
+            assert_eq!(failed.2.exit_code, Some(status));
+            assert_eq!(failed.2.status.as_deref(), Some("error"));
+            assert!(
+                failed.0.starts_with(&format!("exit: {status}\n")),
+                "{}",
+                failed.0
+            );
+            let retry_wire = requests[2].to_string();
+            assert!(
+                retry_wire.contains("(failed with no output)"),
+                "{retry_wire}"
+            );
+            if contract == RequestContract::AnthropicMessages {
+                assert!(retry_wire.contains("\"is_error\":true"), "{retry_wire}");
+            } else {
+                assert!(retry_wire.contains("(failed)\\nexit:"), "{retry_wire}");
+            }
+            assert!(agent.history.iter().flat_map(|message| &message.content).any(|block| {
+                matches!(block, Block::ToolResult { tool_use_id, content, is_error: Some(true), .. }
+                    if tool_use_id == "call_old_blank_failure" && content.is_empty())
+            }));
+            assert!(
+                agent
+                    .history
+                    .iter()
+                    .flat_map(|message| &message.content)
+                    .any(|block| { matches!(block, Block::Text { text } if text == "Recovered.") })
+            );
+            let events = drain_events(&mut rx);
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event,
+                AgentEvent::ToolCallResult { name, ok: false, .. } if name == "bash"))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event,
+                AgentEvent::ToolCallResult { name, ok: true, .. } if name == "read_file"))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, AgentEvent::HttpRetry { .. }))
+                    .count(),
+                1
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, AgentEvent::TurnEnd { failed: false, .. }))
+            );
+        }
+    }
     Ok(())
 }
 

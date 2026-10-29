@@ -2670,6 +2670,16 @@ fn empty_tool_result_metadata() -> ToolResultMetadata {
     ToolResultMetadata::default()
 }
 
+const EMPTY_TOOL_FAILURE: &str = "(failed with no output)";
+
+fn openai_tool_result_content(content: &str, is_error: Option<bool>) -> String {
+    match is_error {
+        Some(true) if content.trim().is_empty() => EMPTY_TOOL_FAILURE.to_string(),
+        Some(true) => format!("(failed)\n{content}"),
+        _ => content.to_string(),
+    }
+}
+
 const PROVIDER_ROUTE_CONTINUATION_PREFIX: &str = "[provider-route continuation]";
 
 fn has_provider_bound_reasoning(messages: &[Message]) -> bool {
@@ -2751,7 +2761,11 @@ fn sanitize_anthropic_messages(
                             ..
                         } => Some(Block::ToolResult {
                             tool_use_id: tool_use_id.clone(),
-                            content: content.clone(),
+                            content: if *is_error == Some(true) && content.trim().is_empty() {
+                                EMPTY_TOOL_FAILURE.to_string()
+                            } else {
+                                content.clone()
+                            },
                             is_error: *is_error,
                             metadata: ToolResultMetadata::default(),
                         }),
@@ -7889,9 +7903,18 @@ fn render_cargo_json_diagnostics_summary(output: &str, root: &Path) -> Option<St
     Some(out)
 }
 
-fn prepend_cargo_json_diagnostics_summary(output: String, root: &Path) -> String {
+fn insert_cargo_json_diagnostics_summary(output: String, root: &Path) -> String {
     match render_cargo_json_diagnostics_summary(&output, root) {
-        Some(summary) => format!("{summary}\n{output}"),
+        Some(summary) => {
+            // Failure, verification, and journal classification read the leading exit status.
+            if let Some((status, tail)) = output.split_once('\n')
+                && parse_bash_exit_code(&output).is_some()
+            {
+                format!("{status}\n{summary}\n{tail}")
+            } else {
+                format!("{summary}\n{output}")
+            }
+        }
         None => output,
     }
 }
@@ -9605,7 +9628,7 @@ async fn execute_bash_async_prepared(
     }
     body.push_str("--- stderr ---\n");
     body.push_str(&stderr);
-    Ok(prepend_cargo_json_diagnostics_summary(body, root))
+    Ok(insert_cargo_json_diagnostics_summary(body, root))
 }
 
 #[derive(Clone, Copy)]
@@ -17242,6 +17265,7 @@ impl Agent {
                             if let Block::ToolResult {
                                 tool_use_id,
                                 content,
+                                is_error,
                                 ..
                             } = b
                             {
@@ -17250,7 +17274,9 @@ impl Agent {
                                 }
                                 msgs.push(OaiMessage {
                                     role: "tool".to_string(),
-                                    content: Some(Value::String(content.clone())),
+                                    content: Some(Value::String(openai_tool_result_content(
+                                        content, *is_error,
+                                    ))),
                                     reasoning_content: None,
                                     tool_calls: None,
                                     tool_call_id: Some(tool_use_id.clone()),
@@ -17460,6 +17486,7 @@ impl Agent {
                     Block::ToolResult {
                         tool_use_id,
                         content,
+                        is_error,
                         ..
                     } => {
                         if !valid_ids.contains(tool_use_id) {
@@ -17468,7 +17495,7 @@ impl Agent {
                         items.push(json!({
                             "type": "function_call_output",
                             "call_id": tool_use_id,
-                            "output": content,
+                            "output": openai_tool_result_content(content, *is_error),
                         }));
                     }
                     Block::ImageReference { .. } => {
