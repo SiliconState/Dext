@@ -16383,8 +16383,11 @@ async fn provider_responses_large_terminal_frame_completes_over_http() -> Result
         "status":"completed", "usage":{"input_tokens":17,"output_tokens":9},
         "output":[{"type":"reasoning", "id":"rs_large", "summary":[],
             "encrypted_content":"x".repeat(300_000)}]}});
+    let streamed_item = json!({"type":"response.output_item.done", "item": {
+        "type":"reasoning", "id":"rs_large", "summary":[],
+        "encrypted_content":"streamed-state"}});
     let body = format!(
-        "data: {{\"type\":\"response.output_text.delta\",\"delta\":\"visible answer\"}}\n\nevent: response.completed\ndata: {terminal}\n\n"
+        "data: {streamed_item}\n\ndata: {{\"type\":\"response.output_text.delta\",\"delta\":\"visible answer\"}}\n\nevent: response.completed\ndata: {terminal}\n\n"
     );
     for contract in [
         RequestContract::ChatGptResponses,
@@ -16434,6 +16437,15 @@ async fn provider_responses_large_terminal_frame_completes_over_http() -> Result
         assert_eq!(parsed.usage.output, 9);
         assert!(parsed.blocks.iter().any(|block| matches!(block,
             Block::Text { text } if text == "visible answer")));
+        let reasoning = parsed.blocks.iter().find_map(|block| match block {
+            Block::ResponsesReasoning { item } => Some(item),
+            _ => None,
+        });
+        if contract == RequestContract::OpenAiResponses {
+            assert!(reasoning == Some(&terminal["response"]["output"][0]));
+        } else {
+            assert!(reasoning.is_none());
+        }
         assert_eq!(
             drain_events(&mut rx)
                 .iter()
@@ -34213,6 +34225,8 @@ fn openai_responses_replays_only_current_turn_encrypted_reasoning() {
     let root = temp_test_dir("openai-responses-reasoning-replay");
     let root = std::fs::canonicalize(&root).expect("canonical temp dir");
     let mut agent = test_agent(&root);
+    configure_stream_recovery_agent(&mut agent, RequestContract::OpenAiResponses);
+    agent.base_url = "https://api.openai.com".to_string();
     let reasoning = |id: &str, encrypted_content: &str| Block::ResponsesReasoning {
         item: json!({
             "type": "reasoning",
@@ -34255,6 +34269,26 @@ fn openai_responses_replays_only_current_turn_encrypted_reasoning() {
         },
     ];
 
+    let mut parser = streaming::ProviderStreamParser::new(RequestContract::OpenAiResponses, false);
+    for data in [
+        json!({"type": "response.output_item.done", "item": {
+            "type": "reasoning", "id": "rs_current", "encrypted_content": "enc-streamed", "summary": []}}),
+        json!({"type": "response.output_item.added", "item": {
+            "type": "function_call", "id": "fc_current", "call_id": "call_current", "name": "todo_read", "arguments": ""}}),
+        json!({"type": "response.function_call_arguments.done", "item_id": "fc_current", "arguments": "{}"}),
+        json!({"type": "response.completed", "response": {"status": "completed", "output": [
+            {"type": "reasoning", "id": "rs_current", "encrypted_content": "enc-terminal", "summary": []},
+            {"type": "function_call", "id": "fc_current", "call_id": "call_current", "name": "todo_read", "arguments": "{}"}]}}),
+    ] {
+        parser
+            .push_frame(streaming::SseFrame {
+                event: None,
+                data: Some(data.to_string()),
+            })
+            .unwrap();
+    }
+    agent.history[3].content = parser.finish().unwrap().blocks;
+    let history_before = serde_json::to_value(&agent.history).unwrap();
     let openai_items = agent.history_to_openai_responses_input();
     let reasoning_ids = openai_items
         .iter()
@@ -34262,6 +34296,23 @@ fn openai_responses_replays_only_current_turn_encrypted_reasoning() {
         .filter_map(|item| item["id"].as_str())
         .collect::<Vec<_>>();
     assert_eq!(reasoning_ids, ["rs_current"]);
+    let current_reasoning = openai_items
+        .iter()
+        .find(|item| item["type"] == "reasoning")
+        .unwrap();
+    assert_eq!(current_reasoning["encrypted_content"], "enc-terminal");
+    let (url, body) = agent
+        .build_streaming_request("sys", "env", &[], &[], "reasoning-replay")
+        .unwrap();
+    assert_eq!(url, "https://api.openai.com/v1/responses");
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    let wire_reasoning = body["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item["type"] == "reasoning")
+        .collect::<Vec<_>>();
+    assert_eq!(wire_reasoning, [current_reasoning]);
     assert!(
         openai_items
             .iter()
@@ -34272,6 +34323,10 @@ fn openai_responses_replays_only_current_turn_encrypted_reasoning() {
     assert!(
         chatgpt_items.iter().all(|item| item["type"] != "reasoning"),
         "{chatgpt_items:?}"
+    );
+    assert_eq!(
+        serde_json::to_value(&agent.history).unwrap(),
+        history_before
     );
     let _ = std::fs::remove_dir_all(&root);
 }
