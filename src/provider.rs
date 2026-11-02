@@ -473,6 +473,14 @@ fn openai_responses_model_specs(
     );
     let mut specs = HashMap::from([
         (
+            "gpt-6.1-terra".to_string(),
+            spec(
+                &["none", "low", "medium", "high", "xhigh", "max"],
+                &[],
+                model_pricing(1.0, 5.0, 0.05, 1.25),
+            ),
+        ),
+        (
             "gpt-6.1-sol".to_string(),
             spec(
                 &["low", "medium", "high", "xhigh", "max"],
@@ -547,6 +555,28 @@ pub(crate) fn is_claude_opus_5_5_model(model: &str) -> bool {
     model_has_family_fragment(model, &["opus-5-5", "opus-5.5", "opus5.5"])
 }
 
+pub(crate) fn is_claude_sonnet_5_5_model(model: &str) -> bool {
+    model_has_family_fragment(model, &["sonnet-5-5", "sonnet-5.5", "sonnet5.5"])
+}
+
+pub(crate) fn is_claude_haiku_5_5_model(model: &str) -> bool {
+    model_has_family_fragment(model, &["haiku-5-5", "haiku-5.5", "haiku5.5"])
+}
+
+pub(crate) fn is_kimi_adaptive_model(model: &str) -> bool {
+    matches!(
+        model.trim().to_ascii_lowercase().as_str(),
+        "k3" | "k3-256k" | "k3.1-pro" | "k3.1-pro-highspeed" | "kimi-for-coding"
+    )
+}
+
+pub(crate) fn is_glm_5_3_model(model: &str) -> bool {
+    matches!(
+        model.trim().to_ascii_lowercase().trim_end_matches("[1m]"),
+        "glm-5.3" | "glm-5.3-flash" | "glm-5.3-flashx" | "glm-5.3-flashx-legal"
+    )
+}
+
 fn canonical_deepseek_model(model: &str) -> Option<&'static str> {
     match model.trim().to_ascii_lowercase().as_str() {
         "deepseek-chat"
@@ -575,6 +605,17 @@ fn builtin_model_pricing(provider_id: &str, model: &str) -> Option<ModelPricing>
         "glm" if model.trim_end_matches("[1m]") == "glm-5.3-flash" => {
             Some(model_pricing(0.15, 0.5, 0.03, 0.0))
         }
+        "glm" if model.trim_end_matches("[1m]") == "glm-5.3" => {
+            Some(model_pricing(1.4, 4.4, 0.26, 0.0))
+        }
+        "glm"
+            if matches!(
+                model.trim_end_matches("[1m]"),
+                "glm-5.3-flashx" | "glm-5.3-flashx-legal"
+            ) =>
+        {
+            Some(model_pricing(0.37, 1.25, 0.075, 0.0))
+        }
         "glm" => Some(model_pricing(1.0, 5.0, 0.1, 1.25)),
         "deepseek" => deepseek_model_pricing(&model),
         "anthropic" if is_claude_fable_5_1_model(&model) => {
@@ -595,6 +636,12 @@ fn builtin_model_pricing(provider_id: &str, model: &str) -> Option<ModelPricing>
             Some(model_pricing(5.0, 25.0, 0.5, 6.25))
         }
         "anthropic" if model.contains("opus") => Some(model_pricing(15.0, 75.0, 1.5, 18.75)),
+        "anthropic" if is_claude_sonnet_5_5_model(&model) => {
+            Some(model_pricing(2.0, 10.0, 0.1, 2.5))
+        }
+        "anthropic" if is_claude_haiku_5_5_model(&model) => {
+            Some(model_pricing(0.1, 0.5, 0.01, 0.125))
+        }
         "anthropic" if model.contains("sonnet-5") || model.contains("sonnet5") => {
             Some(model_pricing(2.0, 10.0, 0.2, 2.5))
         }
@@ -607,6 +654,9 @@ fn builtin_model_pricing(provider_id: &str, model: &str) -> Option<ModelPricing>
             Some(model_pricing(10.0, 50.0, 1.0, 12.5))
         }
         "openai" | "chatgpt" if model == "gpt-6.1-sol" => Some(model_pricing(2.0, 10.0, 0.1, 2.5)),
+        "openai" | "chatgpt" if model == "gpt-6.1-terra" => {
+            Some(model_pricing(1.0, 5.0, 0.05, 1.25))
+        }
         "openai" | "chatgpt" if model == "gpt-6-sol" => Some(model_pricing(2.0, 10.0, 0.2, 2.5)),
         "openai" | "chatgpt" if model == "gpt-6-luna" => Some(model_pricing(0.1, 0.5, 0.01, 0.125)),
         "openai" | "chatgpt" if model == "gpt-5.6-sol" => Some(model_pricing(5.0, 30.0, 0.5, 6.25)),
@@ -684,8 +734,10 @@ fn hydrate_builtin_model_specs(profiles: &mut [ProviderProfile]) {
             let mut spec = profile.model_specs.remove(&normalized).unwrap_or_default();
             spec.pricing = builtin_model_pricing(&provider_id, &normalized);
             if provider_id == "glm" {
-                spec.capabilities.image_input =
-                    Some(normalized.trim_end_matches("[1m]") == "glm-5.3-flash");
+                spec.capabilities.image_input = Some(matches!(
+                    normalized.trim_end_matches("[1m]"),
+                    "glm-5.3-flash" | "glm-5.3-flashx"
+                ));
             }
             if matches!(provider_id.as_str(), "openai" | "chatgpt")
                 && (normalized.starts_with("gpt-4.1") || normalized.starts_with("gpt-4o"))
@@ -714,6 +766,36 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
         },
         pricing: None,
     };
+    let kimi_spec = |context_window| ModelSpec {
+        context_window: Some(context_window),
+        max_output_tokens: Some(131_072),
+        effort_levels: ["low", "high", "max"]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        capabilities: ModelCapabilities {
+            tools: Some(true),
+            reasoning: Some(true),
+            image_input: Some(true),
+            prompt_cache: None,
+        },
+        ..Default::default()
+    };
+    let claude_5_5_spec = ModelSpec {
+        context_window: Some(1_000_000),
+        max_output_tokens: Some(128_000),
+        effort_levels: ["low", "medium", "high", "xhigh", "max"]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        capabilities: ModelCapabilities {
+            tools: Some(true),
+            reasoning: Some(true),
+            image_input: Some(true),
+            prompt_cache: Some(true),
+        },
+        ..Default::default()
+    };
     let mut profiles = vec![
         ProviderProfile {
             id: "glm".to_string(),
@@ -725,6 +807,12 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
             models: vec![
                 "glm-5.3-flash".to_string(),
                 "glm-5.3-flash[1m]".to_string(),
+                "glm-5.3".to_string(),
+                "glm-5.3[1m]".to_string(),
+                "glm-5.3-flashx".to_string(),
+                "glm-5.3-flashx[1m]".to_string(),
+                "glm-5.3-flashx-legal".to_string(),
+                "glm-5.3-flashx-legal[1m]".to_string(),
                 "glm-5.2[1m]".to_string(),
                 "glm-5.2".to_string(),
                 "glm-5.1".to_string(),
@@ -770,7 +858,13 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
             model_defaults: ModelSpec::default(),
             model_specs: HashMap::from([
                 ("glm-5.3-flash".to_string(), glm_flash_spec.clone()),
-                ("glm-5.3-flash[1m]".to_string(), glm_flash_spec),
+                ("glm-5.3-flash[1m]".to_string(), glm_flash_spec.clone()),
+                ("glm-5.3".to_string(), glm_flash_spec.clone()),
+                ("glm-5.3[1m]".to_string(), glm_flash_spec.clone()),
+                ("glm-5.3-flashx".to_string(), glm_flash_spec.clone()),
+                ("glm-5.3-flashx[1m]".to_string(), glm_flash_spec.clone()),
+                ("glm-5.3-flashx-legal".to_string(), glm_flash_spec.clone()),
+                ("glm-5.3-flashx-legal[1m]".to_string(), glm_flash_spec),
             ]),
         },
         ProviderProfile {
@@ -782,6 +876,7 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
             default_model: "gpt-5.4".to_string(),
             models: vec![
                 "gpt-6.1-sol".to_string(),
+                "gpt-6.1-terra".to_string(),
                 "gpt-6-astra".to_string(),
                 "gpt-6-sol".to_string(),
                 "gpt-6-luna".to_string(),
@@ -846,6 +941,7 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
             default_model: "gpt-5".to_string(),
             models: vec![
                 "gpt-6.1-sol".to_string(),
+                "gpt-6.1-terra".to_string(),
                 "gpt-6-astra".to_string(),
                 "gpt-6-sol".to_string(),
                 "gpt-6-luna".to_string(),
@@ -888,6 +984,7 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
                 ("gpt56terra".to_string(), "gpt-5.6-terra".to_string()),
                 ("gpt56luna".to_string(), "gpt-5.6-luna".to_string()),
                 ("gpt61sol".to_string(), "gpt-6.1-sol".to_string()),
+                ("gpt61terra".to_string(), "gpt-6.1-terra".to_string()),
                 ("gpt6astra".to_string(), "gpt-6-astra".to_string()),
                 ("gpt6sol".to_string(), "gpt-6-sol".to_string()),
                 ("gpt6luna".to_string(), "gpt-6-luna".to_string()),
@@ -905,6 +1002,8 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
             models: vec![
                 "claude-sonnet-4-6".to_string(),
                 "claude-sonnet-5".to_string(),
+                "claude-sonnet-5-5".to_string(),
+                "claude-haiku-5-5".to_string(),
                 "claude-opus-5-5".to_string(),
                 "claude-opus-5".to_string(),
                 "claude-opus-4-8".to_string(),
@@ -945,6 +1044,8 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
             model_aliases: HashMap::new(),
             model_defaults: ModelSpec::default(),
             model_specs: HashMap::from([
+                ("claude-sonnet-5-5".to_string(), claude_5_5_spec.clone()),
+                ("claude-haiku-5-5".to_string(), claude_5_5_spec),
                 (
                     "claude-sonnet-5".to_string(),
                     ModelSpec {
@@ -1007,6 +1108,9 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
             base_url: KIMI_CODE_BASE_URL.to_string(),
             default_model: "k3".to_string(),
             models: vec![
+                "k3.1-pro".to_string(),
+                "k3.1-pro-highspeed".to_string(),
+                "k3-256k".to_string(),
                 "k3".to_string(),
                 "k2p7".to_string(),
                 "kimi-for-coding".to_string(),
@@ -1018,14 +1122,18 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
             login_url: Some("https://www.kimi.com/code/console".to_string()),
             oauth_flow: None,
             notes: Some(
-                "Kimi Code plan provider. /login kimi opens the Kimi Code console to create an API key; KIMI_API_KEY is not the separately billed MOONSHOT_API_KEY."
+                "Kimi Code plan provider. /login kimi opens the Kimi Code console to create an API key; KIMI_API_KEY is not the separately billed MOONSHOT_API_KEY. K3.1 Pro Highspeed consumes 2x plan usage; token costs remain zero incremental dollars."
                     .to_string(),
             ),
             context_window: Some(262_144),
             model_context_windows: HashMap::from([("k3".to_string(), 1_048_576)]),
-            model_effort_levels: HashMap::from([("k3".to_string(), vec!["max".to_string()])]),
+            model_effort_levels: HashMap::new(),
             request_contract: Some(RequestContract::AnthropicMessages),
-            model_aliases: HashMap::new(),
+            model_aliases: HashMap::from([
+                ("kimi-k3.1-pro".to_string(), "k3.1-pro".to_string()),
+                ("kimi-k3.1-pro-highspeed".to_string(), "k3.1-pro-highspeed".to_string()),
+                ("kimi-k3".to_string(), "k3".to_string()),
+            ]),
             model_defaults: ModelSpec {
                 context_window: Some(262_144),
                 max_output_tokens: Some(32_768),
@@ -1039,22 +1147,13 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
                 },
                 pricing: None,
             },
-            model_specs: HashMap::from([(
-                "k3".to_string(),
-                ModelSpec {
-                    context_window: Some(1_048_576),
-                    max_output_tokens: Some(131_072),
-                    effort_levels: vec!["max".to_string()],
-                    reasoning_modes: Vec::new(),
-                    capabilities: ModelCapabilities {
-                        tools: Some(true),
-                        reasoning: Some(true),
-                        image_input: Some(true),
-                        prompt_cache: None,
-                    },
-                    pricing: None,
-                },
-            )]),
+            model_specs: HashMap::from([
+                ("k3".to_string(), kimi_spec(1_048_576)),
+                ("k3-256k".to_string(), kimi_spec(262_144)),
+                ("k3.1-pro".to_string(), kimi_spec(1_048_576)),
+                ("k3.1-pro-highspeed".to_string(), kimi_spec(1_048_576)),
+                ("kimi-for-coding".to_string(), kimi_spec(1_048_576)),
+            ]),
         },
         ProviderProfile {
             id: "deepseek".to_string(),
@@ -1309,13 +1408,11 @@ fn ordered_model_entries<T>(
     entries: HashMap<String, T>,
 ) -> Vec<(String, T)> {
     let mut entries = entries.into_iter().collect::<Vec<_>>();
-    if profile.id == "deepseek" {
-        // Alias metadata fills omissions; exact canonical keys win conflicts.
-        entries.sort_by_cached_key(|(model, _)| {
-            let canonical = normalize_provider_model_value(profile, model);
-            (model == &canonical, model.clone())
-        });
-    }
+    // Alias metadata fills omissions; exact canonical keys win conflicts.
+    entries.sort_by_cached_key(|(model, _)| {
+        let canonical = normalize_provider_model_value(profile, model).to_ascii_lowercase();
+        (model == &canonical, model.clone())
+    });
     entries
 }
 
@@ -1423,11 +1520,7 @@ pub(crate) fn normalize_provider_profile(mut profile: ProviderProfile) -> Option
         let key = normalize_provider_model_value(&profile, &model).to_ascii_lowercase();
         if !key.is_empty() {
             let spec = normalize_model_spec(spec);
-            if profile.id == "deepseek" {
-                merge_model_spec(normalized_model_specs.entry(key).or_default(), spec);
-            } else {
-                normalized_model_specs.insert(key, spec);
-            }
+            merge_model_spec(normalized_model_specs.entry(key).or_default(), spec);
         }
     }
     profile.model_specs = normalized_model_specs;
@@ -1481,25 +1574,36 @@ fn merge_provider_profile_with_migrations(
     for (alias, target) in stored.model_aliases {
         builtin.model_aliases.insert(alias, target);
     }
-    if builtin_id == "deepseek" {
-        for (model, window) in &stored.model_context_windows {
-            if *window > 0 {
-                let key = normalize_provider_model_value(&builtin, model).to_ascii_lowercase();
-                stored
-                    .model_specs
-                    .entry(key)
-                    .or_default()
-                    .context_window
-                    .get_or_insert(*window);
-            }
+    let entries = std::mem::take(&mut stored.model_specs);
+    for (model, spec) in ordered_model_entries(&builtin, entries) {
+        let key = normalize_provider_model_value(&builtin, &model).to_ascii_lowercase();
+        merge_model_spec(stored.model_specs.entry(key).or_default(), spec);
+    }
+    let entries = std::mem::take(&mut stored.model_context_windows);
+    for (model, window) in ordered_model_entries(&builtin, entries) {
+        let key = normalize_provider_model_value(&builtin, &model).to_ascii_lowercase();
+        stored.model_context_windows.insert(key, window);
+    }
+    let entries = std::mem::take(&mut stored.model_effort_levels);
+    for (model, levels) in ordered_model_entries(&builtin, entries) {
+        let key = normalize_provider_model_value(&builtin, &model).to_ascii_lowercase();
+        stored.model_effort_levels.insert(key, levels);
+    }
+    for (model, window) in &stored.model_context_windows {
+        if *window > 0 {
+            stored
+                .model_specs
+                .entry(model.clone())
+                .or_default()
+                .context_window
+                .get_or_insert(*window);
         }
-        for (model, levels) in &stored.model_effort_levels {
-            if !levels.is_empty() {
-                let key = normalize_provider_model_value(&builtin, model).to_ascii_lowercase();
-                let spec = stored.model_specs.entry(key).or_default();
-                if spec.effort_levels.is_empty() {
-                    spec.effort_levels = levels.clone();
-                }
+    }
+    for (model, levels) in &stored.model_effort_levels {
+        if !levels.is_empty() {
+            let spec = stored.model_specs.entry(model.clone()).or_default();
+            if spec.effort_levels.is_empty() {
+                spec.effort_levels = levels.clone();
             }
         }
     }
@@ -1508,11 +1612,6 @@ fn merge_provider_profile_with_migrations(
         if refresh_retired_generated_prices {
             refresh_retired_builtin_pricing(&builtin_id, &model, &mut spec);
         }
-        let model = if builtin_id == "deepseek" {
-            normalize_provider_model_value(&builtin, &model).to_ascii_lowercase()
-        } else {
-            model
-        };
         merge_model_spec(builtin.model_specs.entry(model).or_default(), spec);
     }
 
@@ -2507,7 +2606,14 @@ pub(crate) fn is_gpt_5_6_model(model: &str) -> bool {
 pub(crate) fn is_gpt_6_model(model: &str) -> bool {
     matches!(
         model.trim().to_ascii_lowercase().as_str(),
-        "gpt-6.1-sol" | "gpt-6-astra" | "gpt-6-sol" | "gpt-6-luna"
+        "gpt-6.1-sol" | "gpt-6.1-terra" | "gpt-6-astra" | "gpt-6-sol" | "gpt-6-luna"
+    )
+}
+
+pub(crate) fn is_gpt_6_responses_tools_only_model(model: &str) -> bool {
+    matches!(
+        model.trim().to_ascii_lowercase().as_str(),
+        "gpt-6.1-sol" | "gpt-6.1-terra"
     )
 }
 
@@ -2970,6 +3076,7 @@ pub(crate) fn normalize_chatgpt_model_slug(model: &str) -> String {
         "gpt56terra" => "gpt-5.6-terra".to_string(),
         "gpt56luna" => "gpt-5.6-luna".to_string(),
         "gpt61sol" => "gpt-6.1-sol".to_string(),
+        "gpt61terra" => "gpt-6.1-terra".to_string(),
         "gpt6astra" => "gpt-6-astra".to_string(),
         "gpt6sol" => "gpt-6-sol".to_string(),
         "gpt6luna" => "gpt-6-luna".to_string(),
@@ -3003,7 +3110,10 @@ pub(crate) fn chatgpt_reasoning_effort(
         });
     }
     if effort == crate::ThinkingEffort::Off {
-        return None;
+        return model
+            .trim()
+            .eq_ignore_ascii_case("gpt-6.1-terra")
+            .then_some("none");
     }
     if effort == crate::ThinkingEffort::Minimal {
         return Some("low");

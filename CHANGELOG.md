@@ -4,11 +4,19 @@
 
 ### Changed
 
+- Added GPT-6.1 Terra to OpenAI/ChatGPT with Responses tool routing, native effort metadata, pricing, and compact aliases; Sol remains supported and no undocumented 6.1 names are inferred. Added verified Kimi Code K3.1 Pro/Highspeed and K3-256k, Anthropic Sonnet/Haiku 5.5, and GLM-5.3/FlashX/FlashX-Legal with model-specific limits, thinking, vision metadata, and pricing. Kimi defaults and credentials stay unchanged; Pro Highspeed consumes 2× plan usage, and live inference currently requires restored subscription access. Haiku 5.5 applies its documented higher price above 100K total input tokens.
+
 - Raised the transient foreground provider HTTP retry budget from four to six attempts per request round. Without `Retry-After`, five jittered waits total 16–27 seconds plus request time; this improves transient-failure tolerance but does not establish the cause of observed ChatGPT 503s or exclude size-dependent failures. A pre-request cancellation check prevents another request after an interrupted zero-second wait. Mock-server regressions cover five 503s before success, exhaustion at six requests, identical retry bodies, fail-fast authentication/schema errors, and interruption. Four-attempt stream/summary budgets remain separate.
 
 - Raised `read_image` from two to 100 successful images per user turn, with a shared 20 MiB sanitized-JPEG budget. Failed/over-budget calls do not add references or consume budget; batched dispatch and all four provider wire contracts enforce the same bounds before disclosure/base64 encoding. Existing approvals, decoder isolation, digest/route fences, metadata stripping and path-only sessions remain unchanged; no dependencies or persistent pixel cache were added. Provider context/request limits may be lower.
 
 ### Fixed
+
+- Fresh-eyes model review fixes Haiku 5.5 Off/summaries to explicitly disable default-on thinking at low output effort, applies its long-context tier to summary attempts, and preserves accumulated priced session costs across thresholds/model switches. Catalog merging now preserves legacy per-model overrides and deterministically combines alias metadata across built-ins; required-thinking Sonnet/Kimi/GLM requests and summaries honor declared effort restrictions. Regressions cover API-key/OAuth wire bodies, thinking replay/history immutability, summary-worker accounting, session analysis, canonical alias collisions, and reload stability.
+
+- Final model review also preserves official Kimi adaptive thinking without effort metadata, removes double effort mapping, rejects Haiku disabled-thinking requests with incompatible effort restrictions, and prevents Chat Completions effort fallback from escaping explicit levels or reasoning-disabled capability. Three focused regressions reproduce the original failures and cover declared none, medium/high, vendor levels, and invalid disabled-thinking combinations.
+
+- Updated the exact `pulldown-cmark` pin and lockfile from 0.13.5 to 0.13.6 for RUSTSEC-2026-0433 (quadratic parsing with optional image wikilinks), discovered during model verification. No unrelated dependency versions changed.
 
 - Anthropic Messages streams now allow 4 MiB per SSE event, matching Responses. A single `signature_delta` carries the whole opaque thinking signature; at maximum effort a live session failed with `event exceeded 256000 bytes` after earlier signatures reached 239,584 bytes. Chat Completions keeps the 256,000-byte event cap, and tool-argument and aggregate reasoning caps are unchanged. A fragmented 300,000-byte signature regression checks that the signature is preserved exactly.
 

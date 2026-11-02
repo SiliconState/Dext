@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::provider::{
-    ApiProvider, ModelPricing, is_claude_fable_5_1_model, is_claude_opus_5_5_model,
+    ApiProvider, ModelPricing, is_claude_fable_5_1_model, is_claude_haiku_5_5_model,
+    is_claude_opus_5_5_model, is_claude_sonnet_5_5_model,
 };
 use crate::{anthropic_prompt_cache_supported, canonical_provider_id, is_openai_responses_model};
 
@@ -353,6 +354,28 @@ pub(crate) fn openai_long_context_pricing_with_override_state(
     }
 }
 
+pub(crate) fn anthropic_long_context_pricing_with_override_state(
+    model: &str,
+    usage: Usage,
+    pricing: UsagePricing,
+    pricing_override_is_set: bool,
+) -> UsagePricing {
+    if is_claude_haiku_5_5_model(model)
+        && usage.total_input_tokens() > 100_000
+        && !pricing_override_is_set
+        && anthropic_pricing(&normalize_price_model(model)).is_some_and(|official| {
+            pricing.input == official.input
+                && pricing.output == official.output
+                && pricing.cache_read == official.cache_read
+                && pricing.cache_create == official.cache_create
+        })
+    {
+        pricing.scaled(5.0, 5.0)
+    } else {
+        pricing
+    }
+}
+
 pub(crate) fn usage_with_current_pricing(
     mut usage: Usage,
     provider_id: &str,
@@ -370,6 +393,16 @@ pub(crate) fn usage_with_current_pricing(
             |pricing| usage_pricing_from_env(UsagePricing::from(pricing)),
         );
         let pricing = openai_long_context_pricing(provider_id, model, usage, pricing);
+        let pricing = if api_provider == ApiProvider::Anthropic {
+            anthropic_long_context_pricing_with_override_state(
+                model,
+                usage,
+                pricing,
+                pricing_env_override_is_set(),
+            )
+        } else {
+            pricing
+        };
         usage.cost_usd = Some(pricing.estimate(usage));
     }
     usage
@@ -382,6 +415,8 @@ pub(crate) fn normalize_price_model(model: &str) -> String {
 pub(crate) fn openai_pricing(model: &str) -> Option<UsagePricing> {
     if model == "gpt-6.1-sol" {
         Some(UsagePricing::new(2.0, 10.0, 0.1, 2.5))
+    } else if model == "gpt-6.1-terra" {
+        Some(UsagePricing::new(1.0, 5.0, 0.05, 1.25))
     } else if model == "gpt-6-astra" {
         Some(UsagePricing::new(10.0, 50.0, 1.0, 12.5))
     } else if model == "gpt-6-sol" {
@@ -431,6 +466,15 @@ pub(crate) fn anthropic_pricing(model: &str) -> Option<UsagePricing> {
     if model.trim_end_matches("[1m]") == "glm-5.3-flash" {
         return Some(UsagePricing::new(0.15, 0.5, 0.03, 0.0));
     }
+    if model.trim_end_matches("[1m]") == "glm-5.3" {
+        return Some(UsagePricing::new(1.4, 4.4, 0.26, 0.0));
+    }
+    if matches!(
+        model.trim_end_matches("[1m]"),
+        "glm-5.3-flashx" | "glm-5.3-flashx-legal"
+    ) {
+        return Some(UsagePricing::new(0.37, 1.25, 0.075, 0.0));
+    }
     if model.starts_with("glm-") {
         return Some(UsagePricing::default());
     }
@@ -450,6 +494,10 @@ pub(crate) fn anthropic_pricing(model: &str) -> Option<UsagePricing> {
         Some(UsagePricing::new(5.0, 25.0, 0.5, 6.25))
     } else if model.contains("opus") {
         Some(UsagePricing::new(15.0, 75.0, 1.5, 18.75))
+    } else if is_claude_sonnet_5_5_model(model) {
+        Some(UsagePricing::new(2.0, 10.0, 0.1, 2.5))
+    } else if is_claude_haiku_5_5_model(model) {
+        Some(UsagePricing::new(0.1, 0.5, 0.01, 0.125))
     } else if model.contains("sonnet-5") || model.contains("sonnet5") {
         Some(UsagePricing::new(2.0, 10.0, 0.2, 2.5))
     } else if model.contains("sonnet") {

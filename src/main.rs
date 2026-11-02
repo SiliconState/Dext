@@ -50,16 +50,17 @@ use provider::{
     build_chatgpt_request, build_chatgpt_summary_request, build_openai_responses_request,
     built_in_provider_profiles, cancel_pending_oauth_login, canonical_provider_id,
     effective_request_contract, extract_oauth_code_from_callback, find_provider_profile,
-    handle_auth_cli, is_claude_fable_5_1_model, is_claude_opus_5_5_model, is_gpt_5_6_model,
-    is_gpt_6_model, is_gpt_6_sol_or_luna_model, is_official_anthropic_profile,
-    is_official_kimi_profile, is_openai_responses_model, list_models_for_available_providers,
-    list_models_for_provider, load_auth_store, load_provider_catalog, login_provider,
-    logout_provider, looks_like_login_secret_input, normalize_provider_model_value,
-    official_openai_responses_model, provider_auth_status, provider_catalog_path,
-    provider_id_from_selector, provider_request_url, refresh_local_llama_context_window,
-    render_provider_list, render_provider_picker, request_contract_for_profile,
-    resolve_active_provider_id, resolve_model_spec, resolve_provider_model_selection,
-    resolve_runtime_provider, set_active_provider_in_catalog,
+    handle_auth_cli, is_claude_fable_5_1_model, is_claude_haiku_5_5_model,
+    is_claude_opus_5_5_model, is_claude_sonnet_5_5_model, is_glm_5_3_model, is_gpt_5_6_model,
+    is_gpt_6_model, is_gpt_6_responses_tools_only_model, is_gpt_6_sol_or_luna_model,
+    is_kimi_adaptive_model, is_official_anthropic_profile, is_official_kimi_profile,
+    is_openai_responses_model, list_models_for_available_providers, list_models_for_provider,
+    load_auth_store, load_provider_catalog, login_provider, logout_provider,
+    looks_like_login_secret_input, normalize_provider_model_value, official_openai_responses_model,
+    provider_auth_status, provider_catalog_path, provider_id_from_selector, provider_request_url,
+    refresh_local_llama_context_window, render_provider_list, render_provider_picker,
+    request_contract_for_profile, resolve_active_provider_id, resolve_model_spec,
+    resolve_provider_model_selection, resolve_runtime_provider, set_active_provider_in_catalog,
     set_provider_default_model_in_catalog, try_complete_oauth_from_callback,
 };
 #[cfg(unix)]
@@ -3153,7 +3154,12 @@ fn openai_responses_reasoning_effort(effort: ThinkingEffort) -> &'static str {
 fn openai_reasoning_effort(model: &str, effort: ThinkingEffort) -> Option<&'static str> {
     if is_gpt_6_model(model) {
         return match effort {
-            ThinkingEffort::Off if is_gpt_6_sol_or_luna_model(model) => Some("none"),
+            ThinkingEffort::Off
+                if is_gpt_6_sol_or_luna_model(model)
+                    || model.trim().eq_ignore_ascii_case("gpt-6.1-terra") =>
+            {
+                Some("none")
+            }
             ThinkingEffort::Off => None,
             ThinkingEffort::Minimal | ThinkingEffort::Low => Some("low"),
             ThinkingEffort::Medium => Some("medium"),
@@ -3282,10 +3288,7 @@ fn glm_forced_thinking_effort(
     model: &str,
     effort: ThinkingEffort,
 ) -> Option<String> {
-    let model = model.trim().to_ascii_lowercase();
-    if canonical_provider_id(provider_id) != "glm"
-        || model.trim_end_matches("[1m]") != "glm-5.3-flash"
-    {
+    if canonical_provider_id(provider_id) != "glm" || !is_glm_5_3_model(model) {
         return None;
     }
     Some(
@@ -3308,6 +3311,18 @@ fn provider_model_output_config_effort(
 }
 
 fn anthropic_always_adaptive_effort(model: &str, effort: ThinkingEffort) -> Option<String> {
+    if is_claude_sonnet_5_5_model(model) {
+        return Some(
+            match effort {
+                ThinkingEffort::Off | ThinkingEffort::Minimal | ThinkingEffort::Low => "low",
+                ThinkingEffort::Medium => "medium",
+                ThinkingEffort::High => "high",
+                ThinkingEffort::XHigh => "xhigh",
+                ThinkingEffort::Max => "max",
+            }
+            .to_string(),
+        );
+    }
     let always_adaptive = is_claude_opus_5_5_model(model) || is_claude_fable_5_1_model(model);
     if !always_adaptive {
         return None;
@@ -3370,11 +3385,15 @@ fn anthropic_output_config_effort(model: &str, effort: ThinkingEffort) -> Option
     Some(effort.to_string())
 }
 
-// Effort availability follows the official effort doc: Opus 5.5 and Fable 5.1
-// support low/medium/high/max; `xhigh` exists on Sonnet 5, Opus 4.7/4.8,
-// Opus 5, and Fable 5; `max` additionally covers the 4.6 generation.
+// Effort availability follows the official effort doc and Models API: Sonnet/Haiku
+// 5.5 support xhigh/max; Opus 5.5 and Fable 5.1 support low/medium/high/max.
+// Earlier xhigh models include Sonnet 5, Opus 4.7/4.8/5, and Fable 5;
+// max additionally covers the 4.6 generation.
 fn anthropic_model_supports_xhigh_effort(model: &str) -> bool {
     let model = model.trim().to_ascii_lowercase();
+    if is_claude_sonnet_5_5_model(&model) || is_claude_haiku_5_5_model(&model) {
+        return true;
+    }
     if anthropic_always_adaptive_effort(&model, ThinkingEffort::XHigh).is_some() {
         return false;
     }
@@ -3402,7 +3421,8 @@ fn anthropic_model_supports_max_effort(model: &str) -> bool {
 
 fn anthropic_model_supports_adaptive_thinking(model: &str) -> bool {
     let model = model.trim().to_ascii_lowercase();
-    model.contains("opus-4-6")
+    is_claude_haiku_5_5_model(&model)
+        || model.contains("opus-4-6")
         || model.contains("opus-4.6")
         || model.contains("opus-4-7")
         || model.contains("opus-4.7")
@@ -14720,13 +14740,69 @@ impl Agent {
 
     fn kimi_model_uses_adaptive_thinking(&self) -> bool {
         self.official_kimi_model()
-            .is_some_and(|model| model.eq_ignore_ascii_case("k3"))
+            .is_some_and(is_kimi_adaptive_model)
+    }
+
+    fn required_anthropic_thinking_for_model(
+        &self,
+        model: &str,
+        effort: ThinkingEffort,
+    ) -> Option<(&'static str, String)> {
+        if self.request_contract_for_model(model) != RequestContract::AnthropicMessages {
+            return None;
+        }
+        let kimi_adaptive = self.provider_profile.as_ref().is_some_and(|profile| {
+            is_official_kimi_profile(profile, &self.base_url) && is_kimi_adaptive_model(model)
+        });
+        let (kind, effort) = if kimi_adaptive {
+            let effort = match effort {
+                ThinkingEffort::Off | ThinkingEffort::Minimal | ThinkingEffort::Low => "low",
+                ThinkingEffort::Medium | ThinkingEffort::High | ThinkingEffort::XHigh => "high",
+                ThinkingEffort::Max => "max",
+            };
+            ("adaptive", effort.to_string())
+        } else if let Some(effort) = glm_forced_thinking_effort(&self.provider_id, model, effort) {
+            ("enabled", effort)
+        } else {
+            (
+                "adaptive",
+                anthropic_required_adaptive_effort(&self.provider_id, model, effort)?,
+            )
+        };
+        let levels = self
+            .provider_profile
+            .as_ref()
+            .map(|profile| resolve_model_spec(profile, model).effort_levels)
+            .unwrap_or_default();
+        let effort = if levels.is_empty() {
+            effort
+        } else {
+            map_effort_to_provider_levels(&levels, ThinkingEffort::parse(&effort)?)?
+        };
+        Some((kind, effort))
+    }
+
+    fn disabled_thinking_effort_for_haiku(&self, model: &str) -> Result<String> {
+        let levels = self
+            .provider_profile
+            .as_ref()
+            .map(|profile| resolve_model_spec(profile, model).effort_levels)
+            .unwrap_or_default();
+        if levels.is_empty() {
+            return Ok("low".to_string());
+        }
+        let levels = levels
+            .into_iter()
+            .filter(|level| matches!(level.as_str(), "low" | "medium" | "high"))
+            .collect::<Vec<_>>();
+        map_effort_to_provider_levels(&levels, ThinkingEffort::Low).ok_or_else(|| {
+            anyhow::anyhow!("{model} disabled thinking requires a declared low, medium, or high effort level; update model effort metadata or enable thinking")
+        })
     }
 
     fn kimi_model_allows_empty_thinking_signature(&self) -> bool {
-        self.official_kimi_model().is_some_and(|model| {
-            model.eq_ignore_ascii_case("k3") || model.eq_ignore_ascii_case("kimi-for-coding")
-        })
+        self.official_kimi_model()
+            .is_some_and(is_kimi_adaptive_model)
     }
 
     fn request_contract_for_model(&self, model: &str) -> RequestContract {
@@ -14884,6 +14960,9 @@ impl Agent {
     /// a value they understand.
     fn oai_chat_reasoning_effort(&self, effort: ThinkingEffort) -> Option<String> {
         let resolved_spec = self.resolved_model_spec();
+        if resolved_spec.as_ref().is_some_and(|spec| !spec.reasoning) {
+            return None;
+        }
         if self.deepseek_chat_enabled() {
             let mapped = match effort {
                 ThinkingEffort::Off => return None,
@@ -14899,20 +14978,25 @@ impl Agent {
                 .and_then(|spec| map_effort_to_provider_levels(&spec.effort_levels, mapped))
                 .or_else(|| Some(mapped.as_str().to_string()));
         }
-        resolved_spec
+        if let Some(spec) = resolved_spec
             .as_ref()
             .filter(|spec| !spec.effort_levels.is_empty())
-            .and_then(|spec| map_effort_to_provider_levels(&spec.effort_levels, effort))
-            .or_else(|| {
-                (resolved_spec
-                    .as_ref()
-                    .is_none_or(|spec| spec.source == "legacy"))
-                .then(|| {
-                    provider_model_output_config_effort(&self.provider_id, &self.model, effort)
-                })
-                .flatten()
-            })
-            .or_else(|| openai_reasoning_effort(&self.model, effort).map(str::to_string))
+        {
+            if effort == ThinkingEffort::Off {
+                return spec
+                    .effort_levels
+                    .iter()
+                    .any(|level| level == "none")
+                    .then(|| "none".to_string());
+            }
+            return map_effort_to_provider_levels(&spec.effort_levels, effort);
+        }
+        (resolved_spec
+            .as_ref()
+            .is_none_or(|spec| spec.source == "legacy"))
+        .then(|| provider_model_output_config_effort(&self.provider_id, &self.model, effort))
+        .flatten()
+        .or_else(|| openai_reasoning_effort(&self.model, effort).map(str::to_string))
     }
 
     fn model_supports_image_input(&self) -> bool {
@@ -15003,6 +15087,10 @@ impl Agent {
     }
 
     fn priced_session_usage(&self) -> Usage {
+        // Request tiers and model prices cannot be reapplied to aggregate counts.
+        if self.session_usage.cost_usd.is_some() {
+            return self.session_usage;
+        }
         let model_spec = self.resolved_model_spec();
         usage_with_current_pricing(
             self.session_usage,
@@ -17716,9 +17804,10 @@ impl Agent {
                 let mut oai_msgs = self.history_to_oai_messages(sys_stable);
                 push_runtime_env_oai_message(&mut oai_msgs, sys_env);
                 let oai_tools = self.wire_tools_oai();
-                if self.model.trim().eq_ignore_ascii_case("gpt-6.1-sol") && !oai_tools.is_empty() {
+                if is_gpt_6_responses_tools_only_model(&self.model) && !oai_tools.is_empty() {
                     anyhow::bail!(
-                        "gpt-6.1-sol tool calling requires the Responses API; configure this provider with the openai-responses request contract"
+                        "{} tool calling requires the Responses API; configure this provider with the openai-responses request contract",
+                        self.model
                     );
                 }
                 let reasoning_effort =
@@ -17778,47 +17867,52 @@ impl Agent {
             RequestContract::AnthropicMessages => {
                 let max_tokens = max_output_tokens;
                 let resolved_spec = self.resolved_model_spec();
-                let configured_effort =
-                    glm_forced_thinking_effort(&self.provider_id, &self.model, effort)
-                        .or_else(|| {
-                            resolved_spec
-                                .as_ref()
-                                .filter(|spec| !spec.effort_levels.is_empty())
-                                .and_then(|spec| {
-                                    map_effort_to_provider_levels(&spec.effort_levels, effort)
-                                })
+                let configured_effort = resolved_spec
+                    .as_ref()
+                    .filter(|spec| !spec.effort_levels.is_empty())
+                    .and_then(|spec| map_effort_to_provider_levels(&spec.effort_levels, effort))
+                    .or_else(|| {
+                        (resolved_spec
+                            .as_ref()
+                            .is_none_or(|spec| spec.source == "legacy"))
+                        .then(|| {
+                            provider_model_output_config_effort(
+                                &self.provider_id,
+                                &self.model,
+                                effort,
+                            )
                         })
-                        .or_else(|| {
-                            (resolved_spec
-                                .as_ref()
-                                .is_none_or(|spec| spec.source == "legacy"))
-                            .then(|| {
-                                provider_model_output_config_effort(
-                                    &self.provider_id,
-                                    &self.model,
-                                    effort,
-                                )
-                            })
-                            .flatten()
-                        });
-                let required_adaptive_effort =
-                    anthropic_required_adaptive_effort(&self.provider_id, &self.model, effort);
-                let (thinking, output_config) = if let Some(effort) = required_adaptive_effort {
+                        .flatten()
+                    });
+                let required_thinking =
+                    self.required_anthropic_thinking_for_model(&self.model, effort);
+                let (thinking, output_config) = if let Some((kind, effort)) = required_thinking {
                     (
                         Some(AnthropicThinking {
-                            kind: "adaptive",
+                            kind,
                             budget_tokens: None,
                         }),
                         Some(AnthropicOutputConfig { effort }),
                     )
                 } else if let Some(effort) = configured_effort {
-                    let kimi_adaptive = self.kimi_model_uses_adaptive_thinking();
+                    let adaptive = self.kimi_model_uses_adaptive_thinking()
+                        || uses_anthropic_adaptive_thinking(&self.provider_id, &self.model);
                     (
                         Some(AnthropicThinking {
-                            kind: if kimi_adaptive { "adaptive" } else { "enabled" },
+                            kind: if adaptive { "adaptive" } else { "enabled" },
                             budget_tokens: None,
                         }),
                         Some(AnthropicOutputConfig { effort }),
+                    )
+                } else if effort == ThinkingEffort::Off && is_claude_haiku_5_5_model(&self.model) {
+                    (
+                        Some(AnthropicThinking {
+                            kind: "disabled",
+                            budget_tokens: None,
+                        }),
+                        Some(AnthropicOutputConfig {
+                            effort: self.disabled_thinking_effort_for_haiku(&self.model)?,
+                        }),
                     )
                 } else if uses_anthropic_adaptive_thinking(&self.provider_id, &self.model) {
                     let effort = anthropic_output_config_effort(&self.model, effort);
@@ -17846,7 +17940,7 @@ impl Agent {
                 let history = &self.history;
                 let messages = sanitize_anthropic_messages(
                     history,
-                    thinking.is_some(),
+                    thinking.is_some_and(|thinking| thinking.kind != "disabled"),
                     self.kimi_model_allows_empty_thinking_signature(),
                 );
                 let prompt_cache_enabled = self.model_supports_prompt_cache();
@@ -18822,25 +18916,28 @@ impl Agent {
             text: COMPACT_SYSTEM,
             cache_control: None,
         }];
-        let required_adaptive_effort =
-            anthropic_required_adaptive_effort(&self.provider_id, model, ThinkingEffort::Low);
-        let effort = glm_forced_thinking_effort(&self.provider_id, model, ThinkingEffort::Low);
-        let (thinking, output_config) = if let Some(effort) = required_adaptive_effort {
+        let (thinking, output_config) = if let Some((kind, effort)) =
+            self.required_anthropic_thinking_for_model(model, ThinkingEffort::Low)
+        {
             (
                 Some(AnthropicThinking {
-                    kind: "adaptive",
+                    kind,
                     budget_tokens: None,
                 }),
                 Some(AnthropicOutputConfig { effort }),
             )
-        } else {
+        } else if is_claude_haiku_5_5_model(model) {
             (
-                effort.as_ref().map(|_| AnthropicThinking {
-                    kind: "enabled",
+                Some(AnthropicThinking {
+                    kind: "disabled",
                     budget_tokens: None,
                 }),
-                effort.map(|effort| AnthropicOutputConfig { effort }),
+                Some(AnthropicOutputConfig {
+                    effort: self.disabled_thinking_effort_for_haiku(model)?,
+                }),
             )
+        } else {
+            (None, None)
         };
         let body = Request {
             model,
@@ -18882,8 +18979,8 @@ impl Agent {
             .then(|| self.responses_reasoning_effort_for_model(&model, ThinkingEffort::Low))
             .flatten();
         let thinking = effort.is_some()
-            || glm_forced_thinking_effort(&self.provider_id, &model, ThinkingEffort::Low).is_some()
-            || anthropic_required_adaptive_effort(&self.provider_id, &model, ThinkingEffort::Low)
+            || self
+                .required_anthropic_thinking_for_model(&model, ThinkingEffort::Low)
                 .is_some();
         let max_tokens = compact_summary_max_tokens(self.thinking_effort, thinking);
         let bytes = if contract.is_responses() {
@@ -21156,14 +21253,18 @@ fn analyze_session_history(header: &SessionHeader, history: &[Message]) -> Sessi
     } else {
         &header.provenance.model
     };
-    let usage = usage_with_current_pricing(
-        header.usage,
-        provider_id,
-        header.provenance.api_provider,
-        base_url,
-        model,
-        None,
-    );
+    let usage = if header.usage.cost_usd.is_some() {
+        header.usage
+    } else {
+        usage_with_current_pricing(
+            header.usage,
+            provider_id,
+            header.provenance.api_provider,
+            base_url,
+            model,
+            None,
+        )
+    };
     let mut analysis = SessionAnalysis {
         messages: history.len(),
         provider: header.provenance.provider.clone(),
