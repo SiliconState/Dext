@@ -18,6 +18,8 @@
 
 - Updated the exact `pulldown-cmark` pin and lockfile from 0.13.5 to 0.13.6 for RUSTSEC-2026-0433 (quadratic parsing with optional image wikilinks), discovered during model verification. No unrelated dependency versions changed.
 
+- The bash tool now refuses `wsl[.exe] --update`, `--shutdown`, `--terminate`/`-t` and `--unregister`, including inside PowerShell/cmd strings, and tells the model to hand them to the user. On 2026-11-01 a session ran `wsl --update` from inside WSL and the upgrade restarted WSL, killing every running session. Read-only calls such as `wsl --version` still run.
+
 - Anthropic Messages streams now allow 4 MiB per SSE event, matching Responses. A single `signature_delta` carries the whole opaque thinking signature; at maximum effort a live session failed with `event exceeded 256000 bytes` after earlier signatures reached 239,584 bytes. Chat Completions keeps the 256,000-byte event cap, and tool-argument and aggregate reasoning caps are unchanged. A fragmented 300,000-byte signature regression checks that the signature is preserved exactly.
 
 - The lockfile raises Rustls from 0.23.45 to 0.23.46, clearing RUSTSEC-2026-0346 through RUSTSEC-2026-0349. Only that one lockfile entry changed.
