@@ -12771,39 +12771,32 @@ struct TerminalGuard {
 
 impl TerminalGuard {
     fn new() -> io::Result<Self> {
+        Self::with_output(&mut io::stdout())
+    }
+
+    fn with_output(out: &mut impl Write) -> io::Result<Self> {
         enable_raw_mode()?;
         crate::session::set_tui_active(true);
-
+        let mut guard = Self {
+            active: true,
+            keyboard_enhancement_enabled: false,
+        };
         let keyboard_enhancement_enabled = terminal_supports_keyboard_enhancement();
         let keyboard_flags = KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES;
 
-        let mut out = io::stdout();
-        let execute_result = if keyboard_enhancement_enabled {
-            crossterm::execute!(
-                out,
-                EnableBracketedPaste,
-                PushKeyboardEnhancementFlags(keyboard_flags),
-                crossterm::cursor::SetCursorStyle::SteadyBlock,
-                crossterm::cursor::Show
-            )
-        } else {
-            crossterm::execute!(
-                out,
-                EnableBracketedPaste,
-                crossterm::cursor::SetCursorStyle::SteadyBlock,
-                crossterm::cursor::Show
-            )
-        };
-        if let Err(err) = execute_result {
-            crate::session::restore_terminal_if_tui();
-            return Err(err);
+        crossterm::queue!(out, EnableBracketedPaste)?;
+        if keyboard_enhancement_enabled {
+            guard.keyboard_enhancement_enabled = true;
+            crossterm::queue!(out, PushKeyboardEnhancementFlags(keyboard_flags))?;
         }
+        crossterm::execute!(
+            out,
+            crossterm::cursor::SetCursorStyle::SteadyBlock,
+            crossterm::cursor::Show
+        )?;
 
         out.flush()?;
-        Ok(Self {
-            active: true,
-            keyboard_enhancement_enabled,
-        })
+        Ok(guard)
     }
 }
 
@@ -12901,6 +12894,14 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
     );
     let initial_todos = initial_todo_items(&agent.sandbox_root, &agent.session_id);
     let auto_approved_count = agent.auto_approved_privileged_tool_count();
+    let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<ToTui>();
+    let warning_tx = ev_tx.clone();
+    let warning_guard = crate::events::route_runtime_warnings(move |message| {
+        let event = AgentEvent::Warn(message);
+        crate::record_crash_event(&event);
+        // A closed UI must not fall back to stderr while raw mode is active.
+        let _ = warning_tx.send(ToTui::Event(event));
+    });
     let _guard = TerminalGuard::new()?;
     let stdout = io::stdout();
     let backend = ReplayBackend::new(CrosstermBackend::new(stdout));
@@ -12911,7 +12912,6 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
         },
     )?;
 
-    let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<ToTui>();
     let (live_tx, mut live_rx) =
         tokio::sync::mpsc::channel::<AgentEvent>(crate::LIVE_OUTPUT_EVENT_QUEUE_CAP);
     let (in_tx, mut in_rx) = tokio::sync::mpsc::unbounded_channel::<FromTui>();
@@ -13453,6 +13453,7 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
 
     drop(terminal);
     drop(_guard);
+    drop(warning_guard);
     Ok(())
 }
 
@@ -13482,6 +13483,120 @@ mod tests {
     use super::*;
     use crate::provider::StoredCredential;
     use std::sync::atomic::AtomicBool;
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_setup_errors_restore_raw_mode() {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::process::CommandExt as _;
+        use std::process::{Command, Stdio};
+
+        const CHILD_ENV: &str = "DEXT_TEST_TERMINAL_SETUP_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let mut master = -1;
+            let mut slave = -1;
+            assert_eq!(
+                unsafe {
+                    libc::openpty(
+                        &mut master,
+                        &mut slave,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                    )
+                },
+                0
+            );
+            let _master = unsafe { std::fs::File::from_raw_fd(master) };
+            let slave = unsafe { std::fs::File::from_raw_fd(slave) };
+            let mut original: libc::termios = unsafe { std::mem::zeroed() };
+            assert_eq!(
+                unsafe { libc::tcgetattr(slave.as_raw_fd(), &mut original) },
+                0
+            );
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "tui::tests::terminal_setup_errors_restore_raw_mode",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .env("DEXT_KEYBOARD_ENHANCEMENT", "1")
+                .stdin(Stdio::from(slave.try_clone().unwrap()))
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped());
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setsid() == -1
+                        || libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY as libc::c_ulong, 0)
+                            == -1
+                    {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let mut child = command.spawn().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while child.try_wait().unwrap().is_none() {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("terminal setup regression exceeded deadline");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let mut restored: libc::termios = unsafe { std::mem::zeroed() };
+            assert_eq!(
+                unsafe { libc::tcgetattr(slave.as_raw_fd(), &mut restored) },
+                0
+            );
+            assert_eq!(restored.c_lflag, original.c_lflag);
+            assert_eq!(restored.c_iflag, original.c_iflag);
+            assert_eq!(restored.c_oflag, original.c_oflag);
+            return;
+        }
+
+        struct FailingOutput {
+            fail_write: bool,
+            fail_flush: usize,
+            flushes: usize,
+        }
+        impl Write for FailingOutput {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                assert!(crossterm::terminal::is_raw_mode_enabled()?);
+                if self.fail_write {
+                    Err(io::Error::other("injected setup write failure"))
+                } else {
+                    Ok(bytes.len())
+                }
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                self.flushes += 1;
+                if self.flushes == self.fail_flush {
+                    Err(io::Error::other("injected setup flush failure"))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        for (fail_write, fail_flush) in [(true, 0), (false, 1), (false, 2)] {
+            let mut out = FailingOutput {
+                fail_write,
+                fail_flush,
+                flushes: 0,
+            };
+            assert!(TerminalGuard::with_output(&mut out).is_err());
+            assert!(!crossterm::terminal::is_raw_mode_enabled().unwrap());
+        }
+    }
 
     struct ReplayProbe {
         inner: ratatui::backend::TestBackend,
@@ -21133,6 +21248,34 @@ mod tests {
                     _
                 ] if name == "read_symbol" && advisory.starts_with("read_symbol expects")
             ));
+        }
+    }
+
+    #[test]
+    fn checkpoint_warnings_preserve_busy_composer_at_multiple_widths() {
+        let mut state = TuiState::new(
+            "test-model".into(),
+            8192,
+            ".".into(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.agent_busy = true;
+        state.input = "Draft stays here".into();
+        state.cursor = 5;
+        let warning = "[checkpoint] retention warning: skip malformed checkpoint sidecar entry: /repo/.dext/checkpoints/.manifest.txt.tmp-123-456";
+        state.apply_event(AgentEvent::Warn(warning.into()));
+        assert!(matches!(state.pending_insert.as_slice(), [Line_::Warn(text)] if text == warning));
+        for width in [38, 80, 120] {
+            let area = Rect::new(0, 0, width, 24);
+            let input_area = compute_layout(area, &state).input_area;
+            let lines = draw_to_lines(width, 24, &mut state);
+            let composer =
+                lines[usize::from(input_area.y)..usize::from(input_area.bottom())].join("\n");
+            assert!(composer.contains("Draft stays here"), "{composer}");
+            assert!(!composer.contains("checkpoint"), "{composer}");
+            assert_eq!(state.input, "Draft stays here");
+            assert_eq!(state.cursor, 5);
         }
     }
 

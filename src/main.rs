@@ -11452,7 +11452,7 @@ impl Hooks {
     fn load_file(path: &Path) -> Self {
         match std::fs::read_to_string(path) {
             Ok(s) => serde_json::from_str(&s).unwrap_or_else(|e| {
-                eprintln!("[hooks] parse error in {}: {e}", path.display());
+                events::runtime_warning(format!("[hooks] parse error in {}: {e}", path.display()));
                 Hooks::default()
             }),
             Err(_) => Hooks::default(),

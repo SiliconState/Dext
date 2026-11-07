@@ -153,7 +153,8 @@ Dext is a Rust terminal agent packaged as one binary. Most behavior is still int
   - Per-provider token-usage normalization into disjoint input buckets, per-model pricing, and spend/token budget caps with at most one cap per dimension. Haiku 5.5's per-request tier applies to foreground and blocking/background summary attempts. Priced session totals and exported session analysis preserve accumulated request costs across thresholds/model switches rather than repricing aggregate tokens.
 
 - `src/events.rs`
-  - The `AgentEvent` stream and the `EventSink` trait each front end implements, including explicit `PackStart` attribution before provider output. The sinks themselves stay with the console I/O layer in `main.rs`.
+  - The `AgentEvent` stream and the `EventSink` trait each front end implements, including explicit `PackStart` attribution before provider output. Console/JSON sinks live in `main.rs`; the TUI channel sink lives in `tui.rs`.
+  - A scoped cross-thread runtime-warning route sends low-level checkpoint and hook diagnostics through the TUI warning transcript instead of raw stderr. It is installed before raw mode, removed after terminal restoration, and never falls back to stderr for a closed UI within that scope; outside the scope, CLI stderr behavior is unchanged. Fallback writes and route installation hold the same lock, so a startup warning cannot select stderr and print after the TUI takes ownership. Terminal setup arms cleanup immediately after enabling raw mode, including command-write and flush error paths.
 
 - `src/crash.rs`
   - Panic hook, redacted owner-only crash snapshots, and the bounded event breadcrumb trail they record.
