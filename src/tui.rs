@@ -13574,12 +13574,26 @@ mod tests {
                 }
             }
         }
+        fn terminal_settings() -> libc::termios {
+            #[cfg(target_os = "macos")]
+            {
+                // Darwin sets PENDIN on canonical-mode restoration; FIONREAD settles it.
+                let mut pending: libc::c_int = -1;
+                assert_eq!(
+                    unsafe { libc::ioctl(libc::STDIN_FILENO, libc::FIONREAD, &mut pending) },
+                    0
+                );
+                assert_eq!(pending, 0, "fixture input queue must remain empty");
+            }
+            let mut settings: libc::termios = unsafe { std::mem::zeroed() };
+            assert_eq!(
+                unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut settings) },
+                0
+            );
+            settings
+        }
         // macOS can revoke the slave when its controlling-session child exits.
-        let mut original: libc::termios = unsafe { std::mem::zeroed() };
-        assert_eq!(
-            unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut original) },
-            0
-        );
+        let original = terminal_settings();
         for (fail_write, fail_flush) in [(true, 0), (false, 1), (false, 2)] {
             let mut out = FailingOutput {
                 fail_write,
@@ -13588,11 +13602,7 @@ mod tests {
             };
             assert!(TerminalGuard::with_output(&mut out).is_err());
             assert!(!crossterm::terminal::is_raw_mode_enabled().unwrap());
-            let mut restored: libc::termios = unsafe { std::mem::zeroed() };
-            assert_eq!(
-                unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut restored) },
-                0
-            );
+            let restored = terminal_settings();
             assert_eq!(restored.c_lflag, original.c_lflag);
             assert_eq!(restored.c_iflag, original.c_iflag);
             assert_eq!(restored.c_oflag, original.c_oflag);

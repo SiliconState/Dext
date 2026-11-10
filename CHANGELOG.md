@@ -12,6 +12,8 @@
 
 ### Fixed
 
+- The macOS terminal-setup fixture settles the empty input queue with `FIONREAD` before exact settings comparisons. Darwin sets the kernel-managed `PENDIN` bit when canonical mode is restored; processing that state avoids a false mismatch without masking any flags or changing production code.
+
 - The terminal-setup failure regression checks restored input/output/local terminal flags inside its controlling-session child after every injected write/flush failure. This avoids inspecting a revoked slave PTY after child exit on macOS while retaining and strengthening the restoration assertions; production terminal handling is unchanged.
 
 - The local-auth Unix PTY test uses mutable null termios/winsize pointers for macOS's `openpty` signature; Linux accepts the same pointers. This fixes native macOS test compilation without changing local authentication behavior or assertions.
