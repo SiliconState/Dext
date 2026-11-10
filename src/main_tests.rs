@@ -5705,8 +5705,19 @@ async fn run_sudo_prompt_fixture_with_abort(
         wait: abort.is_some(),
         interrupt: abort.filter(|value| *value).map(|_| interrupt.clone()),
     };
+    let command_pipeline = if cached {
+        "printf ok | command sudo tee {target} >/dev/null".to_string()
+    } else {
+        "if [[ ${BASH_VERSINFO[0]} == 3 && ${BASH_VERSINFO[1]} == 2 ]]; then\n  if printf blocked | command sudo tee {blocked} >/dev/null; then exit 91; else status=$?; fi\n  [ \"$status\" -eq 42 ] && [ ! -e {blocked} ] || exit 92\nelse\n  printf ok | command sudo tee {target} >/dev/null || exit $?\nfi".to_string()
+    };
+    let command_pipeline = command_pipeline
+        .replace("{target}", &shell_single_quote(&target.to_string_lossy()))
+        .replace(
+            "{blocked}",
+            &shell_single_quote(&target_dir.join("blocked.txt").to_string_lossy()),
+        );
     let command = format!(
-        "printf ok | sudo -n tee {target} >/dev/null && printf ok | command sudo tee {target} >/dev/null && printf ok | env sudo tee {target} >/dev/null && printf ok | {absolute} -n tee {target} >/dev/null",
+        "printf ok | sudo -n tee {target} >/dev/null && command sudo tee {target} >/dev/null <<< ok && {{ {command_pipeline}\n}} && printf ok | env sudo tee {target} >/dev/null && printf ok | {absolute} -n tee {target} >/dev/null && printf '%s\\n' 'sudo pipeline scope checked'",
         target = shell_single_quote(&target.to_string_lossy()),
         absolute = shell_single_quote(&fake_sudo.to_string_lossy()),
     );
@@ -5745,7 +5756,12 @@ async fn run_sudo_prompt_fixture_with_abort(
     );
     if success {
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "ok");
+        assert!(out.contains("sudo pipeline scope checked"), "{out}");
     }
+    assert!(
+        !target_dir.join("blocked.txt").exists(),
+        "parent-scoped refusal must not execute the payload"
+    );
     assert!(std::fs::read_dir(prompt_dir).unwrap().all(|entry| {
         entry
             .unwrap()

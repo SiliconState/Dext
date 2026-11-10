@@ -12,6 +12,8 @@
 
 ### Fixed
 
+- Corrected the sudo pipeline compatibility claim: Bash 3.2 adds a shell parent for `command sudo` in a pipeline, so parent-scoped authorization cannot be reused there. Tests explicitly assert refusal without payload execution on Bash 3.2, keep modern Bash pipeline success, and retain bare/env/absolute pipeline and non-pipeline command-sudo checks. Production sudo handling and authorization boundaries are unchanged.
+
 - The macOS terminal-setup fixture settles the empty input queue with `FIONREAD` before exact settings comparisons. Darwin sets the kernel-managed `PENDIN` bit when canonical mode is restored; processing that state avoids a false mismatch without masking any flags or changing production code.
 
 - The terminal-setup failure regression checks restored input/output/local terminal flags inside its controlling-session child after every injected write/flush failure. This avoids inspecting a revoked slave PTY after child exit on macOS while retaining and strengthening the restoration assertions; production terminal handling is unchanged.
