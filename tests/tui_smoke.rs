@@ -33,22 +33,14 @@ fn tui_smoke_launches_narrow_and_wide_terminals() {
 fn tui_checkpoint_warnings_stay_in_transcript_and_preserve_draft() {
     use std::os::unix::fs::PermissionsExt as _;
 
-    struct TestChild(Child);
-    impl std::ops::Deref for TestChild {
-        type Target = Child;
-        fn deref(&self) -> &Child {
-            &self.0
-        }
-    }
-    impl std::ops::DerefMut for TestChild {
-        fn deref_mut(&mut self) -> &mut Child {
-            &mut self.0
-        }
+    struct TestChild {
+        child: Child,
+        pty: Pty,
     }
     impl Drop for TestChild {
         fn drop(&mut self) {
-            if !matches!(self.0.try_wait(), Ok(Some(_))) {
-                terminate_child(&mut self.0);
+            if !matches!(self.child.try_wait(), Ok(Some(_))) {
+                terminate_child(&mut self.pty, &mut self.child);
             }
         }
     }
@@ -129,7 +121,7 @@ fn tui_checkpoint_warnings_stay_in_transcript_and_preserve_draft() {
         }
         assert_eq!(completed, 2, "mock tool round did not finish");
     });
-    let mut pty = Pty::open(TUI_COLS, TUI_ROWS).expect("pty");
+    let pty = Pty::open(TUI_COLS, TUI_ROWS).expect("pty");
     let child = spawn_dext_with_env(
         &pty,
         &sandbox,
@@ -144,13 +136,9 @@ fn tui_checkpoint_warnings_stay_in_transcript_and_preserve_draft() {
         ],
     )
     .expect("spawn dext");
-    let mut child = TestChild(child);
-    assert_visible(
-        &mut pty,
-        &mut child,
-        "Type a request",
-        Duration::from_secs(5),
-    );
+    let mut fixture = TestChild { child, pty };
+    let TestChild { child, pty } = &mut fixture;
+    assert_visible(pty, child, "Type a request", Duration::from_secs(5));
 
     let checkpoints = sandbox.join(".dext/checkpoints");
     fs::create_dir_all(&checkpoints).unwrap();
@@ -168,8 +156,8 @@ fn tui_checkpoint_warnings_stay_in_transcript_and_preserve_draft() {
     fs::write(&orphan, "orphaned swap").unwrap();
     pty.write_all_retry(b"Save result.txt\r").unwrap();
     assert_visible(
-        &mut pty,
-        &mut child,
+        pty,
+        child,
         "Checkpoint fixture ready",
         Duration::from_secs(5),
     );
@@ -177,8 +165,8 @@ fn tui_checkpoint_warnings_stay_in_transcript_and_preserve_draft() {
     pty.write_all_retry(b"\x1b[200~/compact 17\x1b[201~")
         .unwrap();
     assert_visible_since(
-        &mut pty,
-        &mut child,
+        pty,
+        child,
         draft_start,
         "/compact 17",
         Duration::from_secs(5),
@@ -186,18 +174,12 @@ fn tui_checkpoint_warnings_stay_in_transcript_and_preserve_draft() {
     let warning_start = pty.capture.len();
     release_tx.send(()).unwrap();
     assert_visible(
-        &mut pty,
-        &mut child,
+        pty,
+        child,
         "fixture completed successfully",
         Duration::from_secs(10),
     );
-    assert_visible_since(
-        &mut pty,
-        &mut child,
-        warning_start,
-        "1 tool",
-        Duration::from_secs(5),
-    );
+    assert_visible_since(pty, child, warning_start, "1 tool", Duration::from_secs(5));
     let output = strip_ansi(&String::from_utf8_lossy(&pty.capture[warning_start..]));
     assert!(
         output.contains("⚠ [checkpoint] repaired checkpoint manifest mode"),
@@ -221,32 +203,32 @@ fn tui_checkpoint_warnings_stay_in_transcript_and_preserve_draft() {
     );
 
     let replay_start = pty.capture.len();
-    pty.resize(&child, TUI_NARROW_COLS, TUI_ROWS).unwrap();
+    pty.resize(child, TUI_NARROW_COLS, TUI_ROWS).unwrap();
     assert_visible_since(
-        &mut pty,
-        &mut child,
+        pty,
+        child,
         replay_start,
         "retention warning",
         Duration::from_secs(5),
     );
     assert_visible_since(
-        &mut pty,
-        &mut child,
+        pty,
+        child,
         replay_start,
         "skipped 1 unreadable manifest entry",
         Duration::from_secs(5),
     );
     assert_visible_since(
-        &mut pty,
-        &mut child,
+        pty,
+        child,
         replay_start,
         "/compact 17",
         Duration::from_secs(5),
     );
     pty.write_all_retry(b"%\r").unwrap();
     assert_visible(
-        &mut pty,
-        &mut child,
+        pty,
+        child,
         "compact threshold set to 17%",
         Duration::from_secs(5),
     );
@@ -254,8 +236,8 @@ fn tui_checkpoint_warnings_stay_in_transcript_and_preserve_draft() {
     fs::write(sandbox.join("hooks.json"), "{ malformed").unwrap();
     pty.write_all_retry(b"/hooks reload\r").unwrap();
     assert_visible_since(
-        &mut pty,
-        &mut child,
+        pty,
+        child,
         hooks_start,
         "hooks reloaded",
         Duration::from_secs(5),
@@ -267,7 +249,7 @@ fn tui_checkpoint_warnings_stay_in_transcript_and_preserve_draft() {
     );
     pty.write_all_retry(b"\x04").unwrap();
     assert!(
-        wait_for_exit(&mut child, Duration::from_secs(5), &mut pty)
+        wait_for_exit(child, Duration::from_secs(5), pty)
             .unwrap()
             .success()
     );
@@ -363,11 +345,14 @@ fn tui_resize_keeps_inline_session_responsive_and_dsr_bounded() {
     }
     pty.pump_for(&mut child, Duration::from_millis(500))
         .expect("settle narrow resize burst");
-    assert_resize_replay_complete(
+    // Slow hosts can complete an intermediate-width replay first; measuring the wide
+    // resize before the final narrow replay closes would split that transaction.
+    assert_resize_replay_settled_at(
         &mut pty,
         &mut child,
         before_resize_capture,
-        Duration::from_secs(5),
+        TUI_NARROW_COLS,
+        Duration::from_secs(10),
     );
     let narrow_resize = pty.terminal_io_counts() - before_resize;
     eprintln!("narrow resize terminal I/O: {narrow_resize:?}");
@@ -420,11 +405,12 @@ fn tui_resize_keeps_inline_session_responsive_and_dsr_bounded() {
         "wide resize replay did not start within the bounded wait: {:?}",
         pty.terminal_io_counts() - before_wide
     );
-    assert_resize_replay_complete(
+    assert_resize_replay_settled_at(
         &mut pty,
         &mut child,
         before_wide_capture,
-        Duration::from_secs(5),
+        TUI_WIDE_COLS,
+        Duration::from_secs(10),
     );
     pty.pump_for(&mut child, Duration::from_millis(200))
         .expect("observe settled wide resize");
@@ -612,10 +598,18 @@ fn tui_streams_mermaid_and_prose_into_history_before_provider_completion() {
         pty.wait_for_clear_all(&mut child, before.clear_all + 1, Duration::from_secs(3))
             .unwrap()
     );
+    // Inline autoresize can repaint the live tail before the history replay; inspect the
+    // narrow view only after the replay completes and the live tail is repainted after it.
+    assert_resize_replay_complete(&mut pty, &mut child, narrow_start, Duration::from_secs(10));
+    let replay_clear = narrow_start
+        + byte_offsets(&pty.capture[narrow_start..], b"\x1b[2J")
+            .last()
+            .copied()
+            .expect("narrow replay clear");
     assert_visible_since(
         &mut pty,
         &mut child,
-        narrow_start,
+        replay_clear,
         "live-tail-before-complete",
         Duration::from_secs(10),
     );
@@ -669,6 +663,7 @@ fn tui_streams_mermaid_and_prose_into_history_before_provider_completion() {
         "completion-after-release",
         Duration::from_secs(10),
     );
+    assert_resize_replay_complete(&mut pty, &mut child, wide_start, Duration::from_secs(10));
     let wide = strip_ansi(&String::from_utf8_lossy(&pty.capture[wide_start..]));
     assert!(
         wide.contains("view line 0+64") && wide.contains("msg 41, whole"),
@@ -1552,6 +1547,12 @@ fn spawn_dext_configured(
         .env("HOME", home)
         .env("DEXT_HOME", dext_home)
         .env("DEXT_APPROVAL", "never")
+        // Startup prewarms the provider connection; a public default endpoint makes exit
+        // wait on DNS/network. Tests needing a live mock override these via extra_env.
+        .env("DEXT_PROVIDER", "local")
+        .env("DEXT_BASE_URL", "http://127.0.0.1:1")
+        .env("DEXT_MODEL", "mock-model")
+        .env("DEXT_MODEL_FORCE", "1")
         .stdin(Stdio::from(stdin))
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
@@ -1575,16 +1576,23 @@ fn spawn_dext_configured(
     cmd.spawn()
 }
 
-fn terminate_child(child: &mut Child) {
-    #[cfg(unix)]
+fn terminate_child(pty: &mut Pty, child: &mut Child) {
+    let pid = child.id() as libc::pid_t;
     unsafe {
-        let pid = child.id() as libc::pid_t;
         let _ = libc::kill(-pid, libc::SIGTERM);
-        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(50));
+    unsafe {
         let _ = libc::kill(-pid, libc::SIGKILL);
     }
     let _ = child.kill();
-    let _ = child.wait();
+    // Never block in wait(): a child that cannot finish exiting would hang the whole suite
+    // until the CI job limit instead of reporting this test's failure.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && matches!(child.try_wait(), Ok(None)) {
+        let _ = pty.read_available();
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn assert_visible_since(
@@ -1609,7 +1617,7 @@ fn assert_visible_since(
         }
         if Instant::now() >= deadline || child.try_wait().expect("query child status").is_some() {
             let visible = pty.visible_text();
-            terminate_child(child);
+            terminate_child(pty, child);
             panic!(
                 "did not see new {needle:?} within {timeout:?}; visible tail:\n{}",
                 tail(&visible, 3000)
@@ -1625,7 +1633,7 @@ fn assert_visible(pty: &mut Pty, child: &mut Child, needle: &str, timeout: Durat
         .unwrap_or_else(|err| panic!("waiting for {needle:?} failed: {err}"));
     if !found {
         let visible = pty.visible_text();
-        terminate_child(child);
+        terminate_child(pty, child);
         panic!(
             "did not see {needle:?} within {timeout:?}; visible tail:\n{}",
             tail(&visible, 3000)
@@ -1648,7 +1656,7 @@ fn wait_for_exit(
         }
         if Instant::now() >= deadline {
             let visible = pty.visible_text();
-            terminate_child(child);
+            terminate_child(pty, child);
             panic!(
                 "dext did not exit within {timeout:?}; visible tail:\n{}",
                 tail(&visible, 3000)
@@ -1831,11 +1839,84 @@ fn assert_resize_replay_complete(
         }
         if Instant::now() >= deadline || child.try_wait().expect("query resize child").is_some() {
             let output = strip_ansi(&String::from_utf8_lossy(capture));
-            terminate_child(child);
+            terminate_child(pty, child);
             panic!("resize replay did not complete within {timeout:?}:\n{output}");
         }
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+fn assert_resize_replay_settled_at(
+    pty: &mut Pty,
+    child: &mut Child,
+    offset: usize,
+    cols: u16,
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        pty.read_available().expect("read resize replay");
+        pty.answer_cursor_position_queries()
+            .expect("answer resize cursor query");
+        let capture = pty.capture.get(offset..).unwrap_or_default();
+        if resize_replay_settled_at(capture, cols) {
+            return;
+        }
+        if Instant::now() >= deadline || child.try_wait().expect("query resize child").is_some() {
+            let output = strip_ansi(&String::from_utf8_lossy(capture));
+            terminate_child(pty, child);
+            panic!("resize replay did not settle at {cols} columns within {timeout:?}:\n{output}");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// True once the newest complete replay was rendered at `cols` and no synchronized update
+/// is still open, so a capture offset taken now starts at a transaction boundary.
+fn resize_replay_settled_at(capture: &[u8], cols: u16) -> bool {
+    let Ok(replays) = resize_replay_transactions(capture) else {
+        return false;
+    };
+    let open =
+        byte_offsets(capture, b"\x1b[?2026h").last() > byte_offsets(capture, b"\x1b[?2026l").last();
+    // The welcome banner rule spans the replay width minus its two margin cells.
+    !open
+        && replays.last().copied().and_then(replay_banner_rule_cells)
+            == Some(usize::from(cols).saturating_sub(2))
+}
+
+fn replay_banner_rule_cells(replay: &[u8]) -> Option<usize> {
+    let text = strip_ansi(&String::from_utf8_lossy(replay));
+    let banner = &text[text.find("◆ Dext  v")?..];
+    let rule = &banner[banner.find('─')?..];
+    Some(rule.chars().take_while(|&ch| ch == '─').count())
+}
+
+#[test]
+fn resize_replay_settles_only_after_final_width_replay_closes() {
+    let replay = |cols: usize| {
+        format!(
+            "\x1b[?2026h\x1b[2J\x1b[3J ◆ Dext  v0\r\n {}\r\nhistory\x1b[?2026l",
+            "─".repeat(cols - 2)
+        )
+        .into_bytes()
+    };
+    let begin = b"\x1b[?2026h".as_slice();
+    let intermediate = replay(100);
+    assert!(!resize_replay_settled_at(&intermediate, 80));
+    let late_begin = [intermediate.as_slice(), begin].concat();
+    assert!(resize_replay_transactions(&late_begin).is_ok());
+    assert!(!resize_replay_settled_at(&late_begin, 80));
+    let late_clear = [late_begin.as_slice(), b"\x1b[2J\x1b[3J".as_slice()].concat();
+    assert!(!resize_replay_settled_at(&late_clear, 80));
+    // A baseline taken after a dangling begin can never parse the split replay.
+    assert!(resize_replay_transactions(&replay(80)[begin.len()..]).is_err());
+    let settled = [intermediate.as_slice(), replay(80).as_slice()].concat();
+    assert!(resize_replay_settled_at(&settled, 80));
+    let redraw = [settled.as_slice(), begin, b"redraw".as_slice()].concat();
+    assert!(!resize_replay_settled_at(&redraw, 80));
+    let closed = [redraw.as_slice(), b"\x1b[?2026l".as_slice()].concat();
+    assert!(resize_replay_settled_at(&closed, 80));
 }
 
 #[test]
@@ -1995,9 +2076,13 @@ impl Pty {
         if rc == -1 {
             return Err(io::Error::last_os_error());
         }
-        set_nonblocking(master)?;
         let master = unsafe { File::from_raw_fd(master) };
         let slave = unsafe { File::from_raw_fd(slave) };
+        // openpty descriptors are inheritable. A fixture child holding another test's PTY keeps
+        // that terminal open after its test ends, so neither child gets SIGHUP and both leak.
+        set_cloexec(master.as_raw_fd())?;
+        set_cloexec(slave.as_raw_fd())?;
+        set_nonblocking(master.as_raw_fd())?;
         Ok(Self {
             master,
             slave,
@@ -2167,12 +2252,37 @@ impl Pty {
 }
 
 fn dup_fd(file: &File) -> io::Result<std::os::fd::RawFd> {
-    let duped = unsafe { libc::dup(file.as_raw_fd()) };
+    let duped = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
     if duped == -1 {
         Err(io::Error::last_os_error())
     } else {
         Ok(duped)
     }
+}
+
+#[test]
+fn pty_descriptors_are_not_inherited_by_fixture_children() {
+    let pty = Pty::open(TUI_COLS, TUI_ROWS).expect("open pty");
+    let duped = unsafe { File::from_raw_fd(dup_fd(pty.slave_file()).expect("dup slave")) };
+    for fd in [
+        pty.master.as_raw_fd(),
+        pty.slave.as_raw_fd(),
+        duped.as_raw_fd(),
+    ] {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert!(
+            flags != -1 && flags & libc::FD_CLOEXEC != 0,
+            "fd {fd} would leak into spawned children"
+        );
+    }
+}
+
+fn set_cloexec(fd: RawFd) -> io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn set_nonblocking(fd: RawFd) -> io::Result<()> {
@@ -2250,7 +2360,12 @@ impl TempDir {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()));
+        // macOS SystemTime has microsecond resolution, so tests sharing a prefix can start
+        // in the same tick and would otherwise share (and delete) one fixture directory.
+        static NEXT_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("{prefix}-{}-{nanos}-{id}", std::process::id()));
         fs::create_dir_all(&path)?;
         Ok(Self { path })
     }

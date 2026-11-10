@@ -118,9 +118,12 @@ The integration gate is `cargo test --release --locked --bin dext tui::tests::`,
 
 ## Regression coverage
 
+Ratatui core/backend are external upstream Git dependencies, not workspace members. The historical `cargo test -p ratatui-core --lib --locked` command is unavailable in this checkout; Dext-owned focused tests and real-PTY tests validate the integration without changing upstream source.
+
 Run the complete renderer gate after any TUI or terminal dependency change:
 
 ```bash
+python3 scripts/validate_pages.py docs
 cargo fmt --all -- --check
 cargo clippy -p dext --all-targets --all-features --locked --no-deps -- -D warnings
 cargo audit --deny warnings
@@ -131,7 +134,7 @@ cargo test --release --locked
 cargo test --release --locked --test tui_smoke -- --nocapture
 ```
 
-The TUI regression coverage combines the real Unix PTY smoke suite with focused state/render unit tests. The PTY starts each Dext child in a fresh session with the slave PTY as its controlling terminal and applies resize geometry through that slave endpoint, matching real terminal resize delivery on macOS and Linux. Resize assertions wait for fresh replay-tail output with a bounded deadline rather than assuming a fixed scheduler delay on shared CI hosts. The thinking-handoff fixture waits for the replayed slash confirmation after the answer and late thinking before inspecting the complete card; completion checks likewise require newly captured late-thinking output. Missing card borders include the captured replay in the failure. These waits preserve the ordering and no-completion-repaint assertions. Replay cost is counted only inside complete synchronized clear/purge/replay transactions, excluding ordinary viewport clears before or after them. The original terminal-height chunk bounds remain unchanged. Parser regressions reject incomplete, nested, unpaired and duplicate reset sequences and exercise split terminal-control output. The PTY coverage requires:
+The TUI regression coverage combines the real Unix PTY smoke suite with focused state/render unit tests. The checkpoint-warning fixture owns its child and PTY in one drop guard, reusing bounded output-draining termination on failure after the merged cleanup-helper signature change. The PTY starts each Dext child in a fresh session with the slave PTY as its controlling terminal and applies resize geometry through that slave endpoint, matching real terminal resize delivery on macOS and Linux. Resize assertions wait for fresh replay-tail output with a bounded deadline rather than assuming a fixed scheduler delay on shared CI hosts. The thinking-handoff fixture waits for the replayed slash confirmation after the answer and late thinking before inspecting the complete card; completion checks likewise require newly captured late-thinking output. Missing card borders include the captured replay in the failure. These waits preserve the ordering and no-completion-repaint assertions. Resize checks wait until the newest complete synchronized replay was rendered at the final width and no update is open, so a slower host that first finishes an intermediate-width replay cannot split the next measurement; the Mermaid reflow check inspects its narrow view only after the replay completes and the live tail is repainted after it. Fixtures use collision-free temporary directories and default to an unreachable loopback provider; PTY descriptors are close-on-exec so a fixture child cannot keep another test's terminal open, and failure cleanup drains output while waiting at most five seconds for the child to exit. Replay cost is counted only inside complete synchronized clear/purge/replay transactions, excluding ordinary viewport clears before or after them. The original terminal-height chunk bounds remain unchanged. Parser regressions reject incomplete, nested, unpaired and duplicate reset sequences and exercise split terminal-control output. The PTY coverage requires:
 
 - banner and composer visibility at narrow and wide sizes;
 - editable input during live streaming;

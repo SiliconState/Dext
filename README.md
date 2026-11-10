@@ -86,7 +86,7 @@ See [`docs/USAGE.md`](docs/USAGE.md) for provider setup, model routing, sessions
 - **Bounded where it matters.** Credential scrubbing, privacy redaction, capped I/O, process cleanup, and recovery remain active without constraining the default agent runtime.
 - **Provider-neutral.** Cloud and local providers share one compact native tool layer.
 - **Extensible without core bloat.** User-owned [packs and shelves](docs/PACKS.md) can add workflows and reviewed runtime tools.
-- **Explicit continuity.** By default, Dext autosaves session state under a project-specific key; `dext --resume` restores the latest session. Optional `recall.md` and [Seat](docs/USAGE.md#seats) summaries are user-authored context, not autonomous memory.
+- **Explicit continuity.** By default, Dext autosaves session state under a project-specific key; `dext --resume` restores the latest session. Optional `recall.md` is bounded agent working memory maintained according to human-authored `DEXT.md` policy; [Seat](docs/USAGE.md#seats) summaries are user-authored context. Neither automatically restores a previous transcript.
 
 ## A small working surface
 

@@ -12,6 +12,12 @@
 
 ### Fixed
 
+- Reconciled the checkpoint-warning PTY fixture with the merged cleanup helper: one drop guard owns both child and PTY and uses bounded output-draining termination on failure. This fixes the merged test's compile error without changing runtime behavior or test assertions.
+
+- Runtime checkpoint/hook warnings now enter the inline TUI transcript rather than overwriting the composer, including worker-thread diagnostics. Warning-route installation and stderr fallback are serialized, drafts survive warning replay, and partial terminal setup failures restore raw mode. Console/standalone CLI diagnostics retain stderr output.
+
+- Authorized edit tasks use an explicit Implement phase, retained across queued updates and resumed work rather than prematurely switching to synthesis or verification. Failed tools keep explicit diagnostics and allow provider continuation without automatically rerunning failed commands; OpenAI Responses reasoning snapshots reconcile same-ID replacements within aggregate bounds.
+
 - Fresh-eyes model review fixes Haiku 5.5 Off/summaries to explicitly disable default-on thinking at low output effort, applies its long-context tier to summary attempts, and preserves accumulated priced session costs across thresholds/model switches. Catalog merging now preserves legacy per-model overrides and deterministically combines alias metadata across built-ins; required-thinking Sonnet/Kimi/GLM requests and summaries honor declared effort restrictions. Regressions cover API-key/OAuth wire bodies, thinking replay/history immutability, summary-worker accounting, session analysis, canonical alias collisions, and reload stability.
 
 - Final model review also preserves official Kimi adaptive thinking without effort metadata, removes double effort mapping, rejects Haiku disabled-thinking requests with incompatible effort restrictions, and prevents Chat Completions effort fallback from escaping explicit levels or reasoning-disabled capability. Three focused regressions reproduce the original failures and cover declared none, medium/high, vendor levels, and invalid disabled-thinking combinations.
@@ -29,6 +35,18 @@
 - Fixed live answers appearing above the spinner. Answers now use the same status-first, bottom-aligned flow as thinking/tool output: activity, unfinished response, then composer. Stable content enters native history once without the spinner. Composer/footer retain normal bottom anchoring; short panes preserve activity before newest content, and slash popups reserve space below the live tail. Long activity labels remain single-line with bounded elapsed text. Renderer, inline-backend and Unix PTY regressions cover actual row ordering, history handoff, empty tails, multiline drafts, prompts/overlays, lifecycle changes and resize.
 
 - Retry waits now preserve their deadline through status-only runtime controls; closed control channels no longer spin. Cancellation and route changes remain responsive. Exhausted HTTP errors retain the upstream response and add route, attempt count and explicit recovery options without automatic provider switching. Thinking/tool activity receives the same short-pane retention and single-line bounds as answers, and slash popups shrink or hide instead of covering the composer.
+
+- Branch CI `test (macos-15-intel)` now has a 45-minute job limit (other platforms keep 30, matching the release workflow's 45). The job was compile-bound (Clippy ~5 min, TUI-test release build ~13 min) and hit 30 minutes mid-way through release tests on `main` and PR #69 with no test failures.
+
+- Fixed intermittent Unix PTY smoke-test failures, most frequent on Intel macOS; Dext itself is unchanged. Local stress runs and CI logs identified five harness defects: tests sharing a temporary-directory prefix could start within one microsecond-resolution macOS clock tick and share a sandbox and session lock; launch-only fixtures used the public default provider, so process exit could wait on the startup connection-prewarm DNS lookup; resize and Mermaid reflow checks could read an intermediate-width or still-open replay; PTY descriptors were inheritable, so one fixture's child could hold another test's terminal open and leave orphaned processes; and failure cleanup waited for the child without a deadline or terminal draining, which hung the suite under heavy throttling. Fixture directories now include a per-process counter, fixtures default to an unreachable loopback provider, resize checks wait for the final-width synchronized replay (their replay waits rise from 5 to 10 seconds) and the Mermaid check for its complete replay, PTY descriptors are close-on-exec, and cleanup drains output under a 5-second bound. Assertions and replay-cost bounds are unchanged.
+
+### Documentation
+
+- Reconciled the merged runtime and CI documentation, clarified policy-governed recall versus user-authored Seat summaries, and documented external Ratatui test scope. Recorded the unresolved-index checkpoint limitation: agent writes fail closed until merge conflicts are resolved and staged externally.
+
+### Security
+
+- Lockfile-only update: quinn-proto 0.11.15 to 0.11.19 (RUSTSEC-2026-0338 through 0342: remote panics and receive-buffer/memory-exhaustion bypasses) and Rustls 0.23.45 to 0.23.46 (RUSTSEC-2026-0346 through 0349: secret-bearing `Debug` output, ECH-rejection data leak, pre-auth Brotli certificate allocation, ServerHello key-exchange downgrade). quinn-proto's transitive `rand` moves from 0.9 to 0.10. `Cargo.toml`, source and existing exact pins are unchanged; `cargo audit --deny warnings` passes again.
 
 ## v0.2.1 - 2026-10-07
 

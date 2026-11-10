@@ -74,7 +74,7 @@ Also scan untracked and ignored files before deciding what to preserve locally v
 
 ## Dependency maintenance
 
-The October 27, 2026 repository audit found that locked Tokio `1.53.2` failed the warnings-denied dependency gate with [RUSTSEC-2026-0386](https://rustsec.org/advisories/RUSTSEC-2026-0386), an I/O-safety issue in Unix `AsyncFd` constructors. The lockfile now selects patched `1.53.3`; all other locked package versions remain unchanged. This finding establishes an affected dependency, not a demonstrated exploit in Dext. Scheduled dependency auditing and the release audit gate remain required.
+The October 27, 2026 repository audit found that locked Tokio `1.53.2` failed the warnings-denied dependency gate with [RUSTSEC-2026-0386](https://rustsec.org/advisories/RUSTSEC-2026-0386), an I/O-safety issue in Unix `AsyncFd` constructors. That targeted patch selected `1.53.3` without changing other package versions. The merged lockfile also retains Rustls `0.23.46`, quinn-proto `0.11.19`, and pulldown-cmark `0.13.6` security updates; `Cargo.lock` is the authoritative current inventory. This finding establishes an affected dependency, not a demonstrated exploit in Dext. Scheduled dependency auditing and the release audit gate remain required.
 
 ## Runtime safety notes
 

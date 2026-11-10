@@ -102,7 +102,7 @@ Dext is a Rust terminal agent packaged as one binary. Most behavior is still int
   - URL/host extraction and external-attempt guard helpers.
 
 - `src/orchestrator.rs`
-  - Turn phase tracking.
+  - Turn phase tracking, including an explicit Implement phase for authorized edits. Queued updates and resumed work preserve implementation intent; verification remains a separate phase.
   - External-result dedupe.
   - Similarity/circuit-breaker/partial-delivery guardrails.
   - Turn telemetry.
@@ -112,7 +112,10 @@ Dext is a Rust terminal agent packaged as one binary. Most behavior is still int
   - Project-scoped locks and stale-lock cleanup.
   - Shared bounded regular/non-symlink reads used by pack workflows, shelf/runtime manifests, and pack forks.
   - Atomic state writes, including permission-preserving replacement for copied pack files.
-  - Terminal restore helpers used by crash/panic paths.
+  - Terminal restore helpers used by crash/panic paths; setup failures restore raw mode.
+
+- `src/events.rs`
+  - Shared agent events and a scoped runtime-warning route that keeps worker/checkpoint/hook diagnostics in the TUI transcript instead of writing over the composer. Route installation and stderr fallback share a lock.
 
 - `src/tui.rs`
   - Inline Ratatui UI in the regular terminal buffer; transactional thinking history uses per-line decoding without newline-proportional temporary batches, bounded open/sealed display units, and suffix-only inspector rendering.
@@ -301,6 +304,7 @@ provider-visible tools:
   routing exists; routed-without-marker and malformed-marker cases fail loudly
   because Dext-owned Git commands scrub routing variables. Never mirror-push
   `refs/dext/*`.
+- Dirty snapshots depend on `git stash create`. An unmerged index blocks snapshot creation and required-checkpoint tools, including edits, write-risk Bash, todos, and commits. Resolve and stage conflicts outside the agent before resuming; manifest repair does not repair a Git index. R-020 tracks this availability limitation.
 - `/undo` and `dext undo` list, preview, and apply checkpoint restores. Normal
   restore updates worktree paths only; moving `HEAD` requires an explicit
   reset-head mode.
@@ -328,7 +332,7 @@ Compaction preserves recent tool evidence and summarizes older conversation when
 
 Expected release assets also include a CycloneDX JSON SBOM. The release workflow includes the SBOM in `SHA256SUMS`, provenance attestation, verification, and publication alongside the four platform archives. This path completed end to end for `v0.1.0`; [`RELEASING.md`](RELEASING.md) records the workflow and verification evidence.
 
-Branch CI covers Linux, arm64 macOS, Intel macOS and Windows before tagging. Provider-free NDJSON lifecycle fixtures pin a loopback provider and assert its ready route so startup prewarming cannot introduce public-endpoint DNS/network dependencies; their 20-second stdout/exit bounds are unchanged. The HTTP proxy-env regression runs in a bounded single-test child: process-wide proxy mutation cannot race parallel provider clients or leak on panic. Mock-server accepts normalize accepted sockets to blocking mode and impose connection/read/write deadlines; a delayed-client regression covers Winsock inheritance, and total-timeout tests retain their two-second deadline while reaping fixture servers before reporting errors; the blocking-compaction redaction fixture also bounds total execution and reaps its server before asserting results. The Linux running-binary unlink regression creates a hard-link launch alias beside the built binary, then removes that alias while the child runs; this preserves the `/proc/self/exe` worker assertion without writing an executable immediately before `exec`. Windows directory-alias discovery uses a junction without requiring symbolic-link privilege. Native Windows MSVC evidence is separate from WSL/Linux evidence; Application Control launch denials do not satisfy gates.
+Branch CI covers Linux, arm64 macOS, Intel macOS and Windows before tagging; Intel macOS has a 45-minute job limit and the other platforms 30. Unix PTY fixtures use unique temporary directories, an unreachable loopback provider by default, close-on-exec PTY descriptors, final-width synchronized-replay barriers, and bounded output-draining child cleanup. Provider-free NDJSON lifecycle fixtures pin a loopback provider and assert its ready route so startup prewarming cannot introduce public-endpoint DNS/network dependencies; their 20-second stdout/exit bounds are unchanged. The HTTP proxy-env regression runs in a bounded single-test child: process-wide proxy mutation cannot race parallel provider clients or leak on panic. Mock-server accepts normalize accepted sockets to blocking mode and impose connection/read/write deadlines; a delayed-client regression covers Winsock inheritance, and total-timeout tests retain their two-second deadline while reaping fixture servers before reporting errors; the blocking-compaction redaction fixture also bounds total execution and reaps its server before asserting results. The Linux running-binary unlink regression creates a hard-link launch alias beside the built binary, then removes that alias while the child runs; this preserves the `/proc/self/exe` worker assertion without writing an executable immediately before `exec`. Windows directory-alias discovery uses a junction without requiring symbolic-link privilege. Native Windows MSVC evidence is separate from WSL/Linux evidence; Application Control launch denials do not satisfy gates.
 
 The October 12 dependency cleanup uses targeted updates rather than a broad lockfile refresh: Tokio `1.53.2`, libc `0.2.190`, toml_edit `0.25.17+spec-1.1.0` (with its required datetime/parser updates), serde_json `1.0.151`, Landlock `0.4.7`, futures-util/futures-macro `0.3.34`, tui-markdown `0.3.10`, and pulldown-cmark `0.13.4`. Nine unused test-helper packages disappear from the production graph. Existing dependency source identities, reqwest/Rustls/image versions, Ratatui Git overrides, and other exact terminal pins remain unchanged. `ra_ap_syntax` stays at `0.0.348`: `0.0.357` requires Rust 1.98, above the locally available Linux 1.96.1 and Windows 1.97.1 toolchains. Base64 stays at `0.22.1` rather than introducing the `0.23` default-on unsafe SIMD feature and a second version alongside transport dependencies. No toolchain or runtime redesign is included.
 
@@ -336,9 +340,14 @@ The November 2 security patch updates only `pulldown-cmark` from `0.13.5` to `0.
 
 The October 28 security patch updates only the exact `pulldown-cmark` pin and lockfile from `0.13.4` to `0.13.5` for RUSTSEC-2026-0414 (exponential parser events with optional `ENABLE_WIKILINKS`). The advisory does not by itself demonstrate a vulnerable Dext call path. Other package versions and terminal source pins remain unchanged; renderer and real-PTY regressions cover the patch's upstream parser correctness changes.
 
+The merged security fixes retain Tokio `1.53.3`, Rustls `0.23.46`, quinn-proto `0.11.19`, and pulldown-cmark `0.13.6`. Earlier dated dependency paragraphs describe their individual changes, not a complete current inventory; `Cargo.lock` is authoritative.
+
+Ratatui core/backend are external upstream Git dependencies, not workspace members. The historical `cargo test -p ratatui-core --lib --locked` gate cannot run from this workspace; use Dext's focused TUI and real-PTY integration tests without modifying dependency source.
+
 Expected checks before releasing Dext changes:
 
 ```bash
+python3 scripts/validate_pages.py docs
 cargo fmt --all -- --check
 cargo clippy -p dext --all-targets --all-features --locked --no-deps -- -D warnings
 cargo audit --deny warnings
