@@ -12,6 +12,8 @@
 
 ### Fixed
 
+- The terminal-setup failure regression checks restored input/output/local terminal flags inside its controlling-session child after every injected write/flush failure. This avoids inspecting a revoked slave PTY after child exit on macOS while retaining and strengthening the restoration assertions; production terminal handling is unchanged.
+
 - The local-auth Unix PTY test uses mutable null termios/winsize pointers for macOS's `openpty` signature; Linux accepts the same pointers. This fixes native macOS test compilation without changing local authentication behavior or assertions.
 
 - Reconciled the checkpoint-warning PTY fixture with the merged cleanup helper: one drop guard owns both child and PTY and uses bounded output-draining termination on failure. This fixes the merged test's compile error without changing runtime behavior or test assertions.
