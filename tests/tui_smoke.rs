@@ -30,6 +30,234 @@ fn tui_smoke_launches_narrow_and_wide_terminals() {
 }
 
 #[test]
+fn tui_checkpoint_warnings_stay_in_transcript_and_preserve_draft() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    struct TestChild {
+        child: Child,
+        pty: Pty,
+    }
+    impl Drop for TestChild {
+        fn drop(&mut self) {
+            if !matches!(self.child.try_wait(), Ok(Some(_))) {
+                terminate_child(&mut self.pty, &mut self.child);
+            }
+        }
+    }
+
+    let temp = TempDir::new("dext-tui-checkpoint-warnings").expect("temp dir");
+    let sandbox = temp.path().join("sandbox");
+    let dext_home = temp.path().join("dext-home");
+    let home = temp.path().join("home");
+    for path in [&sandbox, &dext_home, &home] {
+        fs::create_dir_all(path).expect("fixture directory");
+    }
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&sandbox)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", &home)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .expect("fixture git");
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    };
+    for args in [
+        vec!["init", "-q"],
+        vec!["config", "user.email", "test@example.invalid"],
+        vec!["config", "user.name", "Test"],
+        vec!["commit", "--allow-empty", "-q", "-m", "base"],
+    ] {
+        git(&args);
+    }
+    let head = git(&["rev-parse", "HEAD"]);
+    let listener = TcpListener::bind("127.0.0.1:0").expect("mock server");
+    listener.set_nonblocking(true).unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut completed = 0;
+        while completed < 2 && Instant::now() < deadline {
+            let (mut stream, _) = match listener.accept() {
+                Ok(connection) => connection,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(error) => panic!("mock accept: {error}"),
+            };
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .expect("bound mock response writes");
+            let request = read_mock_openai_request(&mut stream);
+            if !String::from_utf8_lossy(&request).starts_with("POST /v1/chat/completions ") {
+                stream
+                    .write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+                continue;
+            }
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n").unwrap();
+            let frame = if completed == 0 {
+                let ready = serde_json::json!({"choices":[{"delta":{"reasoning_content":"Checkpoint fixture ready\n"},"finish_reason":null}]});
+                write!(stream, "data: {ready}\n\n").unwrap();
+                stream.flush().unwrap();
+                release_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("release tool call");
+                serde_json::json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"checkpoint-write","type":"function","function":{"name":"write_file","arguments":"{\"path\":\"result.txt\",\"content\":\"saved\\n\"}"}}]},"finish_reason":"tool_calls"}]})
+            } else {
+                serde_json::json!({"choices":[{"delta":{"content":"Checkpoint warning fixture completed successfully."},"finish_reason":"stop"}]})
+            };
+            write!(stream, "data: {frame}\n\ndata: [DONE]\n\n").unwrap();
+            stream.flush().unwrap();
+            completed += 1;
+        }
+        assert_eq!(completed, 2, "mock tool round did not finish");
+    });
+    let pty = Pty::open(TUI_COLS, TUI_ROWS).expect("pty");
+    let child = spawn_dext_with_env(
+        &pty,
+        &sandbox,
+        &dext_home,
+        &home,
+        &[
+            ("DEXT_PROVIDER", "local"),
+            ("DEXT_BASE_URL", &base_url),
+            ("DEXT_MODEL", "mock-model"),
+            ("DEXT_MODEL_FORCE", "1"),
+            ("DEXT_APPROVAL", "always"),
+        ],
+    )
+    .expect("spawn dext");
+    let mut fixture = TestChild { child, pty };
+    let TestChild { child, pty } = &mut fixture;
+    assert_visible(pty, child, "Type a request", Duration::from_secs(5));
+
+    let checkpoints = sandbox.join(".dext/checkpoints");
+    fs::create_dir_all(&checkpoints).unwrap();
+    fs::set_permissions(&checkpoints, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(
+        checkpoints.join("manifest.txt"),
+        format!("retired-warning-fixture\trefs/dext/checkpoints/fixture/retired-warning-fixture\t{head}\tbash\t1\t{head}\tfalse\t\n"),
+    ).unwrap();
+    fs::set_permissions(
+        checkpoints.join("manifest.txt"),
+        fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    let orphan = checkpoints.join(".manifest.txt.tmp-123-456");
+    fs::write(&orphan, "orphaned swap").unwrap();
+    pty.write_all_retry(b"Save result.txt\r").unwrap();
+    assert_visible(
+        pty,
+        child,
+        "Checkpoint fixture ready",
+        Duration::from_secs(5),
+    );
+    let draft_start = pty.capture.len();
+    pty.write_all_retry(b"\x1b[200~/compact 17\x1b[201~")
+        .unwrap();
+    assert_visible_since(
+        pty,
+        child,
+        draft_start,
+        "/compact 17",
+        Duration::from_secs(5),
+    );
+    let warning_start = pty.capture.len();
+    release_tx.send(()).unwrap();
+    assert_visible(
+        pty,
+        child,
+        "fixture completed successfully",
+        Duration::from_secs(10),
+    );
+    assert_visible_since(pty, child, warning_start, "1 tool", Duration::from_secs(5));
+    let output = strip_ansi(&String::from_utf8_lossy(&pty.capture[warning_start..]));
+    assert!(
+        output.contains("⚠ [checkpoint] repaired checkpoint manifest mode"),
+        "{output}"
+    );
+    assert!(
+        output.contains("⚠ [checkpoint] skipped 1 unreadable manifest entry"),
+        "{output}"
+    );
+    assert!(
+        output.contains("⚠ [checkpoint] retention warning:"),
+        "{output}"
+    );
+    assert_eq!(
+        fs::read_to_string(sandbox.join("result.txt")).unwrap(),
+        "saved\n"
+    );
+    assert!(
+        orphan.exists(),
+        "routing must not delete unexpected checkpoint artifacts"
+    );
+
+    let replay_start = pty.capture.len();
+    pty.resize(child, TUI_NARROW_COLS, TUI_ROWS).unwrap();
+    assert_visible_since(
+        pty,
+        child,
+        replay_start,
+        "retention warning",
+        Duration::from_secs(5),
+    );
+    assert_visible_since(
+        pty,
+        child,
+        replay_start,
+        "skipped 1 unreadable manifest entry",
+        Duration::from_secs(5),
+    );
+    assert_visible_since(
+        pty,
+        child,
+        replay_start,
+        "/compact 17",
+        Duration::from_secs(5),
+    );
+    pty.write_all_retry(b"%\r").unwrap();
+    assert_visible(
+        pty,
+        child,
+        "compact threshold set to 17%",
+        Duration::from_secs(5),
+    );
+    let hooks_start = pty.capture.len();
+    fs::write(sandbox.join("hooks.json"), "{ malformed").unwrap();
+    pty.write_all_retry(b"/hooks reload\r").unwrap();
+    assert_visible_since(
+        pty,
+        child,
+        hooks_start,
+        "hooks reloaded",
+        Duration::from_secs(5),
+    );
+    let hook_output = strip_ansi(&String::from_utf8_lossy(&pty.capture[hooks_start..]));
+    assert!(
+        hook_output.contains("⚠ [hooks] parse error in"),
+        "{hook_output}"
+    );
+    pty.write_all_retry(b"\x04").unwrap();
+    assert!(
+        wait_for_exit(child, Duration::from_secs(5), pty)
+            .unwrap()
+            .success()
+    );
+    assert_no_crash_text(&pty.visible_text());
+    server.join().expect("mock server thread");
+}
+
+#[test]
 fn tui_resize_keeps_inline_session_responsive_and_dsr_bounded() {
     let temp = TempDir::new("dext-tui-resize").expect("temp dir");
     let sandbox = temp.path().join("sandbox");

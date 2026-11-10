@@ -205,6 +205,16 @@ impl SummaryRequest {
                 self.pricing,
                 self.pricing_override,
             );
+            let pricing = if self.contract == RequestContract::AnthropicMessages {
+                crate::usage::anthropic_long_context_pricing_with_override_state(
+                    &self.model,
+                    usage,
+                    pricing,
+                    self.pricing_override,
+                )
+            } else {
+                pricing
+            };
             usage.cost_usd = Some(pricing.estimate(usage));
         }
         usage
@@ -821,6 +831,80 @@ mod tests {
         assert_eq!(accounting.usage.output, 9);
         assert!(accounting.unknown);
         assert!(!accounting.inflight_open);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn model_review_summary_pricing_applies_haiku_tier_per_request() {
+        let (mut request, server) = loopback_request(Vec::new());
+        server.join().unwrap();
+        request.contract = RequestContract::AnthropicMessages;
+        request.provider = "anthropic".to_string();
+        request.model = "claude-haiku-5-5".to_string();
+        request.pricing = crate::usage::anthropic_pricing(&request.model).unwrap();
+        request.override_wire_cost = true;
+        for (tokens, multiplier) in [(100_000, 1.0), (100_001, 5.0)] {
+            let usage = Usage {
+                cache_read: tokens,
+                output: 1000,
+                ..Usage::default()
+            };
+            let expected = request.pricing.estimate(usage) * multiplier;
+            assert!((request.price(usage).cost_usd.unwrap() - expected).abs() < 1e-12);
+            request.pricing_override = true;
+            assert_eq!(
+                request.price(usage).cost_usd,
+                Some(request.pricing.estimate(usage))
+            );
+            request.pricing_override = false;
+        }
+        request.contract = RequestContract::OpenAiChatCompletions;
+        let usage = Usage {
+            input: 100_001,
+            ..Usage::default()
+        };
+        assert_eq!(
+            request.price(usage).cost_usd,
+            Some(request.pricing.estimate(usage))
+        );
+    }
+
+    #[tokio::test]
+    async fn model_review_summary_worker_prices_haiku_attempts_before_aggregating() {
+        let response = |input, cached| {
+            json!({
+            "content": [{"type": "text", "text": "summary"}],
+            "usage": {"input_tokens": input, "cache_read_input_tokens": cached, "output_tokens": 1000},
+        }).to_string()
+        };
+        let (mut request, server) = loopback_request(vec![
+            (200, response(20_000, 40_000)),
+            (200, response(20_000, 40_000)),
+            (200, response(60_000, 40_001)),
+        ]);
+        request.contract = RequestContract::AnthropicMessages;
+        request.provider = "anthropic".to_string();
+        request.model = "claude-haiku-5-5".to_string();
+        request.pricing = crate::usage::anthropic_pricing(&request.model).unwrap();
+        request.override_wire_cost = true;
+        let accounting = Mutex::new(SummaryAccounting::default());
+        let mut expected = 0.0;
+        for (input, cache_read, multiplier) in [
+            (20_000, 40_000, 1.0),
+            (20_000, 40_000, 1.0),
+            (60_000, 40_001, 5.0),
+        ] {
+            assert_eq!(request.attempt(&accounting).await.unwrap().0, "summary");
+            expected += request.pricing.estimate(Usage {
+                input,
+                cache_read,
+                output: 1000,
+                ..Usage::default()
+            }) * multiplier;
+            let accounting = accounting.lock().unwrap();
+            assert!((accounting.usage.cost_usd.unwrap() - expected).abs() < 1e-12);
+            assert!(!accounting.inflight_open);
+        }
         server.join().unwrap();
     }
 

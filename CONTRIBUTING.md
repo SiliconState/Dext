@@ -40,6 +40,7 @@ cargo install --path . --force --locked
 Run the narrowest useful check first, then the release checks before publishing:
 
 ```bash
+python3 scripts/validate_pages.py docs
 cargo fmt --all -- --check
 cargo clippy -p dext --all-targets --all-features --locked --no-deps -- -D warnings
 cargo audit --deny warnings
@@ -56,7 +57,11 @@ If `src/tui.rs` or a terminal dependency changed:
 cargo test --release --locked --test tui_smoke -- --nocapture
 ```
 
-Follow the renderer contract and live-terminal acceptance in [`docs/TUI.md`](docs/TUI.md).
+Follow the renderer contract and live-terminal acceptance in [`docs/TUI.md`](docs/TUI.md). Ratatui core/backend are external upstream Git dependencies, not workspace members. The historical `cargo test -p ratatui-core --lib --locked` command cannot run in this workspace; Dext's focused TUI tests and real-PTY suite exercise the integration without modifying dependency source.
+
+Branch CI uses 45 minutes for compile-bound Intel macOS and 30 minutes for Linux, arm64 macOS, and Windows. Local Linux results do not establish native macOS/Windows or live-terminal acceptance.
+
+When an agent-started merge leaves an unmerged index, recovery checkpoints cannot use `git stash create`; required-checkpoint tools then fail closed. Resolve and stage the conflicts outside the agent before continuing. Manifest repair does not resolve Git conflicts.
 
 After code changes intended for interactive use:
 

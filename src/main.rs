@@ -50,16 +50,17 @@ use provider::{
     build_chatgpt_request, build_chatgpt_summary_request, build_openai_responses_request,
     built_in_provider_profiles, cancel_pending_oauth_login, canonical_provider_id,
     effective_request_contract, extract_oauth_code_from_callback, find_provider_profile,
-    handle_auth_cli, is_claude_fable_5_1_model, is_claude_opus_5_5_model, is_gpt_5_6_model,
-    is_gpt_6_model, is_gpt_6_sol_or_luna_model, is_official_anthropic_profile,
-    is_official_kimi_profile, is_openai_responses_model, list_models_for_available_providers,
-    list_models_for_provider, load_auth_store, load_provider_catalog, login_provider,
-    logout_provider, looks_like_login_secret_input, normalize_provider_model_value,
-    official_openai_responses_model, provider_auth_status, provider_catalog_path,
-    provider_id_from_selector, provider_request_url, refresh_local_llama_context_window,
-    render_provider_list, render_provider_picker, request_contract_for_profile,
-    resolve_active_provider_id, resolve_model_spec, resolve_provider_model_selection,
-    resolve_runtime_provider, set_active_provider_in_catalog,
+    handle_auth_cli, is_claude_fable_5_1_model, is_claude_haiku_5_5_model,
+    is_claude_opus_5_5_model, is_claude_sonnet_5_5_model, is_glm_5_3_model, is_gpt_5_6_model,
+    is_gpt_6_model, is_gpt_6_responses_tools_only_model, is_gpt_6_sol_or_luna_model,
+    is_kimi_adaptive_model, is_official_anthropic_profile, is_official_kimi_profile,
+    is_openai_responses_model, list_models_for_available_providers, list_models_for_provider,
+    load_auth_store, load_provider_catalog, login_provider, logout_provider,
+    looks_like_login_secret_input, normalize_provider_model_value, official_openai_responses_model,
+    provider_auth_status, provider_catalog_path, provider_id_from_selector, provider_request_url,
+    refresh_local_llama_context_window, render_provider_list, render_provider_picker,
+    request_contract_for_profile, resolve_active_provider_id, resolve_model_spec,
+    resolve_provider_model_selection, resolve_runtime_provider, set_active_provider_in_catalog,
     set_provider_default_model_in_catalog, try_complete_oauth_from_callback,
 };
 #[cfg(unix)]
@@ -2119,6 +2120,14 @@ impl EventSink for ConsoleSink {
         eprintln!("{message}");
     }
 
+    fn request_local_auth_secret_async<'a>(
+        &'a mut self,
+        _tool: &'a str,
+        message: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = LocalAuthSecret> + Send + 'a>> {
+        Box::pin(read_local_auth_secret_from_tty_async(message))
+    }
+
     fn request_local_auth_secret(&mut self, _tool: &str, message: &str) -> LocalAuthSecret {
         read_local_auth_secret_from_tty(message)
             .map(LocalAuthSecret::Secret)
@@ -2364,6 +2373,22 @@ impl EventSink for JsonSink {
         }
     }
 
+    fn request_local_auth_secret_async<'a>(
+        &'a mut self,
+        tool: &'a str,
+        message: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = LocalAuthSecret> + Send + 'a>> {
+        if self.mode == OutputMode::StreamJson
+            && let Ok(value) = serde_json::to_value(AgentEvent::LocalAuthPrompt {
+                tool: tool.to_string(),
+                message: message.to_string(),
+            })
+        {
+            Self::emit_json_line(&value);
+        }
+        self.inner.request_local_auth_secret_async(tool, message)
+    }
+
     fn request_local_auth_secret(&mut self, tool: &str, message: &str) -> LocalAuthSecret {
         if self.mode == OutputMode::StreamJson
             && let Ok(value) = serde_json::to_value(AgentEvent::LocalAuthPrompt {
@@ -2438,7 +2463,7 @@ impl TerminalEchoGuard {
                 return Err(io::Error::last_os_error());
             }
             let mut hidden = original;
-            hidden.c_lflag &= !libc::ECHO;
+            hidden.c_lflag &= !(libc::ECHO | libc::ECHONL);
             if libc::tcsetattr(fd, libc::TCSAFLUSH, &hidden) != 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -2456,6 +2481,9 @@ impl Drop for TerminalEchoGuard {
     fn drop(&mut self) {
         if self.active {
             unsafe {
+                // Discard partial/pasted secrets before another input consumer
+                // regains the terminal, including on timeout or future drop.
+                let _ = libc::tcflush(self.fd, libc::TCIFLUSH);
                 let _ = libc::tcsetattr(self.fd, libc::TCSANOW, &self.original);
             }
             self.active = false;
@@ -2485,21 +2513,80 @@ fn read_local_auth_secret_from_tty(message: &str) -> Option<String> {
         .write(true)
         .open("/dev/tty")
         .ok()?;
+    let _echo_guard = TerminalEchoGuard::disable(tty.as_raw_fd()).ok()?;
     writeln!(tty, "{message}").ok()?;
     write!(tty, "Password: ").ok()?;
     tty.flush().ok()?;
-
-    let _echo_guard = TerminalEchoGuard::disable(tty.as_raw_fd()).ok()?;
     let mut line = String::new();
     let mut reader = io::BufReader::new(tty.try_clone().ok()?);
-    let bytes = reader.read_line(&mut line).ok()?;
+    let result = reader.read_line(&mut line);
     drop(_echo_guard);
-    writeln!(tty).ok()?;
-    if bytes == 0 {
-        None
-    } else {
-        Some(trim_local_auth_secret_line(&line))
+    let newline = writeln!(tty);
+    let secret = match (result, newline) {
+        (Ok(bytes), Ok(())) if bytes > 0 => Some(trim_local_auth_secret_line(&line)),
+        _ => None,
+    };
+    clear_secret_string(&mut line);
+    secret
+}
+
+#[cfg(unix)]
+async fn read_local_auth_secret_from_tty_async(message: &str) -> LocalAuthSecret {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let Ok(tty) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open("/dev/tty")
+    else {
+        return LocalAuthSecret::Unavailable;
+    };
+    read_local_auth_secret_from_terminal(tty, message).await
+}
+
+#[cfg(unix)]
+async fn read_local_auth_secret_from_terminal(
+    mut tty: std::fs::File,
+    message: &str,
+) -> LocalAuthSecret {
+    use std::os::fd::AsRawFd;
+
+    let Ok(_echo_guard) = TerminalEchoGuard::disable(tty.as_raw_fd()) else {
+        return LocalAuthSecret::Canceled;
+    };
+    if writeln!(tty, "{message}\nPassword: ").is_err() {
+        return LocalAuthSecret::Canceled;
     }
+    struct SecretBuffer([u8; 501]);
+    impl Drop for SecretBuffer {
+        fn drop(&mut self) {
+            self.0.fill(0);
+        }
+    }
+    let mut bytes = SecretBuffer([0; 501]);
+    let mut len = 0;
+    loop {
+        match tty.read(&mut bytes.0[len..len + 1]) {
+            Ok(1) if matches!(bytes.0[len], b'\n' | b'\r') => {
+                let _ = writeln!(tty);
+                return match std::str::from_utf8(&bytes.0[..len]) {
+                    Ok(value) if !value.is_empty() => LocalAuthSecret::Secret(value.to_string()),
+                    _ => LocalAuthSecret::Canceled,
+                };
+            }
+            Ok(1) if len < 500 && !matches!(bytes.0[len], 0 | 27) => len += 1,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            _ => return LocalAuthSecret::Canceled,
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn read_local_auth_secret_from_tty_async(_message: &str) -> LocalAuthSecret {
+    LocalAuthSecret::Unavailable
 }
 
 #[cfg(not(unix))]
@@ -2584,6 +2671,16 @@ fn empty_tool_result_metadata() -> ToolResultMetadata {
     ToolResultMetadata::default()
 }
 
+const EMPTY_TOOL_FAILURE: &str = "(failed with no output)";
+
+fn openai_tool_result_content(content: &str, is_error: Option<bool>) -> String {
+    match is_error {
+        Some(true) if content.trim().is_empty() => EMPTY_TOOL_FAILURE.to_string(),
+        Some(true) => format!("(failed)\n{content}"),
+        _ => content.to_string(),
+    }
+}
+
 const PROVIDER_ROUTE_CONTINUATION_PREFIX: &str = "[provider-route continuation]";
 
 fn has_provider_bound_reasoning(messages: &[Message]) -> bool {
@@ -2665,7 +2762,11 @@ fn sanitize_anthropic_messages(
                             ..
                         } => Some(Block::ToolResult {
                             tool_use_id: tool_use_id.clone(),
-                            content: content.clone(),
+                            content: if *is_error == Some(true) && content.trim().is_empty() {
+                                EMPTY_TOOL_FAILURE.to_string()
+                            } else {
+                                content.clone()
+                            },
                             is_error: *is_error,
                             metadata: ToolResultMetadata::default(),
                         }),
@@ -3053,7 +3154,12 @@ fn openai_responses_reasoning_effort(effort: ThinkingEffort) -> &'static str {
 fn openai_reasoning_effort(model: &str, effort: ThinkingEffort) -> Option<&'static str> {
     if is_gpt_6_model(model) {
         return match effort {
-            ThinkingEffort::Off if is_gpt_6_sol_or_luna_model(model) => Some("none"),
+            ThinkingEffort::Off
+                if is_gpt_6_sol_or_luna_model(model)
+                    || model.trim().eq_ignore_ascii_case("gpt-6.1-terra") =>
+            {
+                Some("none")
+            }
             ThinkingEffort::Off => None,
             ThinkingEffort::Minimal | ThinkingEffort::Low => Some("low"),
             ThinkingEffort::Medium => Some("medium"),
@@ -3182,10 +3288,7 @@ fn glm_forced_thinking_effort(
     model: &str,
     effort: ThinkingEffort,
 ) -> Option<String> {
-    let model = model.trim().to_ascii_lowercase();
-    if canonical_provider_id(provider_id) != "glm"
-        || model.trim_end_matches("[1m]") != "glm-5.3-flash"
-    {
+    if canonical_provider_id(provider_id) != "glm" || !is_glm_5_3_model(model) {
         return None;
     }
     Some(
@@ -3208,6 +3311,18 @@ fn provider_model_output_config_effort(
 }
 
 fn anthropic_always_adaptive_effort(model: &str, effort: ThinkingEffort) -> Option<String> {
+    if is_claude_sonnet_5_5_model(model) {
+        return Some(
+            match effort {
+                ThinkingEffort::Off | ThinkingEffort::Minimal | ThinkingEffort::Low => "low",
+                ThinkingEffort::Medium => "medium",
+                ThinkingEffort::High => "high",
+                ThinkingEffort::XHigh => "xhigh",
+                ThinkingEffort::Max => "max",
+            }
+            .to_string(),
+        );
+    }
     let always_adaptive = is_claude_opus_5_5_model(model) || is_claude_fable_5_1_model(model);
     if !always_adaptive {
         return None;
@@ -3270,11 +3385,15 @@ fn anthropic_output_config_effort(model: &str, effort: ThinkingEffort) -> Option
     Some(effort.to_string())
 }
 
-// Effort availability follows the official effort doc: Opus 5.5 and Fable 5.1
-// support low/medium/high/max; `xhigh` exists on Sonnet 5, Opus 4.7/4.8,
-// Opus 5, and Fable 5; `max` additionally covers the 4.6 generation.
+// Effort availability follows the official effort doc and Models API: Sonnet/Haiku
+// 5.5 support xhigh/max; Opus 5.5 and Fable 5.1 support low/medium/high/max.
+// Earlier xhigh models include Sonnet 5, Opus 4.7/4.8/5, and Fable 5;
+// max additionally covers the 4.6 generation.
 fn anthropic_model_supports_xhigh_effort(model: &str) -> bool {
     let model = model.trim().to_ascii_lowercase();
+    if is_claude_sonnet_5_5_model(&model) || is_claude_haiku_5_5_model(&model) {
+        return true;
+    }
     if anthropic_always_adaptive_effort(&model, ThinkingEffort::XHigh).is_some() {
         return false;
     }
@@ -3302,7 +3421,8 @@ fn anthropic_model_supports_max_effort(model: &str) -> bool {
 
 fn anthropic_model_supports_adaptive_thinking(model: &str) -> bool {
     let model = model.trim().to_ascii_lowercase();
-    model.contains("opus-4-6")
+    is_claude_haiku_5_5_model(&model)
+        || model.contains("opus-4-6")
         || model.contains("opus-4.6")
         || model.contains("opus-4-7")
         || model.contains("opus-4.7")
@@ -7803,9 +7923,18 @@ fn render_cargo_json_diagnostics_summary(output: &str, root: &Path) -> Option<St
     Some(out)
 }
 
-fn prepend_cargo_json_diagnostics_summary(output: String, root: &Path) -> String {
+fn insert_cargo_json_diagnostics_summary(output: String, root: &Path) -> String {
     match render_cargo_json_diagnostics_summary(&output, root) {
-        Some(summary) => format!("{summary}\n{output}"),
+        Some(summary) => {
+            // Failure, verification, and journal classification read the leading exit status.
+            if let Some((status, tail)) = output.split_once('\n')
+                && parse_bash_exit_code(&output).is_some()
+            {
+                format!("{status}\n{summary}\n{tail}")
+            } else {
+                format!("{summary}\n{output}")
+            }
+        }
         None => output,
     }
 }
@@ -8325,8 +8454,9 @@ struct LocalSudoAuth {
     askpass: Option<PathBuf>,
     sudo_path: PathBuf,
     sudo_shim_dir: PathBuf,
+    prompt_requests: Option<tokio::sync::mpsc::Sender<SudoPromptRequest>>,
     password_fifo: Option<PathBuf>,
-    password: Option<String>,
+    request_fifo: Option<PathBuf>,
     preauth_required: bool,
 }
 
@@ -8344,8 +8474,9 @@ async fn prepare_local_sudo_auth(
         askpass: Some(askpass),
         sudo_path,
         sudo_shim_dir,
+        prompt_requests: None,
         password_fifo: None,
-        password: None,
+        request_fifo: None,
         preauth_required: true,
     }))
 }
@@ -8385,22 +8516,33 @@ fn sudo_askpass_script_content_with_paths(zenity: &str, kdialog: &str, osascript
         r#"#!/bin/sh
 set -eu
 PROMPT=${{1:-'sudo password:'}}
-if [ -n "${{DEXT_SUDO_PASSWORD_FIFO:-}}" ] && [ -p "$DEXT_SUDO_PASSWORD_FIFO" ]; then
-  IFS= read -r password < "$DEXT_SUDO_PASSWORD_FIFO" || exit 1
-  printf '%s\n' "$password"
-  exit 0
+if [ -n "${{DEXT_SUDO_PASSWORD_FIFO:-}}" ]; then
+  [ -p "$DEXT_SUDO_PASSWORD_FIFO" ] && [ -p "${{DEXT_SUDO_REQUEST_FIFO:-}}" ] || exit 1
+  printf 'x' > "$DEXT_SUDO_REQUEST_FIFO" || exit 1
+  {{
+    IFS= read -r status || exit 1
+    case "$status" in
+      secret) IFS= read -r password || exit 1 ;;
+      unavailable) ;;
+      *) printf '%s\n' 'Dext sudo authentication canceled or retry limit reached.' >&2; exit 1 ;;
+    esac
+  }} < "$DEXT_SUDO_PASSWORD_FIFO"
+  if [ "$status" = secret ]; then
+    printf '%s\n' "$password"
+    exit 0
+  fi
 fi
-if command -v zenity >/dev/null 2>&1; then
+if [ -x {zenity} ] || command -v zenity >/dev/null 2>&1; then
   exec {zenity} --password --title='Dext local sudo prompt' --text="$PROMPT"
 fi
-if command -v kdialog >/dev/null 2>&1; then
+if [ -x {kdialog} ] || command -v kdialog >/dev/null 2>&1; then
   exec {kdialog} --password "$PROMPT"
 fi
 if [ -x {osascript} ] || command -v osascript >/dev/null 2>&1; then
   exec {osascript} \
     -e 'on run argv' \
     -e 'set promptText to item 1 of argv' \
-    -e 'display dialog promptText default answer "" with hidden answer with title "Dext local sudo prompt" buttons {{"OK"}} default button "OK"' \
+    -e 'display dialog promptText default answer "" with hidden answer with title "Dext local sudo prompt" buttons {{"Cancel", "OK"}} default button "OK" cancel button "Cancel"' \
     -e 'text returned of result' \
     -e 'end run' \
     "$PROMPT"
@@ -8502,12 +8644,12 @@ fn create_secret_fifo_in_dir(dir: &Path, label: &str) -> std::result::Result<Pat
             .map_err(|_| format!("{label} pipe path contains NUL"))?;
         let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
         if rc == 0 {
-            let mut perms = std::fs::metadata(&path)
-                .map_err(|e| format!("metadata {label} pipe: {e}"))?
-                .permissions();
-            perms.set_mode(0o600);
-            std::fs::set_permissions(&path, perms)
-                .map_err(|e| format!("chmod {label} pipe: {e}"))?;
+            if let Err(error) =
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            {
+                let _ = std::fs::remove_file(&path);
+                return Err(format!("chmod {label} pipe: {error}"));
+            }
             return Ok(path);
         }
         let err = io::Error::last_os_error();
@@ -8519,20 +8661,12 @@ fn create_secret_fifo_in_dir(dir: &Path, label: &str) -> std::result::Result<Pat
     Err(format!("create {label} pipe: exhausted unique names"))
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 fn create_sudo_password_fifo(
     root: &Path,
     session_id: &str,
 ) -> std::result::Result<PathBuf, String> {
     create_secret_fifo_in_dir(&session_sudo_dir(root, session_id), "sudo password")
-}
-
-#[cfg(not(unix))]
-fn create_sudo_password_fifo(
-    _root: &Path,
-    _session_id: &str,
-) -> std::result::Result<PathBuf, String> {
-    Err("local sudo password prompts are only supported on Unix".to_string())
 }
 
 struct SudoPasswordPipeRuntime {
@@ -8541,51 +8675,181 @@ struct SudoPasswordPipeRuntime {
     path: PathBuf,
 }
 
-#[cfg(unix)]
-fn start_sudo_password_pipe_writer(path: PathBuf, password: String) -> SudoPasswordPipeRuntime {
-    use std::os::unix::fs::OpenOptionsExt;
+struct SudoPromptRequest {
+    attempt: usize,
+    response: std::sync::mpsc::SyncSender<SudoPromptResponse>,
+}
 
-    let stop = Arc::new(AtomicBool::new(false));
-    let thread_stop = stop.clone();
-    let thread_path = path.clone();
-    let handle = std::thread::spawn(move || {
-        let mut password = password;
-        while !thread_stop.load(Ordering::SeqCst) {
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .custom_flags(libc::O_NONBLOCK)
-                .open(&thread_path)
-            {
-                Ok(mut fifo) => {
-                    let _ = fifo.write_all(password.as_bytes());
-                    let _ = fifo.write_all(b"\n");
-                    let _ = fifo.flush();
-                    break;
-                }
-                Err(err)
-                    if matches!(err.raw_os_error(), Some(code) if code == libc::ENXIO)
-                        || err.kind() == io::ErrorKind::WouldBlock =>
-                {
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                }
-                Err(_) => break,
-            }
+struct SudoPromptResponse(LocalAuthSecret);
+
+impl Drop for SudoPromptResponse {
+    fn drop(&mut self) {
+        if let LocalAuthSecret::Secret(secret) = &mut self.0 {
+            clear_secret_string(secret);
         }
-        clear_secret_string(&mut password);
-    });
-    SudoPasswordPipeRuntime {
-        stop,
-        handle: Some(handle),
-        path,
     }
 }
 
+struct SudoPromptRuntime {
+    pipe: SudoPasswordPipeRuntime,
+    request_path: PathBuf,
+}
+
+impl Drop for SudoPromptRuntime {
+    fn drop(&mut self) {
+        self.pipe.stop.store(true, Ordering::SeqCst);
+        let _ = std::fs::remove_file(&self.request_path);
+    }
+}
+
+#[cfg(unix)]
+fn start_sudo_prompt_runtime(
+    auth: &mut LocalSudoAuth,
+) -> std::result::Result<Option<SudoPromptRuntime>, String> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let Some(requests) = auth.prompt_requests.take() else {
+        return Ok(None);
+    };
+    let dir = auth
+        .sudo_shim_dir
+        .parent()
+        .ok_or("missing sudo prompt dir")?;
+    let dir = std::fs::canonicalize(dir).map_err(|e| format!("resolve sudo prompt dir: {e}"))?;
+    let response_path = create_secret_fifo_in_dir(&dir, "sudo response")?;
+    let mut runtime = SudoPromptRuntime {
+        pipe: SudoPasswordPipeRuntime {
+            stop: Arc::new(AtomicBool::new(false)),
+            handle: None,
+            path: response_path.clone(),
+        },
+        request_path: PathBuf::new(),
+    };
+    runtime.request_path = create_secret_fifo_in_dir(&dir, "sudo request")?;
+    // Keeping both ends open prevents orphaned blocking opens. Only askpass
+    // reads responses; each request produces one bounded, atomic FIFO write.
+    let open_pipe = |path: &Path| {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+            .map_err(|e| format!("open sudo prompt pipe: {e}"))
+    };
+    let mut request_pipe = open_pipe(&runtime.request_path)?;
+    let mut response_pipe = open_pipe(&response_path)?;
+    auth.password_fifo = Some(response_path);
+    auth.request_fifo = Some(runtime.request_path.clone());
+    let stop = runtime.pipe.stop.clone();
+    runtime.pipe.handle = Some(
+        std::thread::Builder::new()
+            .name("dext-sudo-auth".into())
+            .spawn(move || {
+                let pause = std::time::Duration::from_millis(20);
+                let mut attempt = 0;
+                let mut canceled = false;
+                while !stop.load(Ordering::SeqCst) {
+                    match request_pipe.read(&mut [0u8; 1]) {
+                        Ok(1) => {}
+                        Ok(_) => {
+                            std::thread::sleep(pause);
+                            continue;
+                        }
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(pause);
+                            continue;
+                        }
+                        Err(_) => break,
+                    }
+                    attempt += 1;
+                    let mut response = SudoPromptResponse(LocalAuthSecret::Canceled);
+                    if !canceled && attempt <= 3 {
+                        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+                        if requests
+                            .try_send(SudoPromptRequest {
+                                attempt,
+                                response: tx,
+                            })
+                            .is_ok()
+                        {
+                            loop {
+                                if stop.load(Ordering::SeqCst) {
+                                    return;
+                                }
+                                match rx.recv_timeout(pause) {
+                                    Ok(value) => {
+                                        response = value;
+                                        break;
+                                    }
+                                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                                }
+                            }
+                        }
+                    }
+                    // POSIX guarantees atomic writes up to 512 bytes. Refuse invalid
+                    // secrets rather than truncate or inject another protocol record.
+                    let mut payload = match &response.0 {
+                        LocalAuthSecret::Secret(secret)
+                            if secret.len() <= 500
+                                && !secret.is_empty()
+                                && !secret.contains(['\n', '\r', '\0']) =>
+                        {
+                            format!("secret\n{secret}\n")
+                        }
+                        LocalAuthSecret::Unavailable => "unavailable\n".to_string(),
+                        _ => {
+                            canceled = true;
+                            "cancel\n".to_string()
+                        }
+                    };
+                    let sent = response_pipe.write_all(payload.as_bytes());
+                    clear_secret_string(&mut payload);
+                    if sent.is_err() {
+                        break;
+                    }
+                }
+            })
+            .map_err(|e| format!("start sudo prompt worker: {e}"))?,
+    );
+    Ok(Some(runtime))
+}
+
 #[cfg(not(unix))]
-fn start_sudo_password_pipe_writer(path: PathBuf, _password: String) -> SudoPasswordPipeRuntime {
-    SudoPasswordPipeRuntime {
-        stop: Arc::new(AtomicBool::new(true)),
-        handle: None,
-        path,
+fn start_sudo_prompt_runtime(
+    _auth: &mut LocalSudoAuth,
+) -> std::result::Result<Option<SudoPromptRuntime>, String> {
+    Err("local sudo prompts are only supported on Unix".to_string())
+}
+
+async fn execute_with_sudo_prompts<F, T>(
+    execution: F,
+    mut requests: tokio::sync::mpsc::Receiver<SudoPromptRequest>,
+    sink: &mut dyn EventSink,
+) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    tokio::pin!(execution);
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut execution => return result,
+            Some(request) = requests.recv() => {
+                let message = if request.attempt > 1 {
+                    "sudo requested authentication again. Re-enter your password locally (maximum 3 attempts); Esc cancels in the TUI, an empty line cancels in the console. Never send it in chat."
+                } else {
+                    SUDO_AUTH_GUIDANCE
+                };
+                let prompt = sink.request_local_auth_secret_async("bash", message);
+                let response = tokio::select! {
+                    biased;
+                    result = &mut execution => return result,
+                    response = prompt => SudoPromptResponse(response),
+                };
+                let _ = request.response.send(response);
+            }
+        }
     }
 }
 
@@ -9001,8 +9265,7 @@ fn write_git_credential_helper_script(
     Ok(path)
 }
 
-/// Like start_sudo_password_pipe_writer, but keeps serving after the first
-/// read: one git command may invoke the credential helper several times
+/// One git command may invoke the credential helper several times
 /// (fetch + push, redirects, submodules), and each helper run opens the FIFO
 /// once.
 ///
@@ -9134,47 +9397,29 @@ fn sudo_wrapper_prefix(auth: &LocalSudoAuth) -> String {
                 .map(|fifo| {
                     let fifo = std::fs::canonicalize(fifo).unwrap_or_else(|_| fifo.clone());
                     format!(
-                        " {SUDO_PASSWORD_FIFO_ENV}={}",
-                        shell_single_quote(&fifo.display().to_string())
+                        " {SUDO_PASSWORD_FIFO_ENV}={} DEXT_SUDO_REQUEST_FIFO={}",
+                        shell_single_quote(&fifo.display().to_string()),
+                        shell_single_quote(
+                            &auth
+                                .request_fifo
+                                .as_ref()
+                                .expect("sudo request fifo")
+                                .display()
+                                .to_string()
+                        )
                     )
                 })
                 .unwrap_or_default();
             prefix.push_str(&format!(
-                "if ! builtin command {real_sudo} -n -v 2>/dev/null; then\n  SUDO_ASKPASS={askpass} {SUDO_ASKPASS_ENV}={askpass}{fifo_env} SUDO_PROMPT='[dext local sudo] password for %u to run %p: ' builtin command {real_sudo} -A -v || exit $?\nfi\nunset SUDO_ASKPASS {SUDO_ASKPASS_ENV} {SUDO_PASSWORD_FIFO_ENV} SUDO_PROMPT\n"
+                "if ! builtin command {real_sudo} -n -v 2>/dev/null; then\n  SUDO_ASKPASS={askpass} {SUDO_ASKPASS_ENV}={askpass}{fifo_env} SUDO_PROMPT='[dext local sudo] password for %u to run %p: ' builtin command {real_sudo} -A -v || exit $?\nfi\nunset SUDO_ASKPASS {SUDO_ASKPASS_ENV} {SUDO_PASSWORD_FIFO_ENV} DEXT_SUDO_REQUEST_FIFO SUDO_PROMPT\n"
             ));
         } else {
             prefix.push_str("printf '%s\\n' 'sudo auth prompt unavailable' >&2\nexit 1\n");
         }
     }
-    prefix.push_str(&format!(
-        "sudo() {{ builtin command {real_sudo} -n \"$@\"; }}\n"
-    ));
-    let mut seen = HashSet::new();
-    for path in std::iter::once(auth.sudo_path.display().to_string()).chain(
-        sudo_wrapper_command_paths()
-            .iter()
-            .map(|path| path.to_string()),
-    ) {
-        if !seen.insert(path.clone()) || !sudo_shell_function_name_is_safe(&path) {
-            continue;
-        }
-        prefix.push_str(&format!(
-            "function {path} {{ builtin command {} -n \"$@\"; }}\n",
-            shell_single_quote(&path)
-        ));
-    }
+    // Shell functions add a subshell parent in pipelines, invalidating
+    // parent-scoped sudo timestamps. The PATH shim execs sudo directly.
     prefix
-}
-
-fn sudo_wrapper_command_paths() -> &'static [&'static str] {
-    &["/usr/bin/sudo", "/bin/sudo"]
-}
-
-fn sudo_shell_function_name_is_safe(path: &str) -> bool {
-    !path.is_empty()
-        && path
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-'))
 }
 
 #[cfg(test)]
@@ -9215,11 +9460,10 @@ async fn execute_bash_async_prepared(
     } else {
         None
     };
-    let _sudo_password_pipe = local_sudo_auth.as_mut().and_then(|auth| {
-        let fifo = auth.password_fifo.clone()?;
-        let password = auth.password.take()?;
-        Some(start_sudo_password_pipe_writer(fifo, password))
-    });
+    let _sudo_prompt = local_sudo_auth
+        .as_mut()
+        .map(start_sudo_prompt_runtime)
+        .transpose()?;
     let bash_cmd = if let Some(auth) = local_sudo_auth.as_ref() {
         format!("{}{cmd}", sudo_wrapper_prefix(auth))
     } else {
@@ -9292,7 +9536,8 @@ async fn execute_bash_async_prepared(
             .env("PATH", path_env)
             .env_remove("SUDO_ASKPASS")
             .env_remove(SUDO_ASKPASS_ENV)
-            .env_remove(SUDO_PASSWORD_FIFO_ENV);
+            .env_remove(SUDO_PASSWORD_FIFO_ENV)
+            .env_remove("DEXT_SUDO_REQUEST_FIFO");
     }
     configure_tokio_process_group(&mut command);
     let mut child = command.spawn().map_err(|e| format!("spawn failed: {e}"))?;
@@ -9403,7 +9648,7 @@ async fn execute_bash_async_prepared(
     }
     body.push_str("--- stderr ---\n");
     body.push_str(&stderr);
-    Ok(prepend_cargo_json_diagnostics_summary(body, root))
+    Ok(insert_cargo_json_diagnostics_summary(body, root))
 }
 
 #[derive(Clone, Copy)]
@@ -11207,7 +11452,7 @@ impl Hooks {
     fn load_file(path: &Path) -> Self {
         match std::fs::read_to_string(path) {
             Ok(s) => serde_json::from_str(&s).unwrap_or_else(|e| {
-                eprintln!("[hooks] parse error in {}: {e}", path.display());
+                events::runtime_warning(format!("[hooks] parse error in {}: {e}", path.display()));
                 Hooks::default()
             }),
             Err(_) => Hooks::default(),
@@ -14495,13 +14740,69 @@ impl Agent {
 
     fn kimi_model_uses_adaptive_thinking(&self) -> bool {
         self.official_kimi_model()
-            .is_some_and(|model| model.eq_ignore_ascii_case("k3"))
+            .is_some_and(is_kimi_adaptive_model)
+    }
+
+    fn required_anthropic_thinking_for_model(
+        &self,
+        model: &str,
+        effort: ThinkingEffort,
+    ) -> Option<(&'static str, String)> {
+        if self.request_contract_for_model(model) != RequestContract::AnthropicMessages {
+            return None;
+        }
+        let kimi_adaptive = self.provider_profile.as_ref().is_some_and(|profile| {
+            is_official_kimi_profile(profile, &self.base_url) && is_kimi_adaptive_model(model)
+        });
+        let (kind, effort) = if kimi_adaptive {
+            let effort = match effort {
+                ThinkingEffort::Off | ThinkingEffort::Minimal | ThinkingEffort::Low => "low",
+                ThinkingEffort::Medium | ThinkingEffort::High | ThinkingEffort::XHigh => "high",
+                ThinkingEffort::Max => "max",
+            };
+            ("adaptive", effort.to_string())
+        } else if let Some(effort) = glm_forced_thinking_effort(&self.provider_id, model, effort) {
+            ("enabled", effort)
+        } else {
+            (
+                "adaptive",
+                anthropic_required_adaptive_effort(&self.provider_id, model, effort)?,
+            )
+        };
+        let levels = self
+            .provider_profile
+            .as_ref()
+            .map(|profile| resolve_model_spec(profile, model).effort_levels)
+            .unwrap_or_default();
+        let effort = if levels.is_empty() {
+            effort
+        } else {
+            map_effort_to_provider_levels(&levels, ThinkingEffort::parse(&effort)?)?
+        };
+        Some((kind, effort))
+    }
+
+    fn disabled_thinking_effort_for_haiku(&self, model: &str) -> Result<String> {
+        let levels = self
+            .provider_profile
+            .as_ref()
+            .map(|profile| resolve_model_spec(profile, model).effort_levels)
+            .unwrap_or_default();
+        if levels.is_empty() {
+            return Ok("low".to_string());
+        }
+        let levels = levels
+            .into_iter()
+            .filter(|level| matches!(level.as_str(), "low" | "medium" | "high"))
+            .collect::<Vec<_>>();
+        map_effort_to_provider_levels(&levels, ThinkingEffort::Low).ok_or_else(|| {
+            anyhow::anyhow!("{model} disabled thinking requires a declared low, medium, or high effort level; update model effort metadata or enable thinking")
+        })
     }
 
     fn kimi_model_allows_empty_thinking_signature(&self) -> bool {
-        self.official_kimi_model().is_some_and(|model| {
-            model.eq_ignore_ascii_case("k3") || model.eq_ignore_ascii_case("kimi-for-coding")
-        })
+        self.official_kimi_model()
+            .is_some_and(is_kimi_adaptive_model)
     }
 
     fn request_contract_for_model(&self, model: &str) -> RequestContract {
@@ -14659,6 +14960,9 @@ impl Agent {
     /// a value they understand.
     fn oai_chat_reasoning_effort(&self, effort: ThinkingEffort) -> Option<String> {
         let resolved_spec = self.resolved_model_spec();
+        if resolved_spec.as_ref().is_some_and(|spec| !spec.reasoning) {
+            return None;
+        }
         if self.deepseek_chat_enabled() {
             let mapped = match effort {
                 ThinkingEffort::Off => return None,
@@ -14674,20 +14978,25 @@ impl Agent {
                 .and_then(|spec| map_effort_to_provider_levels(&spec.effort_levels, mapped))
                 .or_else(|| Some(mapped.as_str().to_string()));
         }
-        resolved_spec
+        if let Some(spec) = resolved_spec
             .as_ref()
             .filter(|spec| !spec.effort_levels.is_empty())
-            .and_then(|spec| map_effort_to_provider_levels(&spec.effort_levels, effort))
-            .or_else(|| {
-                (resolved_spec
-                    .as_ref()
-                    .is_none_or(|spec| spec.source == "legacy"))
-                .then(|| {
-                    provider_model_output_config_effort(&self.provider_id, &self.model, effort)
-                })
-                .flatten()
-            })
-            .or_else(|| openai_reasoning_effort(&self.model, effort).map(str::to_string))
+        {
+            if effort == ThinkingEffort::Off {
+                return spec
+                    .effort_levels
+                    .iter()
+                    .any(|level| level == "none")
+                    .then(|| "none".to_string());
+            }
+            return map_effort_to_provider_levels(&spec.effort_levels, effort);
+        }
+        (resolved_spec
+            .as_ref()
+            .is_none_or(|spec| spec.source == "legacy"))
+        .then(|| provider_model_output_config_effort(&self.provider_id, &self.model, effort))
+        .flatten()
+        .or_else(|| openai_reasoning_effort(&self.model, effort).map(str::to_string))
     }
 
     fn model_supports_image_input(&self) -> bool {
@@ -14778,6 +15087,10 @@ impl Agent {
     }
 
     fn priced_session_usage(&self) -> Usage {
+        // Request tiers and model prices cannot be reapplied to aggregate counts.
+        if self.session_usage.cost_usd.is_some() {
+            return self.session_usage;
+        }
         let model_spec = self.resolved_model_spec();
         usage_with_current_pricing(
             self.session_usage,
@@ -16697,7 +17010,7 @@ impl Agent {
             ledger.next_actions.clear();
             if matches!(
                 ledger.current_phase.as_str(),
-                "probe" | "execute" | "verify" | "synthesize"
+                "probe" | "execute" | "implement" | "verify" | "synthesize"
             ) {
                 ledger.current_phase = "done".to_string();
             }
@@ -17040,6 +17353,7 @@ impl Agent {
                             if let Block::ToolResult {
                                 tool_use_id,
                                 content,
+                                is_error,
                                 ..
                             } = b
                             {
@@ -17048,7 +17362,9 @@ impl Agent {
                                 }
                                 msgs.push(OaiMessage {
                                     role: "tool".to_string(),
-                                    content: Some(Value::String(content.clone())),
+                                    content: Some(Value::String(openai_tool_result_content(
+                                        content, *is_error,
+                                    ))),
                                     reasoning_content: None,
                                     tool_calls: None,
                                     tool_call_id: Some(tool_use_id.clone()),
@@ -17258,6 +17574,7 @@ impl Agent {
                     Block::ToolResult {
                         tool_use_id,
                         content,
+                        is_error,
                         ..
                     } => {
                         if !valid_ids.contains(tool_use_id) {
@@ -17266,7 +17583,7 @@ impl Agent {
                         items.push(json!({
                             "type": "function_call_output",
                             "call_id": tool_use_id,
-                            "output": content,
+                            "output": openai_tool_result_content(content, *is_error),
                         }));
                     }
                     Block::ImageReference { .. } => {
@@ -17487,9 +17804,10 @@ impl Agent {
                 let mut oai_msgs = self.history_to_oai_messages(sys_stable);
                 push_runtime_env_oai_message(&mut oai_msgs, sys_env);
                 let oai_tools = self.wire_tools_oai();
-                if self.model.trim().eq_ignore_ascii_case("gpt-6.1-sol") && !oai_tools.is_empty() {
+                if is_gpt_6_responses_tools_only_model(&self.model) && !oai_tools.is_empty() {
                     anyhow::bail!(
-                        "gpt-6.1-sol tool calling requires the Responses API; configure this provider with the openai-responses request contract"
+                        "{} tool calling requires the Responses API; configure this provider with the openai-responses request contract",
+                        self.model
                     );
                 }
                 let reasoning_effort =
@@ -17549,47 +17867,52 @@ impl Agent {
             RequestContract::AnthropicMessages => {
                 let max_tokens = max_output_tokens;
                 let resolved_spec = self.resolved_model_spec();
-                let configured_effort =
-                    glm_forced_thinking_effort(&self.provider_id, &self.model, effort)
-                        .or_else(|| {
-                            resolved_spec
-                                .as_ref()
-                                .filter(|spec| !spec.effort_levels.is_empty())
-                                .and_then(|spec| {
-                                    map_effort_to_provider_levels(&spec.effort_levels, effort)
-                                })
+                let configured_effort = resolved_spec
+                    .as_ref()
+                    .filter(|spec| !spec.effort_levels.is_empty())
+                    .and_then(|spec| map_effort_to_provider_levels(&spec.effort_levels, effort))
+                    .or_else(|| {
+                        (resolved_spec
+                            .as_ref()
+                            .is_none_or(|spec| spec.source == "legacy"))
+                        .then(|| {
+                            provider_model_output_config_effort(
+                                &self.provider_id,
+                                &self.model,
+                                effort,
+                            )
                         })
-                        .or_else(|| {
-                            (resolved_spec
-                                .as_ref()
-                                .is_none_or(|spec| spec.source == "legacy"))
-                            .then(|| {
-                                provider_model_output_config_effort(
-                                    &self.provider_id,
-                                    &self.model,
-                                    effort,
-                                )
-                            })
-                            .flatten()
-                        });
-                let required_adaptive_effort =
-                    anthropic_required_adaptive_effort(&self.provider_id, &self.model, effort);
-                let (thinking, output_config) = if let Some(effort) = required_adaptive_effort {
+                        .flatten()
+                    });
+                let required_thinking =
+                    self.required_anthropic_thinking_for_model(&self.model, effort);
+                let (thinking, output_config) = if let Some((kind, effort)) = required_thinking {
                     (
                         Some(AnthropicThinking {
-                            kind: "adaptive",
+                            kind,
                             budget_tokens: None,
                         }),
                         Some(AnthropicOutputConfig { effort }),
                     )
                 } else if let Some(effort) = configured_effort {
-                    let kimi_adaptive = self.kimi_model_uses_adaptive_thinking();
+                    let adaptive = self.kimi_model_uses_adaptive_thinking()
+                        || uses_anthropic_adaptive_thinking(&self.provider_id, &self.model);
                     (
                         Some(AnthropicThinking {
-                            kind: if kimi_adaptive { "adaptive" } else { "enabled" },
+                            kind: if adaptive { "adaptive" } else { "enabled" },
                             budget_tokens: None,
                         }),
                         Some(AnthropicOutputConfig { effort }),
+                    )
+                } else if effort == ThinkingEffort::Off && is_claude_haiku_5_5_model(&self.model) {
+                    (
+                        Some(AnthropicThinking {
+                            kind: "disabled",
+                            budget_tokens: None,
+                        }),
+                        Some(AnthropicOutputConfig {
+                            effort: self.disabled_thinking_effort_for_haiku(&self.model)?,
+                        }),
                     )
                 } else if uses_anthropic_adaptive_thinking(&self.provider_id, &self.model) {
                     let effort = anthropic_output_config_effort(&self.model, effort);
@@ -17617,7 +17940,7 @@ impl Agent {
                 let history = &self.history;
                 let messages = sanitize_anthropic_messages(
                     history,
-                    thinking.is_some(),
+                    thinking.is_some_and(|thinking| thinking.kind != "disabled"),
                     self.kimi_model_allows_empty_thinking_signature(),
                 );
                 let prompt_cache_enabled = self.model_supports_prompt_cache();
@@ -18593,25 +18916,28 @@ impl Agent {
             text: COMPACT_SYSTEM,
             cache_control: None,
         }];
-        let required_adaptive_effort =
-            anthropic_required_adaptive_effort(&self.provider_id, model, ThinkingEffort::Low);
-        let effort = glm_forced_thinking_effort(&self.provider_id, model, ThinkingEffort::Low);
-        let (thinking, output_config) = if let Some(effort) = required_adaptive_effort {
+        let (thinking, output_config) = if let Some((kind, effort)) =
+            self.required_anthropic_thinking_for_model(model, ThinkingEffort::Low)
+        {
             (
                 Some(AnthropicThinking {
-                    kind: "adaptive",
+                    kind,
                     budget_tokens: None,
                 }),
                 Some(AnthropicOutputConfig { effort }),
             )
-        } else {
+        } else if is_claude_haiku_5_5_model(model) {
             (
-                effort.as_ref().map(|_| AnthropicThinking {
-                    kind: "enabled",
+                Some(AnthropicThinking {
+                    kind: "disabled",
                     budget_tokens: None,
                 }),
-                effort.map(|effort| AnthropicOutputConfig { effort }),
+                Some(AnthropicOutputConfig {
+                    effort: self.disabled_thinking_effort_for_haiku(model)?,
+                }),
             )
+        } else {
+            (None, None)
         };
         let body = Request {
             model,
@@ -18653,8 +18979,8 @@ impl Agent {
             .then(|| self.responses_reasoning_effort_for_model(&model, ThinkingEffort::Low))
             .flatten();
         let thinking = effort.is_some()
-            || glm_forced_thinking_effort(&self.provider_id, &model, ThinkingEffort::Low).is_some()
-            || anthropic_required_adaptive_effort(&self.provider_id, &model, ThinkingEffort::Low)
+            || self
+                .required_anthropic_thinking_for_model(&model, ThinkingEffort::Low)
                 .is_some();
         let max_tokens = compact_summary_max_tokens(self.thinking_effort, thinking);
         let bytes = if contract.is_responses() {
@@ -20927,14 +21253,18 @@ fn analyze_session_history(header: &SessionHeader, history: &[Message]) -> Sessi
     } else {
         &header.provenance.model
     };
-    let usage = usage_with_current_pricing(
-        header.usage,
-        provider_id,
-        header.provenance.api_provider,
-        base_url,
-        model,
-        None,
-    );
+    let usage = if header.usage.cost_usd.is_some() {
+        header.usage
+    } else {
+        usage_with_current_pricing(
+            header.usage,
+            provider_id,
+            header.provenance.api_provider,
+            base_url,
+            model,
+            None,
+        )
+    };
     let mut analysis = SessionAnalysis {
         messages: history.len(),
         provider: header.provenance.provider.clone(),

@@ -3532,7 +3532,43 @@ fn classify_http_risk(input: &Value) -> CommandRisk {
 
 pub(crate) const BASH_PIPEFAIL_PREFIX: &str = "set -o pipefail\n";
 
+/// `wsl.exe` options that restart or tear down WSL. Run from inside WSL they kill
+/// every Linux session at once, Dext included, so they are left to the user.
+const WSL_LIFECYCLE_FLAGS: &[&str] = &[
+    "--update",
+    "--shutdown",
+    "--terminate",
+    "-t",
+    "--unregister",
+];
+
+/// Finds `wsl[.exe] <lifecycle flag>` anywhere in the command, including inside
+/// PowerShell/cmd strings and heredocs, so `powershell.exe -Command 'wsl --update'`
+/// is caught too. Only the option run right after `wsl` is checked, so
+/// `wsl -e ls -t` still runs.
+fn wsl_lifecycle_flag(command: &str) -> Option<String> {
+    let words: Vec<&str> = command
+        .split(|c: char| c.is_whitespace() || "'\";|&(){},`".contains(c))
+        .filter(|word| !word.is_empty())
+        .collect();
+    words.iter().enumerate().find_map(|(idx, word)| {
+        if !shell_command_basename(word).eq_ignore_ascii_case("wsl") {
+            return None;
+        }
+        words[idx + 1..]
+            .iter()
+            .take_while(|arg| arg.starts_with('-') && !matches!(**arg, "-e" | "--exec" | "--"))
+            .map(|arg| arg.to_ascii_lowercase())
+            .find(|arg| WSL_LIFECYCLE_FLAGS.contains(&arg.as_str()))
+    })
+}
+
 pub(crate) fn apply_bash_guardrails(command: &str) -> std::result::Result<String, String> {
+    if let Some(flag) = wsl_lifecycle_flag(command) {
+        return Err(format!(
+            "blocked `wsl {flag}`: it restarts WSL and kills every running WSL session, including this one. Ask the user to run it from Windows PowerShell once their work is saved."
+        ));
+    }
     let lower = command.to_ascii_lowercase();
     if lower.contains("--break-system-packages") {
         let allow = std::env::var(crate::BASH_UNSAFE_FLAG_OVERRIDE_ENV)
@@ -3577,6 +3613,31 @@ mod tests {
         let err = apply_bash_guardrails("pip install --break-system-packages requests")
             .expect_err("unsafe flag should be blocked");
         assert!(err.contains("blocked unsafe flag"), "{err}");
+    }
+
+    #[test]
+    fn bash_guardrails_block_wsl_restart_commands() {
+        for command in [
+            // The 2026-11-01 command that killed every WSL session.
+            "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe -NoProfile -NonInteractive -Command '& wsl.exe --update; exit $LASTEXITCODE' >update.log 2>&1",
+            "wsl.exe --shutdown",
+            "cmd.exe /c wsl -t Ubuntu",
+            "powershell.exe -Command - <<'PS'\nwsl.exe --version\nWSL.EXE --Update --pre-release\nPS",
+            "powershell.exe -Command \"Start-Process wsl -ArgumentList '--unregister','Old' -Verb RunAs\"",
+        ] {
+            let err = apply_bash_guardrails(command).expect_err(command);
+            assert!(err.contains("restarts WSL"), "{err}");
+        }
+        for command in [
+            "wsl.exe --version",
+            "wsl.exe -l -v",
+            "powershell.exe -NoProfile -Command 'wsl.exe --status'",
+            "wsl -e ls -t",
+            "wsl -d Ubuntu -- sort -t, -k2 data.csv",
+            "cargo update --workspace",
+        ] {
+            apply_bash_guardrails(command).expect(command);
+        }
     }
 
     #[test]

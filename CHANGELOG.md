@@ -4,11 +4,39 @@
 
 ### Changed
 
+- Added GPT-6.1 Terra to OpenAI/ChatGPT with Responses tool routing, native effort metadata, pricing, and compact aliases; Sol remains supported and no undocumented 6.1 names are inferred. Added verified Kimi Code K3.1 Pro/Highspeed and K3-256k, Anthropic Sonnet/Haiku 5.5, and GLM-5.3/FlashX/FlashX-Legal with model-specific limits, thinking, vision metadata, and pricing. Kimi defaults and credentials stay unchanged; Pro Highspeed consumes 2× plan usage, and live inference currently requires restored subscription access. Haiku 5.5 applies its documented higher price above 100K total input tokens.
+
 - Raised the transient foreground provider HTTP retry budget from four to six attempts per request round. Without `Retry-After`, five jittered waits total 16–27 seconds plus request time; this improves transient-failure tolerance but does not establish the cause of observed ChatGPT 503s or exclude size-dependent failures. A pre-request cancellation check prevents another request after an interrupted zero-second wait. Mock-server regressions cover five 503s before success, exhaustion at six requests, identical retry bodies, fail-fast authentication/schema errors, and interruption. Four-attempt stream/summary budgets remain separate.
 
 - Raised `read_image` from two to 100 successful images per user turn, with a shared 20 MiB sanitized-JPEG budget. Failed/over-budget calls do not add references or consume budget; batched dispatch and all four provider wire contracts enforce the same bounds before disclosure/base64 encoding. Existing approvals, decoder isolation, digest/route fences, metadata stripping and path-only sessions remain unchanged; no dependencies or persistent pixel cache were added. Provider context/request limits may be lower.
 
 ### Fixed
+
+- Corrected the sudo pipeline compatibility claim: Bash 3.2 adds a shell parent for `command sudo` in a pipeline, so parent-scoped authorization cannot be reused there. Tests explicitly assert refusal without payload execution on Bash 3.2, keep modern Bash pipeline success, and retain bare/env/absolute pipeline and non-pipeline command-sudo checks. Production sudo handling and authorization boundaries are unchanged.
+
+- The macOS terminal-setup fixture settles the empty input queue with `FIONREAD` before exact settings comparisons. Darwin sets the kernel-managed `PENDIN` bit when canonical mode is restored; processing that state avoids a false mismatch without masking any flags or changing production code.
+
+- The terminal-setup failure regression checks restored input/output/local terminal flags inside its controlling-session child after every injected write/flush failure. This avoids inspecting a revoked slave PTY after child exit on macOS while retaining and strengthening the restoration assertions; production terminal handling is unchanged.
+
+- The local-auth Unix PTY test uses mutable null termios/winsize pointers for macOS's `openpty` signature; Linux accepts the same pointers. This fixes native macOS test compilation without changing local authentication behavior or assertions.
+
+- Reconciled the checkpoint-warning PTY fixture with the merged cleanup helper: one drop guard owns both child and PTY and uses bounded output-draining termination on failure. This fixes the merged test's compile error without changing runtime behavior or test assertions.
+
+- Runtime checkpoint/hook warnings now enter the inline TUI transcript rather than overwriting the composer, including worker-thread diagnostics. Warning-route installation and stderr fallback are serialized, drafts survive warning replay, and partial terminal setup failures restore raw mode. Console/standalone CLI diagnostics retain stderr output.
+
+- Authorized edit tasks use an explicit Implement phase, retained across queued updates and resumed work rather than prematurely switching to synthesis or verification. Failed tools keep explicit diagnostics and allow provider continuation without automatically rerunning failed commands; OpenAI Responses reasoning snapshots reconcile same-ID replacements within aggregate bounds.
+
+- Fresh-eyes model review fixes Haiku 5.5 Off/summaries to explicitly disable default-on thinking at low output effort, applies its long-context tier to summary attempts, and preserves accumulated priced session costs across thresholds/model switches. Catalog merging now preserves legacy per-model overrides and deterministically combines alias metadata across built-ins; required-thinking Sonnet/Kimi/GLM requests and summaries honor declared effort restrictions. Regressions cover API-key/OAuth wire bodies, thinking replay/history immutability, summary-worker accounting, session analysis, canonical alias collisions, and reload stability.
+
+- Final model review also preserves official Kimi adaptive thinking without effort metadata, removes double effort mapping, rejects Haiku disabled-thinking requests with incompatible effort restrictions, and prevents Chat Completions effort fallback from escaping explicit levels or reasoning-disabled capability. Three focused regressions reproduce the original failures and cover declared none, medium/high, vendor levels, and invalid disabled-thinking combinations.
+
+- Updated the exact `pulldown-cmark` pin and lockfile from 0.13.5 to 0.13.6 for RUSTSEC-2026-0433 (quadratic parsing with optional image wikilinks), discovered during model verification. No unrelated dependency versions changed.
+
+- The bash tool now refuses `wsl[.exe] --update`, `--shutdown`, `--terminate`/`-t` and `--unregister`, including inside PowerShell/cmd strings, and tells the model to hand them to the user. On 2026-11-01 a session ran `wsl --update` from inside WSL and the upgrade restarted WSL, killing every running session. Read-only calls such as `wsl --version` still run.
+
+- Anthropic Messages streams now allow 4 MiB per SSE event, matching Responses. A single `signature_delta` carries the whole opaque thinking signature; at maximum effort a live session failed with `event exceeded 256000 bytes` after earlier signatures reached 239,584 bytes. Chat Completions keeps the 256,000-byte event cap, and tool-argument and aggregate reasoning caps are unchanged. A fragmented 300,000-byte signature regression checks that the signature is preserved exactly.
+
+- The lockfile raises Rustls from 0.23.45 to 0.23.46, clearing RUSTSEC-2026-0346 through RUSTSEC-2026-0349. Only that one lockfile entry changed.
 
 - Fresh-eyes image audit deferred batch image approvals/digest capture/pre-tool hooks until sequential dispatch after capacity and interrupt checks; exhausted budgets no longer cause unusable prompts. New-turn image grants expire before authentication refresh, including on early failure. Lean tool descriptions now expose count/byte limits within the unchanged prompt budget. Regressions cover policy/denial/cancellation, hook blocking/source changes, smaller-after-overflow admission, exact decoded wire bytes across messages/rebuilt requests, and six distinguishable gateway images. The real-binary worker/gateway fixture additionally verifies 100/101 admission across 50/51-call batches, sanitized dimensions/order and aggregate bytes, and refusal without pixels. A bounded live ChatGPT smoke correctly identified 12 distinct fixture colors; 100-image and cross-provider live acceptance remain unclaimed.
 
@@ -19,6 +47,10 @@
 - Branch CI `test (macos-15-intel)` now has a 45-minute job limit (other platforms keep 30, matching the release workflow's 45). The job was compile-bound (Clippy ~5 min, TUI-test release build ~13 min) and hit 30 minutes mid-way through release tests on `main` and PR #69 with no test failures.
 
 - Fixed intermittent Unix PTY smoke-test failures, most frequent on Intel macOS; Dext itself is unchanged. Local stress runs and CI logs identified five harness defects: tests sharing a temporary-directory prefix could start within one microsecond-resolution macOS clock tick and share a sandbox and session lock; launch-only fixtures used the public default provider, so process exit could wait on the startup connection-prewarm DNS lookup; resize and Mermaid reflow checks could read an intermediate-width or still-open replay; PTY descriptors were inheritable, so one fixture's child could hold another test's terminal open and leave orphaned processes; and failure cleanup waited for the child without a deadline or terminal draining, which hung the suite under heavy throttling. Fixture directories now include a per-process counter, fixtures default to an unreachable loopback provider, resize checks wait for the final-width synchronized replay (their replay waits rise from 5 to 10 seconds) and the Mermaid check for its complete replay, PTY descriptors are close-on-exec, and cleanup drains output under a 5-second bound. Assertions and replay-cost bounds are unchanged.
+
+### Documentation
+
+- Reconciled the merged runtime and CI documentation, clarified policy-governed recall versus user-authored Seat summaries, and documented external Ratatui test scope. Recorded the unresolved-index checkpoint limitation: agent writes fail closed until merge conflicts are resolved and staged externally.
 
 ### Security
 

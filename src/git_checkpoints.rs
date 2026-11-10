@@ -655,10 +655,10 @@ fn normalize_checkpoint_file_mode(path: &Path, label: &str) -> Result<bool, Stri
         if mode != 0o600 {
             file.set_permissions(std::fs::Permissions::from_mode(0o600))
                 .map_err(|error| format!("chmod {label} {}: {error}", path.display()))?;
-            eprintln!(
+            crate::events::runtime_warning(format!(
                 "[checkpoint] repaired {label} mode {mode:04o} -> 0600: {}",
                 path.display()
-            );
+            ));
             return Ok(true);
         }
         Ok(false)
@@ -1884,10 +1884,14 @@ pub(crate) fn create_checkpoint_in_repo(
     match prune_checkpoint_refs(git_root, DEFAULT_PRUNE_KEEP, DEFAULT_PRUNE_MAX_AGE_HOURS) {
         Ok(outcome) => {
             for warning in outcome.warnings {
-                eprintln!("[checkpoint] retention warning: {warning}");
+                crate::events::runtime_warning(format!(
+                    "[checkpoint] retention warning: {warning}"
+                ));
             }
         }
-        Err(error) => eprintln!("[checkpoint] retention warning: {error}"),
+        Err(error) => {
+            crate::events::runtime_warning(format!("[checkpoint] retention warning: {error}"))
+        }
     }
 
     Ok(Some(cp))
@@ -2308,9 +2312,8 @@ fn list_checkpoints_in_repo(
             ));
         }
     }
-    // Every write-risk tool call reaches this through automatic retention, and
-    // stderr is shared with the inline TUI, so the notice is emitted at most
-    // once per process instead of once per checkpoint.
+    // Automatic retention visits this on every write-risk call; report retired
+    // rows once per process rather than flooding the transcript.
     static WARNED_UNREADABLE: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
     if !unreadable.is_empty() && !WARNED_UNREADABLE.swap(true, std::sync::atomic::Ordering::Relaxed)
@@ -2326,11 +2329,11 @@ fn list_checkpoints_in_repo(
         } else {
             ("entries", "lines")
         };
-        eprintln!(
+        crate::events::runtime_warning(format!(
             "[checkpoint] skipped {} unreadable manifest {entry_noun} ({line_noun} {shown}{}); those recovery points cannot be restored by this build",
             unreadable.len(),
             if unreadable.len() > 8 { ", …" } else { "" },
-        );
+        ));
     }
     // Newest first. Manifest append order breaks ties when several checkpoints
     // share the same millisecond timestamp.

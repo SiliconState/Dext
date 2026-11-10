@@ -10,11 +10,14 @@ const TOOL_ARGUMENT_BUFFER_CAP: usize = 256_000;
 const REASONING_BUFFER_CAP: usize = 4 * 1024 * 1024;
 
 pub(crate) fn sse_event_cap(contract: RequestContract) -> usize {
-    // Responses terminals include full output snapshots and opaque reasoning items.
-    if contract.is_responses() {
-        crate::PROVIDER_JSON_BODY_CAP
-    } else {
-        256_000
+    // Responses terminals include full output snapshots and opaque reasoning items;
+    // a Messages signature_delta carries the whole opaque thinking signature in one
+    // event, which exceeds 256,000 bytes at high reasoning effort.
+    match contract {
+        RequestContract::AnthropicMessages
+        | RequestContract::OpenAiResponses
+        | RequestContract::ChatGptResponses => crate::PROVIDER_JSON_BODY_CAP,
+        RequestContract::OpenAiChatCompletions => 256_000,
     }
 }
 
@@ -1340,7 +1343,7 @@ fn parse_chatgpt_frame(
                     call.done = true;
                 }
             } else if item_type == "reasoning" && contract == RequestContract::OpenAiResponses {
-                capture_openai_reasoning_item(contract, event, state, item)?;
+                capture_openai_reasoning_items(contract, event, state, [item])?;
             }
         }
         "response.function_call_arguments.done" => {
@@ -1436,6 +1439,7 @@ fn parse_chatgpt_frame(
                 state.usage = Usage::parse_openai(usage);
             }
             let mut terminal_function_items = BTreeSet::new();
+            let mut terminal_reasoning_items = Vec::new();
             let terminal_outputs = response
                 .get("output")
                 .map(|outputs| array(contract, event, outputs, "response.output"))
@@ -1452,7 +1456,7 @@ fn parse_chatgpt_frame(
                         "output item type",
                     )?;
                     if output_type == "reasoning" && contract == RequestContract::OpenAiResponses {
-                        capture_openai_reasoning_item(contract, event, state, output)?;
+                        terminal_reasoning_items.push(output);
                         continue;
                     }
                     if output_type != "function_call" {
@@ -1594,6 +1598,7 @@ fn parse_chatgpt_frame(
                     "completed response omitted an unfinished streamed function item",
                 ));
             }
+            capture_openai_reasoning_items(contract, event, state, terminal_reasoning_items)?;
             state.completed = true;
             state.response_reconciled = true;
         }
@@ -1602,36 +1607,49 @@ fn parse_chatgpt_frame(
     Ok(updates)
 }
 
-fn capture_openai_reasoning_item(
+fn capture_openai_reasoning_items<'a>(
     contract: RequestContract,
     event: &str,
     state: &mut ChatGptState,
-    item: &serde_json::Map<String, Value>,
+    items: impl IntoIterator<Item = &'a serde_json::Map<String, Value>>,
 ) -> Result<()> {
-    if item.get("type").and_then(Value::as_str) != Some("reasoning")
-        || item
+    let mut replacements = Vec::new();
+    let mut item_ids = BTreeSet::new();
+    let mut retained_bytes = state.reasoning_item_bytes;
+    let mut replacement_bytes = 0usize;
+    for item in items {
+        if item.get("type").and_then(Value::as_str) != Some("reasoning") {
+            continue;
+        }
+        let Some(id) = item
             .get("id")
             .and_then(Value::as_str)
-            .is_none_or(|id| id.trim().is_empty())
-        || item
+            .filter(|id| !id.trim().is_empty())
+        else {
+            continue;
+        };
+        if !item_ids.insert(id) {
+            return Err(protocol_error(
+                contract,
+                event,
+                "duplicate final reasoning item",
+            ));
+        }
+        if item
             .get("encrypted_content")
             .and_then(Value::as_str)
             .is_none_or(|value| value.is_empty())
-    {
-        return Ok(());
+        {
+            continue;
+        }
+        if let Some(previous) = state.reasoning_items.get(id) {
+            retained_bytes = retained_bytes.saturating_sub(serde_json::to_vec(previous)?.len());
+        }
+        replacement_bytes = replacement_bytes.saturating_add(serde_json::to_vec(item)?.len());
+        replacements.push((id, item));
     }
-    let id = item["id"].as_str().expect("validated id");
-    let previous_bytes = state
-        .reasoning_items
-        .get(id)
-        .map(serde_json::to_vec)
-        .transpose()?
-        .map_or(0, |bytes| bytes.len());
-    let item_bytes = serde_json::to_vec(item)?.len();
-    let total = state
-        .reasoning_item_bytes
-        .saturating_sub(previous_bytes)
-        .saturating_add(item_bytes);
+    // Budget the whole snapshot: one item may grow while another shrinks.
+    let total = retained_bytes.saturating_add(replacement_bytes);
     if total > REASONING_BUFFER_CAP {
         return Err(protocol_error(
             contract,
@@ -1639,26 +1657,19 @@ fn capture_openai_reasoning_item(
             "opaque reasoning items exceeded buffer cap",
         ));
     }
-    let item = Value::Object(item.clone());
-    let id = item
-        .get("id")
-        .and_then(Value::as_str)
-        .expect("validated reasoning item id")
-        .to_string();
-    if let Some(previous) = state.reasoning_items.get(&id)
-        && previous.get("encrypted_content") != item.get("encrypted_content")
-    {
-        return Err(protocol_error(
-            contract,
-            event,
-            "reasoning item conflicted with prior streamed state",
-        ));
+    // Drop superseded copies before retaining replacements, keeping original order.
+    for &(id, _) in &replacements {
+        if state.reasoning_items.remove(id).is_none() {
+            state.reasoning_item_order.push(id.to_string());
+        }
     }
-    if !state.reasoning_items.contains_key(&id) {
-        state.reasoning_item_order.push(id.clone());
+    for (id, item) in replacements {
+        // Opaque ciphertext can differ between streamed and terminal snapshots.
+        state
+            .reasoning_items
+            .insert(id.to_string(), Value::Object(item.clone()));
     }
     state.reasoning_item_bytes = total;
-    state.reasoning_items.insert(id, item);
     Ok(())
 }
 
@@ -2750,16 +2761,24 @@ mod tests {
     #[test]
     fn responses_opaque_reasoning_has_an_aggregate_cap_without_double_counting() {
         let mut parser = ProviderStreamParser::new(RequestContract::OpenAiResponses, false);
-        let item = serde_json::json!({"type":"response.output_item.done", "item": {
-            "type":"reasoning", "id":"rs_first", "encrypted_content":"x".repeat(2_200_000), "summary":[]
-        }});
-        for _ in 0..2 {
+        for size in [2_200_000, 3_000_000, 1_000_000, 2_200_000] {
+            let item = serde_json::json!({"type":"response.output_item.done", "item": {
+                "type":"reasoning", "id":"rs_first", "encrypted_content":"x".repeat(size), "summary":[]
+            }});
             parser
                 .push_frame(SseFrame {
                     event: None,
                     data: Some(item.to_string()),
                 })
                 .unwrap();
+            let ProviderState::ChatGpt(state) = &parser.state else {
+                unreachable!()
+            };
+            assert_eq!(state.reasoning_item_order, ["rs_first"]);
+            assert_eq!(
+                state.reasoning_item_bytes,
+                serde_json::to_vec(&item["item"]).unwrap().len()
+            );
         }
         let second = serde_json::json!({"type":"response.output_item.done", "item": {
             "type":"reasoning", "id":"rs_second", "encrypted_content":"y".repeat(2_200_000), "summary":[]
@@ -2839,6 +2858,76 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_large_signature_frames_preserve_thinking_signature() {
+        let contract = RequestContract::AnthropicMessages;
+        let signature = "s".repeat(300_000);
+        let frames = [
+            (
+                "message_start",
+                serde_json::json!({"type":"message_start","message":{"usage":{}}}),
+            ),
+            (
+                "content_block_start",
+                serde_json::json!({"type":"content_block_start","index":0,
+                "content_block":{"type":"thinking","thinking":"","signature":""}}),
+            ),
+            (
+                "content_block_delta",
+                serde_json::json!({"type":"content_block_delta","index":0,
+                "delta":{"type":"signature_delta","signature":signature}}),
+            ),
+            (
+                "content_block_stop",
+                serde_json::json!({"type":"content_block_stop","index":0}),
+            ),
+            (
+                "content_block_start",
+                serde_json::json!({"type":"content_block_start","index":1,
+                "content_block":{"type":"text","text":""}}),
+            ),
+            (
+                "content_block_delta",
+                serde_json::json!({"type":"content_block_delta","index":1,
+                "delta":{"type":"text_delta","text":"visible answer"}}),
+            ),
+            (
+                "content_block_stop",
+                serde_json::json!({"type":"content_block_stop","index":1}),
+            ),
+            (
+                "message_delta",
+                serde_json::json!({"type":"message_delta",
+                "delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":9}}),
+            ),
+            ("message_stop", serde_json::json!({"type":"message_stop"})),
+        ];
+        let wire = frames
+            .iter()
+            .map(|(event, data)| format!("event: {event}\ndata: {data}\n\n"))
+            .collect::<String>();
+        assert!(SseDecoder::new(256_000).push(wire.as_bytes()).is_err());
+        for chunk_size in [4093, wire.len()] {
+            let mut decoder = SseDecoder::new(sse_event_cap(contract));
+            let mut parser = ProviderStreamParser::new(contract, false);
+            for chunk in wire.as_bytes().chunks(chunk_size) {
+                for frame in decoder.push(chunk).unwrap() {
+                    parser.push_frame(frame).unwrap();
+                }
+            }
+            for frame in decoder.finish().unwrap() {
+                parser.push_frame(frame).unwrap();
+            }
+            let parsed = parser.finish().unwrap();
+            assert_eq!(parsed.stop_reason.as_deref(), Some("end_turn"));
+            assert_eq!(parsed.usage.output, 9);
+            assert!(matches!(&parsed.blocks[..], [
+                Block::Thinking { text, signature: Some(sig) },
+                Block::Text { text: answer },
+            ] if text.is_empty() && *sig == signature && answer == "visible answer"));
+        }
+    }
+
+    #[test]
     fn responses_event_caps_still_reject_oversized_frames_and_tool_arguments() {
         for contract in [
             RequestContract::AnthropicMessages,
@@ -2849,10 +2938,10 @@ mod tests {
             let cap = sse_event_cap(contract);
             assert_eq!(
                 cap,
-                if contract.is_responses() {
-                    4 * 1024 * 1024
-                } else {
+                if contract == RequestContract::OpenAiChatCompletions {
                     256_000
+                } else {
+                    4 * 1024 * 1024
                 }
             );
             let mut decoder = SseDecoder::new(cap);
@@ -2909,6 +2998,373 @@ mod tests {
                     .to_string()
                     .contains("tool arguments exceeded buffer cap")
             );
+        }
+    }
+
+    #[test]
+    fn openai_responses_keeps_latest_encrypted_reasoning_snapshot() {
+        let mut parser = ProviderStreamParser::new(RequestContract::OpenAiResponses, false);
+        for (event, data) in [
+            (
+                "response.output_item.added",
+                r#"{"type":"response.output_item.added","item":{"type":"reasoning","id":"rs_1","summary":[]}}"#,
+            ),
+            (
+                "response.output_item.done",
+                r#"{"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1","encrypted_content":"gAAAAAB-first","summary":[],"content":null}}"#,
+            ),
+            (
+                "response.output_item.added",
+                r#"{"type":"response.output_item.added","item":{"type":"message","id":"msg_1","role":"assistant","content":[]}}"#,
+            ),
+            (
+                "response.output_text.delta",
+                r#"{"type":"response.output_text.delta","item_id":"msg_1","delta":"I am","obfuscation":"x1"}"#,
+            ),
+            (
+                "response.output_text.done",
+                r#"{"type":"response.output_text.done","item_id":"msg_1","text":"I am"}"#,
+            ),
+            (
+                "response.completed",
+                r#"{"type":"response.completed","response":{"status":"completed","output":[{"type":"reasoning","id":"rs_1","encrypted_content":"gAAAAAB-second","summary":[],"content":null},{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"I am"}]}]}}"#,
+            ),
+        ] {
+            parser
+                .push_frame(SseFrame {
+                    event: Some(event.to_string()),
+                    data: Some(data.to_string()),
+                })
+                .unwrap();
+        }
+        let parsed = parser.finish().unwrap();
+        let reasoning: Vec<_> = parsed
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::ResponsesReasoning { item } => Some(item),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reasoning.len(), 1);
+        assert_eq!(reasoning[0]["encrypted_content"], "gAAAAAB-second");
+        assert!(
+            parsed
+                .blocks
+                .iter()
+                .any(|block| matches!(block, Block::Text { text } if text == "I am"))
+        );
+    }
+
+    #[test]
+    fn openai_responses_reasoning_terminal_replacements_share_one_budget() {
+        for event in ["response.completed", "response.done"] {
+            let mut parser = ProviderStreamParser::new(RequestContract::OpenAiResponses, false);
+            for (id, size) in [("rs_first", 1_000_000), ("rs_second", 3_000_000)] {
+                parser
+                    .push_frame(SseFrame {
+                        event: None,
+                        data: Some(
+                            serde_json::json!({
+                                "type": "response.output_item.done",
+                                "item": {"type": "reasoning", "id": id,
+                                    "encrypted_content": "x".repeat(size), "summary": []}
+                            })
+                            .to_string(),
+                        ),
+                    })
+                    .unwrap();
+            }
+            let mut output = serde_json::json!([
+                {"type": "reasoning", "id": "rs_first",
+                    "encrypted_content": "y".repeat(3_000_000), "summary": []},
+                {"type": "reasoning", "id": "rs_new",
+                    "encrypted_content": "new", "summary": []},
+                {"type": "reasoning", "id": "rs_second",
+                    "encrypted_content": "z".repeat(1_000_000), "summary": []}
+            ]);
+            let expected = vec![output[0].clone(), output[2].clone(), output[1].clone()];
+            if event == "response.done" {
+                output.as_array_mut().unwrap().reverse();
+            }
+            let wire = format!(
+                "event: {event}\ndata: {}\n\n",
+                serde_json::json!({
+                    "type": event, "response": {"status": "completed", "output": output}
+                })
+            );
+            let mut decoder = SseDecoder::new(sse_event_cap(RequestContract::OpenAiResponses));
+            for chunk in wire.as_bytes().chunks(4093) {
+                for frame in decoder.push(chunk).unwrap() {
+                    parser.push_frame(frame).unwrap();
+                }
+            }
+            for frame in decoder.finish().unwrap() {
+                parser.push_frame(frame).unwrap();
+            }
+            let ProviderState::ChatGpt(state) = &parser.state else {
+                unreachable!()
+            };
+            assert_eq!(
+                state.reasoning_item_order,
+                ["rs_first", "rs_second", "rs_new"]
+            );
+            assert_eq!(
+                state.reasoning_item_bytes,
+                output
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|item| serde_json::to_vec(item).unwrap().len())
+                    .sum::<usize>()
+            );
+            let parsed = parser.finish().unwrap();
+            let items = parsed
+                .blocks
+                .iter()
+                .map(|block| match block {
+                    Block::ResponsesReasoning { item } => item.clone(),
+                    _ => panic!("unexpected block"),
+                })
+                .collect::<Vec<_>>();
+            assert!(items == expected, "terminal snapshot was not retained");
+        }
+    }
+
+    #[test]
+    fn openai_responses_reasoning_terminal_rejects_invalid_snapshots_without_mutation() {
+        for event in ["response.completed", "response.done"] {
+            for invalid in [
+                "overflow",
+                "duplicate",
+                "placeholder_first",
+                "placeholder_last",
+                "unfinished_tool",
+            ] {
+                let original = serde_json::json!({"type": "reasoning", "id": "rs_first",
+                    "encrypted_content": "original", "summary": []});
+                let mut parser = ProviderStreamParser::new(RequestContract::OpenAiResponses, false);
+                parser
+                    .push_frame(SseFrame {
+                        event: None,
+                        data: Some(
+                            serde_json::json!({
+                                "type": "response.output_item.done", "item": original
+                            })
+                            .to_string(),
+                        ),
+                    })
+                    .unwrap();
+                let replacement = serde_json::json!({"type": "reasoning", "id": "rs_first",
+                    "encrypted_content": "replacement", "summary": []});
+                let placeholder =
+                    serde_json::json!({"type": "reasoning", "id": "rs_first", "summary": []});
+                let output = match invalid {
+                    "duplicate" => serde_json::json!([replacement, replacement]),
+                    "placeholder_first" => serde_json::json!([placeholder, replacement]),
+                    "placeholder_last" => serde_json::json!([replacement, placeholder]),
+                    "unfinished_tool" => {
+                        parser.push_frame(SseFrame {
+                            event: None,
+                            data: Some(serde_json::json!({"type": "response.output_item.added", "item": {
+                                "type": "function_call", "id": "fc_pending", "call_id": "call_pending",
+                                "name": "todo_read", "arguments": ""}}).to_string()),
+                        }).unwrap();
+                        serde_json::json!([replacement])
+                    }
+                    "overflow" => {
+                        parser.push_frame(SseFrame {
+                            event: None,
+                            data: Some(serde_json::json!({"type": "response.output_item.done", "item": {
+                                "type": "reasoning", "id": "rs_omitted", "summary": [],
+                                "encrypted_content": "y".repeat(2_200_000)}}).to_string()),
+                        }).unwrap();
+                        serde_json::json!([{"type": "reasoning", "id": "rs_first",
+                            "encrypted_content": "x".repeat(2_200_000), "summary": []}])
+                    }
+                    _ => unreachable!(),
+                };
+                let ProviderState::ChatGpt(state) = &parser.state else {
+                    unreachable!()
+                };
+                let original_items = state.reasoning_items.clone();
+                let original_order = state.reasoning_item_order.clone();
+                let original_bytes = state.reasoning_item_bytes;
+                let wire = format!(
+                    "event: {event}\ndata: {}\n\n",
+                    serde_json::json!({
+                        "type": event, "response": {"status": "completed", "output": output}
+                    })
+                );
+                let mut decoder = SseDecoder::new(sse_event_cap(RequestContract::OpenAiResponses));
+                let frame = decoder.push(wire.as_bytes()).unwrap().pop().unwrap();
+                let error = parser.push_frame(frame).unwrap_err().to_string();
+                let expected = match invalid {
+                    "overflow" => "opaque reasoning items exceeded buffer cap",
+                    "unfinished_tool" => {
+                        "completed response omitted an unfinished streamed function item"
+                    }
+                    _ => "duplicate final reasoning item",
+                };
+                assert!(error.contains(expected), "{invalid}: {error}");
+                let ProviderState::ChatGpt(state) = &parser.state else {
+                    unreachable!()
+                };
+                assert!(
+                    state.reasoning_items == original_items,
+                    "{invalid}: rejected snapshot changed retained reasoning"
+                );
+                assert_eq!(state.reasoning_item_order, original_order);
+                assert_eq!(state.reasoning_item_bytes, original_bytes);
+                assert!(!state.completed);
+                assert!(!state.response_reconciled);
+                assert!(parser.finish().is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn openai_responses_reasoning_replacements_count_serialized_bytes_at_the_cap() {
+        let contract = RequestContract::OpenAiResponses;
+        let mut state = ChatGptState::default();
+        let omitted = serde_json::json!({"type": "reasoning", "id": "rs_omitted",
+            "encrypted_content": "retained", "summary": []});
+        let mut replacement = serde_json::json!({"type": "reasoning", "id": "rs_replaced",
+            "encrypted_content": "é\n\"\\", "summary": []});
+        let overhead = serde_json::to_vec(&omitted).unwrap().len()
+            + serde_json::to_vec(&replacement).unwrap().len();
+        let padding = "x".repeat(REASONING_BUFFER_CAP - overhead);
+        let mut encrypted = replacement["encrypted_content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        encrypted.push_str(&padding);
+        replacement["encrypted_content"] = Value::String(encrypted);
+        capture_openai_reasoning_items(
+            contract,
+            "test",
+            &mut state,
+            [
+                omitted.as_object().unwrap(),
+                replacement.as_object().unwrap(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(state.reasoning_item_bytes, REASONING_BUFFER_CAP);
+        let mut over = replacement.clone();
+        let mut encrypted = over["encrypted_content"].as_str().unwrap().to_string();
+        encrypted.push('x');
+        over["encrypted_content"] = Value::String(encrypted);
+        let error = capture_openai_reasoning_items(
+            contract,
+            "test",
+            &mut state,
+            [over.as_object().unwrap()],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("opaque reasoning items exceeded buffer cap"),
+            "{error}"
+        );
+        assert!(state.reasoning_items["rs_replaced"] == replacement);
+        assert_eq!(state.reasoning_item_bytes, REASONING_BUFFER_CAP);
+        let smaller = serde_json::json!({"type": "reasoning", "id": "rs_replaced",
+            "encrypted_content": "smaller", "summary": []});
+        capture_openai_reasoning_items(
+            contract,
+            "test",
+            &mut state,
+            [smaller.as_object().unwrap()],
+        )
+        .unwrap();
+        assert_eq!(state.reasoning_item_order, ["rs_omitted", "rs_replaced"]);
+        assert!(state.reasoning_items["rs_omitted"] == omitted);
+        assert_eq!(
+            state.reasoning_item_bytes,
+            serde_json::to_vec(&omitted).unwrap().len()
+                + serde_json::to_vec(&smaller).unwrap().len()
+        );
+    }
+
+    #[test]
+    fn openai_responses_invalid_reasoning_copies_do_not_erase_retained_items() {
+        let original = serde_json::json!({"type": "reasoning", "id": "rs_retained",
+            "encrypted_content": "valid", "summary": []});
+        for invalid in [
+            serde_json::json!({"type": "reasoning", "id": "rs_retained", "summary": []}),
+            serde_json::json!({"type": "reasoning", "id": "rs_retained", "encrypted_content": null}),
+            serde_json::json!({"type": "reasoning", "id": "rs_retained", "encrypted_content": ""}),
+            serde_json::json!({"type": "reasoning", "id": "rs_retained", "encrypted_content": 42}),
+            serde_json::json!({"type": "reasoning", "encrypted_content": "invalid"}),
+            serde_json::json!({"type": "reasoning", "id": " \t", "encrypted_content": "invalid"}),
+        ] {
+            let mut parser = ProviderStreamParser::new(RequestContract::OpenAiResponses, false);
+            for data in [
+                serde_json::json!({"type": "response.output_item.done", "item": original}),
+                serde_json::json!({"type": "response.output_item.done", "item": invalid}),
+                serde_json::json!({"type": "response.completed", "response": {"status": "completed", "output": [invalid]}}),
+            ] {
+                parser
+                    .push_frame(SseFrame {
+                        event: None,
+                        data: Some(data.to_string()),
+                    })
+                    .unwrap();
+            }
+            let ProviderState::ChatGpt(state) = &parser.state else {
+                unreachable!()
+            };
+            assert_eq!(state.reasoning_item_order, ["rs_retained"]);
+            assert_eq!(
+                state.reasoning_item_bytes,
+                serde_json::to_vec(&original).unwrap().len()
+            );
+            assert!(matches!(parser.finish().unwrap().blocks.as_slice(),
+                [Block::ResponsesReasoning { item }] if *item == original));
+        }
+    }
+
+    #[test]
+    fn responses_incomplete_terminals_do_not_replace_streamed_reasoning() {
+        for contract in [
+            RequestContract::OpenAiResponses,
+            RequestContract::ChatGptResponses,
+        ] {
+            for reason in ["max_output_tokens", "content_filter"] {
+                let original = serde_json::json!({"type": "reasoning", "id": "rs_streamed",
+                    "encrypted_content": "streamed", "summary": []});
+                let mut parser = ProviderStreamParser::new(contract, false);
+                for data in [
+                    serde_json::json!({"type": "response.output_item.done", "item": original}),
+                    serde_json::json!({"type": "response.incomplete", "response": {
+                        "status": "incomplete", "incomplete_details": {"reason": reason},
+                        "output": [{"type": "reasoning", "id": "rs_streamed", "encrypted_content": "untrusted-terminal"}]}}),
+                ] {
+                    parser
+                        .push_frame(SseFrame {
+                            event: None,
+                            data: Some(data.to_string()),
+                        })
+                        .unwrap();
+                }
+                let ProviderState::ChatGpt(state) = &parser.state else {
+                    unreachable!()
+                };
+                if contract == RequestContract::OpenAiResponses && reason == "max_output_tokens" {
+                    assert_eq!(
+                        state.reasoning_item_bytes,
+                        serde_json::to_vec(&original).unwrap().len()
+                    );
+                    assert!(matches!(parser.finish().unwrap().blocks.as_slice(),
+                        [Block::ResponsesReasoning { item }] if *item == original));
+                } else {
+                    assert!(state.reasoning_items.is_empty());
+                    assert!(state.reasoning_item_order.is_empty());
+                    assert_eq!(state.reasoning_item_bytes, 0);
+                    assert!(parser.finish().unwrap().blocks.is_empty());
+                }
+            }
         }
     }
 

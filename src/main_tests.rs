@@ -4873,6 +4873,122 @@ fn potential_login_secret_is_not_serialized_to_provider_request() {
 }
 
 #[cfg(unix)]
+#[tokio::test]
+async fn local_auth_console_pty_hides_secret_and_restores_echo() {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    for cancel in [false, true] {
+        let mut master = -1;
+        let mut slave = -1;
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        let mut master = unsafe { std::fs::File::from_raw_fd(master) };
+        let slave = unsafe { std::fs::File::from_raw_fd(slave) };
+        for fd in [master.as_raw_fd(), slave.as_raw_fd()] {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            assert_ne!(flags, -1);
+            assert_ne!(
+                unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+                -1
+            );
+        }
+        let observer = slave.try_clone().unwrap();
+        let original = unsafe {
+            let mut settings: libc::termios = std::mem::zeroed();
+            assert_eq!(libc::tcgetattr(observer.as_raw_fd(), &mut settings), 0);
+            settings
+        };
+        let prompt = read_local_auth_secret_from_terminal(slave, "fixture prompt");
+        let driver = async {
+            let mut output = String::new();
+            loop {
+                let mut buf = [0u8; 256];
+                match master.read(&mut buf) {
+                    Ok(n) => output.push_str(&String::from_utf8_lossy(&buf[..n])),
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(e) => panic!("read pty: {e}"),
+                }
+                if output.contains("Password:") {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            let mut hidden: libc::termios = unsafe { std::mem::zeroed() };
+            assert_eq!(
+                unsafe { libc::tcgetattr(observer.as_raw_fd(), &mut hidden) },
+                0
+            );
+            assert_eq!(hidden.c_lflag & libc::ECHO, 0);
+            if cancel {
+                master.write_all(b"partial-password").unwrap();
+            } else {
+                master
+                    .write_all("pāss word\nleftover-password\n".as_bytes())
+                    .unwrap();
+            }
+            output
+        };
+        let (result, output) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(
+                tokio::time::timeout(std::time::Duration::from_millis(200), prompt),
+                driver
+            )
+        })
+        .await
+        .expect("pty bounded");
+        if cancel {
+            assert!(result.is_err());
+        } else {
+            assert!(
+                matches!(result.unwrap(), LocalAuthSecret::Secret(value) if value == "pāss word")
+            );
+        }
+        let mut restored: libc::termios = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::tcgetattr(observer.as_raw_fd(), &mut restored) },
+            0
+        );
+        assert_eq!(restored.c_lflag, original.c_lflag);
+        let mut tail = [0u8; 256];
+        let mut output = output;
+        while let Ok(n) = master.read(&mut tail) {
+            if n == 0 {
+                break;
+            }
+            output.push_str(&String::from_utf8_lossy(&tail[..n]));
+        }
+        assert!(!output.contains("pāss word"));
+        assert!(!output.contains("password"));
+        // Finishing a line after cancellation must not release the old secret.
+        master.write_all(b"\n").unwrap();
+        let mut observer = observer;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            match observer.read(&mut tail) {
+                Ok(n) => {
+                    assert_eq!(&tail[..n], b"\n");
+                    break;
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    assert!(tokio::time::Instant::now() < deadline);
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                Err(e) => panic!("read restored terminal: {e}"),
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
 #[test]
 fn sudo_askpass_script_reads_fifo_and_never_echoes_chat_guidance() {
     let script = sudo_askpass_script_content_with_paths(
@@ -4891,6 +5007,7 @@ fn sudo_askpass_script_reads_fifo_and_never_echoes_chat_guidance() {
     assert!(!script.contains("/dev/tty"), "{script}");
     assert!(!script.contains("chat/steering"), "{script}");
     assert!(script.contains("'\\''"), "{script}");
+    assert!(script.contains("cancel button \"Cancel\""), "{script}");
 }
 
 #[cfg(unix)]
@@ -5164,27 +5281,24 @@ fn clear_secret_string_zeroes_then_empties() {
 
 #[cfg(unix)]
 #[test]
-fn sudo_wrapper_prefix_uses_noninteractive_and_no_askpass_env() {
+fn sudo_wrapper_prefix_avoids_functions_and_askpass_when_preauth_done() {
     let auth = LocalSudoAuth {
         askpass: Some(PathBuf::from("/nonexistent/askpass.sh")),
         sudo_path: PathBuf::from("/usr/bin/sudo"),
         sudo_shim_dir: PathBuf::from("/tmp/dext-sudo/bin"),
+        prompt_requests: None,
         password_fifo: None,
-        password: None,
+        request_fifo: None,
         preauth_required: false,
     };
     let prefix = sudo_wrapper_prefix(&auth);
-    assert!(prefix.contains("-n \"$@\""), "{prefix}");
-    assert!(prefix.contains("sudo()"), "{prefix}");
-    assert!(prefix.contains("function /usr/bin/sudo"), "{prefix}");
+    assert!(prefix.is_empty(), "{prefix}");
     // After pre-auth, the wrapper must NOT export askpass env vars into the
     // bash child (pre-auth already established the sudo timestamp; leaking
     // askpass would risk re-prompting via the script's fallback paths).
     assert!(!prefix.contains("SUDO_ASKPASS"), "{prefix}");
     assert!(!prefix.contains("DEXT_SUDO_ASKPASS"), "{prefix}");
     assert!(!prefix.contains("DEXT_SUDO_PASSWORD_FIFO"), "{prefix}");
-    assert!(sudo_shell_function_name_is_safe("/usr/bin/sudo"));
-    assert!(!sudo_shell_function_name_is_safe("/tmp/sudo;evil"));
 }
 
 #[cfg(unix)]
@@ -5241,16 +5355,312 @@ fn sudo_command_shim_invokes_real_sudo_noninteractive_and_is_private() {
 #[cfg(unix)]
 #[tokio::test]
 async fn sudo_preauth_runs_inside_bash_session_before_noninteractive_sudo() {
+    run_sudo_prompt_fixture(
+        false,
+        vec![LocalAuthSecret::Secret("hunter2".into())],
+        1,
+        true,
+    )
+    .await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sudo_cached_auth_never_requests_password() {
+    run_sudo_prompt_fixture(true, vec![], 0, true).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sudo_rejected_password_gets_fresh_prompt() {
+    run_sudo_prompt_fixture(
+        false,
+        vec![
+            LocalAuthSecret::Secret("wrong".into()),
+            LocalAuthSecret::Secret("hunter2".into()),
+        ],
+        2,
+        true,
+    )
+    .await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sudo_cancel_does_not_run_payload_or_reprompt() {
+    run_sudo_prompt_fixture(false, vec![LocalAuthSecret::Canceled], 1, false).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sudo_retries_stop_at_three_without_running_payload() {
+    run_sudo_prompt_fixture(
+        false,
+        (0..3)
+            .map(|_| LocalAuthSecret::Secret("wrong".into()))
+            .collect(),
+        3,
+        false,
+    )
+    .await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sudo_unavailable_uses_desktop_helper_but_cancel_never_does() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = temp_test_dir("sudo-desktop-fallback");
+    let root = std::fs::canonicalize(root).unwrap();
+    let helper = root.join("desktop-helper");
+    let marker = root.join("called");
+    std::fs::write(
+        &helper,
+        format!(
+            "#!/bin/sh\nprintf called > {}\nprintf 'desktop-fixture\\n'\n",
+            shell_single_quote(&marker.to_string_lossy())
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let askpass = root.join("askpass.sh");
+    std::fs::write(
+        &askpass,
+        sudo_askpass_script_content_with_paths(
+            &helper.to_string_lossy(),
+            "/nonexistent",
+            "/nonexistent",
+        ),
+    )
+    .unwrap();
+    for canceled in [false, true] {
+        let _ = std::fs::remove_file(&marker);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let mut auth = LocalSudoAuth {
+            askpass: Some(askpass.clone()),
+            sudo_path: PathBuf::from("/nonexistent"),
+            sudo_shim_dir: root.join("bin"),
+            prompt_requests: Some(tx),
+            password_fifo: None,
+            request_fifo: None,
+            preauth_required: true,
+        };
+        let runtime = start_sudo_prompt_runtime(&mut auth).unwrap().unwrap();
+        let response_path = auth.password_fifo.as_ref().unwrap().clone();
+        let request_path = auth.request_fifo.as_ref().unwrap().clone();
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .arg(&askpass)
+            .env(SUDO_PASSWORD_FIFO_ENV, &response_path)
+            .env("DEXT_SUDO_REQUEST_FIFO", &request_path)
+            .kill_on_drop(true);
+        let driver = async {
+            let request = rx.recv().await.unwrap();
+            assert_eq!(request.attempt, 1);
+            let value = if canceled {
+                LocalAuthSecret::Canceled
+            } else {
+                LocalAuthSecret::Unavailable
+            };
+            assert!(request.response.send(SudoPromptResponse(value)).is_ok());
+        };
+        let (output, ()) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(command.output(), driver)
+        })
+        .await
+        .expect("askpass finishes");
+        let output = output.unwrap();
+        assert_eq!(output.status.success(), !canceled);
+        assert_eq!(marker.exists(), !canceled);
+        if canceled {
+            assert!(output.stdout.is_empty());
+        } else {
+            assert_eq!(output.stdout, b"desktop-fixture\n");
+        }
+        drop(runtime);
+        assert!(!response_path.exists());
+        assert!(!request_path.exists());
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sudo_drop_and_spawn_failure_remove_pipes_without_running_payload() {
+    use std::os::unix::fs::PermissionsExt;
+    for spawn_failure in [false, true] {
+        let root = std::fs::canonicalize(temp_test_dir("sudo-drop-cleanup")).unwrap();
+        let fake_sudo = root.join("fake-sudo");
+        std::fs::write(
+            &fake_sudo,
+            "#!/bin/sh\n[ \"$1\" = -A ] || exit 1\nexec \"$SUDO_ASKPASS\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_sudo, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let askpass = root.join("askpass.sh");
+        std::fs::write(&askpass, sudo_askpass_script_content()).unwrap();
+        std::fs::set_permissions(&askpass, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let auth = LocalSudoAuth {
+            askpass: Some(askpass),
+            sudo_path: fake_sudo,
+            sudo_shim_dir: root.join("bin"),
+            prompt_requests: Some(tx),
+            password_fifo: None,
+            request_fifo: None,
+            preauth_required: true,
+        };
+        let cwd = if spawn_failure {
+            root.join("missing")
+        } else {
+            root.clone()
+        };
+        let command = format!(
+            "printf unexpected > {}",
+            shell_single_quote(&root.join("payload").to_string_lossy())
+        );
+        let mut execution = Box::pin(execute_bash_async_prepared(
+            &command,
+            &cwd,
+            Arc::new(AtomicBool::new(false)),
+            std::time::Duration::from_secs(5),
+            Some(auth),
+            SandboxProfile::DangerFullAccess,
+            None,
+            &[],
+        ));
+        if spawn_failure {
+            assert!(execution.await.unwrap_err().contains("spawn failed"));
+            assert!(rx.try_recv().is_err());
+        } else {
+            let request = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                tokio::select! {
+                    result = &mut execution => panic!("unexpected completion: {result:?}"),
+                    request = rx.recv() => request.unwrap(),
+                }
+            })
+            .await
+            .expect("askpass requests input");
+            assert!(std::fs::read_dir(&root).unwrap().any(|entry| {
+                entry
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|ext| ext == "fifo")
+            }));
+            drop(execution);
+            assert!(
+                request
+                    .response
+                    .send(SudoPromptResponse(LocalAuthSecret::Canceled))
+                    .is_err()
+            );
+        }
+        assert!(!root.join("payload").exists());
+        assert!(std::fs::read_dir(&root).unwrap().all(|entry| {
+            entry
+                .unwrap()
+                .path()
+                .extension()
+                .is_none_or(|ext| ext != "fifo")
+        }));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sudo_invalid_secret_fails_closed() {
+    for secret in ["bad\nsecret".to_string(), "x".repeat(501), String::new()] {
+        run_sudo_prompt_fixture(false, vec![LocalAuthSecret::Secret(secret)], 1, false).await;
+    }
+}
+
+#[cfg(unix)]
+struct SudoTestSink {
+    responses: std::collections::VecDeque<LocalAuthSecret>,
+    prompts: usize,
+    wait: bool,
+    interrupt: Option<Arc<AtomicBool>>,
+}
+
+#[cfg(unix)]
+impl EventSink for SudoTestSink {
+    fn emit(&mut self, _: AgentEvent) {}
+    fn request_permission(&mut self, _: &str, _: &Value) -> Choice {
+        Choice::Deny
+    }
+    fn local_auth_prompt(&mut self, _: &str, _: &str) {}
+    fn request_local_auth_secret_async<'a>(
+        &'a mut self,
+        tool: &'a str,
+        message: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = LocalAuthSecret> + Send + 'a>> {
+        Box::pin(async move {
+            if self.wait {
+                self.prompts += 1;
+                if let Some(interrupt) = &self.interrupt {
+                    interrupt.store(true, Ordering::SeqCst);
+                }
+                std::future::pending().await
+            } else {
+                self.request_local_auth_secret(tool, message)
+            }
+        })
+    }
+    fn request_local_auth_secret(&mut self, _: &str, message: &str) -> LocalAuthSecret {
+        self.prompts += 1;
+        if self.prompts > 1 {
+            assert!(message.contains("again"));
+        }
+        self.responses
+            .pop_front()
+            .expect("unexpected password prompt")
+    }
+}
+
+#[cfg(unix)]
+async fn run_sudo_prompt_fixture(
+    cached: bool,
+    responses: Vec<LocalAuthSecret>,
+    prompts: usize,
+    success: bool,
+) {
+    run_sudo_prompt_fixture_with_abort(cached, responses, prompts, success, None).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sudo_timeout_while_prompt_open_reaps_and_cleans_pipes() {
+    run_sudo_prompt_fixture_with_abort(false, vec![], 1, false, Some(false)).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sudo_interrupt_while_prompt_open_reaps_and_cleans_pipes() {
+    run_sudo_prompt_fixture_with_abort(false, vec![], 1, false, Some(true)).await;
+}
+
+#[cfg(unix)]
+async fn run_sudo_prompt_fixture_with_abort(
+    cached: bool,
+    responses: Vec<LocalAuthSecret>,
+    prompts: usize,
+    success: bool,
+    abort: Option<bool>,
+) {
     let root = temp_test_dir("sudo-preauth-noninteractive");
     let root = std::fs::canonicalize(&root).expect("canonical temp dir");
     let fake_sudo = root.join("fake-sudo");
     let state_dir = root.join("sudo-state");
     std::fs::create_dir_all(&state_dir).expect("create sudo state dir");
+    if cached {
+        std::fs::write(state_dir.join("authenticated"), "").unwrap();
+    }
     let state_dir = shell_single_quote(&state_dir.to_string_lossy());
     std::fs::write(
         &fake_sudo,
         format!(
-            "#!/bin/sh\nset -eu\nstate_dir={state_dir}\nstate=\"$state_dir/authenticated\"\nif [ \"${{1:-}}\" = -n ] && [ \"${{2:-}}\" = -v ]; then\n  test -f \"$state\"\n  exit $?\nfi\nif [ \"${{1:-}}\" = -A ] && [ \"${{2:-}}\" = -v ]; then\n  ask=\"${{SUDO_ASKPASS:-}}\"\n  if [ -z \"$ask\" ]; then ask=\"${{DEXT_SUDO_ASKPASS:-}}\"; fi\n  [ -n \"$ask\" ] || exit 1\n  pass=$(\"$ask\" 'fake sudo prompt') || exit 1\n  [ \"$pass\" = hunter2 ] || exit 1\n  : > \"$state\"\n  exit 0\nfi\nwhile [ \"${{1:-}}\" = -n ]; do shift; done\nif [ -f \"$state\" ]; then exec \"$@\"; fi\nprintf '%s\\n' 'sudo: interactive authentication is required' >&2\nexit 1\n"
+            "#!/bin/sh\nset -eu\nstate_dir={state_dir}\nstate=\"$state_dir/authenticated\"\nif [ \"${{1:-}}\" = -n ] && [ \"${{2:-}}\" = -v ]; then\n  test -f \"$state\"\n  exit $?\nfi\nif [ \"${{1:-}}\" = -A ] && [ \"${{2:-}}\" = -v ]; then\n  ask=\"${{SUDO_ASKPASS:-}}\"\n  if [ -z \"$ask\" ]; then ask=\"${{DEXT_SUDO_ASKPASS:-}}\"; fi\n  [ -n \"$ask\" ] || exit 1\n  for attempt in 1 2 3 4 5; do\n    pass=$(\"$ask\" 'fake sudo prompt') || exit 1\n    if [ \"$pass\" = hunter2 ]; then printf '%s' \"$PPID\" > \"$state\"; exit 0; fi\n  done\n  exit 1\nfi\nwhile [ \"${{1:-}}\" = -n ]; do shift; done\nif [ -f \"$state\" ]; then\n  owner=$(cat \"$state\")\n  [ -z \"$owner\" ] || [ \"$owner\" = \"$PPID\" ] || exit 42\n  exec \"$@\"\nfi\nprintf '%s\\n' 'sudo: interactive authentication is required' >&2\nexit 1\n"
         ),
     )
     .expect("write fake sudo");
@@ -5264,7 +5674,7 @@ async fn sudo_preauth_runs_inside_bash_session_before_noninteractive_sudo() {
     let target_dir = temp_test_dir("sudo-preauth-target");
     let target = target_dir.join("out.txt");
 
-    let (sudo_shim_dir, askpass, fifo) = {
+    let (sudo_shim_dir, askpass) = {
         let _guard = env_lock();
         let old_sessions_dir = std::env::var_os("DEXT_SESSIONS_DIR");
         unsafe {
@@ -5273,38 +5683,92 @@ async fn sudo_preauth_runs_inside_bash_session_before_noninteractive_sudo() {
         let result = (
             write_sudo_command_shim(&root, "test-session", &fake_sudo).expect("write sudo shim"),
             write_sudo_askpass_script(&root, "test-session").expect("write askpass"),
-            create_sudo_password_fifo(&root, "test-session").expect("create sudo fifo"),
         );
         restore_env_var("DEXT_SESSIONS_DIR", old_sessions_dir);
         result
     };
+    let prompt_dir = sudo_shim_dir.parent().unwrap().to_path_buf();
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
     let auth = LocalSudoAuth {
         askpass: Some(askpass),
-        sudo_path: fake_sudo,
+        sudo_path: fake_sudo.clone(),
         sudo_shim_dir,
-        password_fifo: Some(fifo),
-        password: Some("hunter2".to_string()),
+        prompt_requests: Some(tx),
+        password_fifo: None,
+        request_fifo: None,
         preauth_required: true,
     };
+    let interrupt = Arc::new(AtomicBool::new(false));
+    let mut sink = SudoTestSink {
+        responses: responses.into(),
+        prompts: 0,
+        wait: abort.is_some(),
+        interrupt: abort.filter(|value| *value).map(|_| interrupt.clone()),
+    };
+    let command_pipeline = if cached {
+        "printf ok | command sudo tee {target} >/dev/null".to_string()
+    } else {
+        "if [[ ${BASH_VERSINFO[0]} == 3 && ${BASH_VERSINFO[1]} == 2 ]]; then\n  if printf blocked | command sudo tee {blocked} >/dev/null; then exit 91; else status=$?; fi\n  [ \"$status\" -eq 42 ] && [ ! -e {blocked} ] || exit 92\nelse\n  printf ok | command sudo tee {target} >/dev/null || exit $?\nfi".to_string()
+    };
+    let command_pipeline = command_pipeline
+        .replace("{target}", &shell_single_quote(&target.to_string_lossy()))
+        .replace(
+            "{blocked}",
+            &shell_single_quote(&target_dir.join("blocked.txt").to_string_lossy()),
+        );
     let command = format!(
-        "printf ok | sudo -n tee {} >/dev/null",
-        shell_single_quote(&target.to_string_lossy())
+        "printf ok | sudo -n tee {target} >/dev/null && command sudo tee {target} >/dev/null <<< ok && {{ {command_pipeline}\n}} && printf ok | env sudo tee {target} >/dev/null && printf ok | {absolute} -n tee {target} >/dev/null && printf '%s\\n' 'sudo pipeline scope checked'",
+        target = shell_single_quote(&target.to_string_lossy()),
+        absolute = shell_single_quote(&fake_sudo.to_string_lossy()),
     );
-    let out = execute_bash_async_prepared(
+    let execution = execute_bash_async_prepared(
         &command,
         &root,
-        Arc::new(AtomicBool::new(false)),
-        std::time::Duration::from_secs(10),
+        interrupt,
+        std::time::Duration::from_secs(if abort.is_some() { 1 } else { 5 }),
         Some(auth),
         SandboxProfile::ReadOnly,
         None,
         &[],
-    )
-    .await
-    .expect("preauthed sudo command runs");
-
-    assert!(out.contains("exit: 0"), "{out}");
-    assert_eq!(std::fs::read_to_string(&target).expect("read target"), "ok");
+    );
+    let result = execute_with_sudo_prompts(execution, rx, &mut sink).await;
+    let out = if let Some(interrupted) = abort {
+        let error = result.expect_err("unfinished prompt must honor tool deadline/interrupt");
+        assert!(
+            error.contains(if interrupted {
+                "interrupt"
+            } else {
+                "timed out"
+            }),
+            "{error}"
+        );
+        error
+    } else {
+        result.expect("sudo finishes without timeout")
+    };
+    assert_eq!(out.contains("exit: 0"), success, "{out}");
+    assert_eq!(sink.prompts, prompts);
+    assert!(!out.contains("hunter2"), "secret in output");
+    assert_eq!(
+        target.exists(),
+        success,
+        "payload must not run after auth failure"
+    );
+    if success {
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "ok");
+        assert!(out.contains("sudo pipeline scope checked"), "{out}");
+    }
+    assert!(
+        !target_dir.join("blocked.txt").exists(),
+        "parent-scoped refusal must not execute the payload"
+    );
+    assert!(std::fs::read_dir(prompt_dir).unwrap().all(|entry| {
+        entry
+            .unwrap()
+            .path()
+            .extension()
+            .is_none_or(|ext| ext != "fifo")
+    }));
     let _ = std::fs::remove_file(&target);
     if let Some(dir) = target.parent() {
         let _ = std::fs::remove_dir(dir);
@@ -15935,8 +16399,11 @@ async fn provider_responses_large_terminal_frame_completes_over_http() -> Result
         "status":"completed", "usage":{"input_tokens":17,"output_tokens":9},
         "output":[{"type":"reasoning", "id":"rs_large", "summary":[],
             "encrypted_content":"x".repeat(300_000)}]}});
+    let streamed_item = json!({"type":"response.output_item.done", "item": {
+        "type":"reasoning", "id":"rs_large", "summary":[],
+        "encrypted_content":"streamed-state"}});
     let body = format!(
-        "data: {{\"type\":\"response.output_text.delta\",\"delta\":\"visible answer\"}}\n\nevent: response.completed\ndata: {terminal}\n\n"
+        "data: {streamed_item}\n\ndata: {{\"type\":\"response.output_text.delta\",\"delta\":\"visible answer\"}}\n\nevent: response.completed\ndata: {terminal}\n\n"
     );
     for contract in [
         RequestContract::ChatGptResponses,
@@ -15986,6 +16453,15 @@ async fn provider_responses_large_terminal_frame_completes_over_http() -> Result
         assert_eq!(parsed.usage.output, 9);
         assert!(parsed.blocks.iter().any(|block| matches!(block,
             Block::Text { text } if text == "visible answer")));
+        let reasoning = parsed.blocks.iter().find_map(|block| match block {
+            Block::ResponsesReasoning { item } => Some(item),
+            _ => None,
+        });
+        if contract == RequestContract::OpenAiResponses {
+            assert!(reasoning == Some(&terminal["response"]["output"][0]));
+        } else {
+            assert!(reasoning.is_none());
+        }
         assert_eq!(
             drain_events(&mut rx)
                 .iter()
@@ -22300,78 +22776,88 @@ fn gpt_5_6_openai_request_uses_responses_pro_mode_and_true_max_effort() -> Resul
 }
 
 #[test]
-fn gpt_6_1_sol_requests_preserve_provider_contracts() -> Result<()> {
+fn gpt_6_1_requests_preserve_provider_contracts() -> Result<()> {
+    let _guard = env_lock();
     let root = std::env::current_dir()?.canonicalize()?;
-    for id in ["openai", "chatgpt"] {
-        let profile = built_in_provider_profiles()
-            .into_iter()
-            .find(|profile| profile.id == id)
-            .expect("built-in profile");
-        let mut agent = test_agent(&root);
-        agent.provider_id = id.to_string();
-        agent.api_provider = profile.api_provider;
-        agent.base_url = profile.base_url.clone();
-        agent.provider_profile = Some(profile);
-        agent.model = "gpt-6.1-sol".to_string();
-        agent.reasoning_mode = ReasoningMode::Pro;
-        for (effort, expected) in [
-            (ThinkingEffort::Off, None),
-            (ThinkingEffort::Minimal, Some("low")),
-            (ThinkingEffort::Low, Some("low")),
-            (ThinkingEffort::Medium, Some("medium")),
-            (ThinkingEffort::High, Some("high")),
-            (ThinkingEffort::XHigh, Some("xhigh")),
-            (ThinkingEffort::Max, Some("max")),
-        ] {
-            agent.thinking_effort = effort;
-            let (url, bytes) =
-                agent.build_streaming_request("sys", "env", &[], &[], "session-key")?;
-            let body: Value = serde_json::from_slice(&bytes)?;
-            assert!(url.ends_with("/responses"), "{url}");
-            assert_eq!(
-                body["reasoning"]["effort"].as_str(),
-                expected,
-                "{id}: {body}"
-            );
-            assert!(body["reasoning"].get("mode").is_none(), "{body}");
-            assert_eq!(body["store"], false, "{body}");
-            assert!(!body["tools"].as_array().expect("tools").is_empty());
-            if id == "openai" {
-                assert_eq!(body["max_output_tokens"], 128_000);
-                assert_eq!(body["include"][0], "reasoning.encrypted_content");
-            } else {
-                assert!(body.get("max_output_tokens").is_none());
+    for (model, off_effort) in [("gpt-6.1-sol", None), ("gpt-6.1-terra", Some("none"))] {
+        for id in ["openai", "chatgpt"] {
+            let profile = built_in_provider_profiles()
+                .into_iter()
+                .find(|profile| profile.id == id)
+                .expect("built-in profile");
+            let mut agent = test_agent(&root);
+            agent.provider_id = id.to_string();
+            agent.api_provider = profile.api_provider;
+            agent.base_url = profile.base_url.clone();
+            agent.provider_profile = Some(profile);
+            agent.model = model.to_string();
+            agent.reasoning_mode = ReasoningMode::Pro;
+            for (effort, expected) in [
+                (ThinkingEffort::Off, off_effort),
+                (ThinkingEffort::Minimal, Some("low")),
+                (ThinkingEffort::Low, Some("low")),
+                (ThinkingEffort::Medium, Some("medium")),
+                (ThinkingEffort::High, Some("high")),
+                (ThinkingEffort::XHigh, Some("xhigh")),
+                (ThinkingEffort::Max, Some("max")),
+            ] {
+                agent.thinking_effort = effort;
+                let (url, bytes) =
+                    agent.build_streaming_request("sys", "env", &[], &[], "session-key")?;
+                let body: Value = serde_json::from_slice(&bytes)?;
+                assert!(url.ends_with("/responses"), "{url}");
+                assert_eq!(
+                    body["reasoning"]["effort"].as_str(),
+                    expected,
+                    "{id}: {body}"
+                );
+                assert!(body["reasoning"].get("mode").is_none(), "{body}");
+                assert_eq!(body["store"], false, "{body}");
+                assert!(!body["tools"].as_array().expect("tools").is_empty());
+                if id == "openai" {
+                    assert_eq!(body["max_output_tokens"], 128_000);
+                    assert_eq!(body["include"][0], "reasoning.encrypted_content");
+                } else {
+                    assert!(body.get("max_output_tokens").is_none());
+                }
+                let summary = build_responses_summary_body(
+                    agent.request_contract_for_model(&agent.model),
+                    &agent.model,
+                    "summarize",
+                    agent
+                        .responses_reasoning_effort_for_model(&agent.model, effort)
+                        .as_deref(),
+                    agent.reasoning_mode_for_model(&agent.model),
+                    COMPACT_SUMMARY_MAX_TOKENS_THINKING,
+                );
+                assert_eq!(summary["reasoning"]["effort"].as_str(), expected);
+                assert!(summary["reasoning"].get("mode").is_none());
             }
-            let summary = build_responses_summary_body(
-                agent.request_contract_for_model(&agent.model),
-                &agent.model,
-                "summarize",
-                agent
-                    .responses_reasoning_effort_for_model(&agent.model, effort)
-                    .as_deref(),
-                agent.reasoning_mode_for_model(&agent.model),
-                COMPACT_SUMMARY_MAX_TOKENS_THINKING,
-            );
-            assert_eq!(summary["reasoning"]["effort"].as_str(), expected);
-            assert!(summary["reasoning"].get("mode").is_none());
-        }
-        if id == "openai" {
-            agent.base_url = "https://example.test".to_string();
-            assert!(
-                agent
-                    .build_streaming_request("sys", "env", &[], &[], "session-key")
-                    .unwrap_err()
-                    .to_string()
-                    .contains("requires the Responses API")
-            );
-            agent.tools.clear();
-            let (url, bytes) =
-                agent.build_streaming_request("sys", "env", &[], &[], "session-key")?;
-            let body: Value = serde_json::from_slice(&bytes)?;
-            assert!(url.ends_with("/chat/completions"));
-            assert_eq!(body["reasoning_effort"], "max");
-            assert_eq!(body["max_completion_tokens"], 128_000);
-            assert!(body.get("tools").is_none());
+            if id == "openai" {
+                agent.base_url = "https://example.test".to_string();
+                assert!(
+                    agent
+                        .build_streaming_request("sys", "env", &[], &[], "session-key")
+                        .unwrap_err()
+                        .to_string()
+                        .contains("requires the Responses API")
+                );
+                agent.tools.clear();
+                let (url, bytes) =
+                    agent.build_streaming_request("sys", "env", &[], &[], "session-key")?;
+                let body: Value = serde_json::from_slice(&bytes)?;
+                assert!(url.ends_with("/chat/completions"));
+                assert_eq!(body["reasoning_effort"], "max");
+                assert_eq!(body["max_completion_tokens"], 128_000);
+                assert!(body.get("tools").is_none());
+                agent.model = model.to_ascii_uppercase();
+                agent.tools = test_agent(&root).tools;
+                assert!(
+                    agent
+                        .build_streaming_request("sys", "env", &[], &[], "session-key")
+                        .is_err()
+                );
+            }
         }
     }
     Ok(())
@@ -27910,36 +28396,30 @@ fn usage_pricing_for_local_provider_is_zero_cost() {
 }
 
 #[test]
-fn gpt_6_1_sol_cached_pricing_and_tier_boundary() {
-    let pricing = usage_pricing_default_for(
-        "openai",
-        ApiProvider::OpenAi,
-        "https://api.openai.com",
-        "gpt-6.1-sol",
-    );
-    for provider in ["openai", "chatgpt"] {
-        for (cached, multiplier) in [(272_000, 1.0), (272_001, 2.0)] {
-            let usage = Usage {
-                cache_read: cached,
-                ..Usage::default()
-            };
-            let tier = openai_long_context_pricing_with_override_state(
-                provider,
-                "gpt-6.1-sol",
-                usage,
-                pricing,
-                false,
-            );
-            let expected = cached as f64 / 1_000_000.0 * 0.1 * multiplier;
-            assert!((tier.estimate(usage) - expected).abs() < 1e-12);
-            let override_tier = openai_long_context_pricing_with_override_state(
-                provider,
-                "gpt-6.1-sol",
-                usage,
-                pricing,
-                true,
-            );
-            assert_eq!(override_tier.estimate(usage), pricing.estimate(usage));
+fn gpt_6_1_cached_pricing_and_tier_boundary() {
+    for (model, cache_price) in [("gpt-6.1-sol", 0.1), ("gpt-6.1-terra", 0.05)] {
+        let pricing = usage_pricing_default_for(
+            "openai",
+            ApiProvider::OpenAi,
+            "https://api.openai.com",
+            model,
+        );
+        for provider in ["openai", "chatgpt"] {
+            for (cached, multiplier) in [(272_000, 1.0), (272_001, 2.0)] {
+                let usage = Usage {
+                    cache_read: cached,
+                    ..Usage::default()
+                };
+                let tier = openai_long_context_pricing_with_override_state(
+                    provider, model, usage, pricing, false,
+                );
+                let expected = cached as f64 / 1_000_000.0 * cache_price * multiplier;
+                assert!((tier.estimate(usage) - expected).abs() < 1e-12);
+                let override_tier = openai_long_context_pricing_with_override_state(
+                    provider, model, usage, pricing, true,
+                );
+                assert_eq!(override_tier.estimate(usage), pricing.estimate(usage));
+            }
         }
     }
 }
@@ -27955,6 +28435,7 @@ fn openai_responses_pricing_applies_documented_long_context_tier() {
     };
     for (model, expected) in [
         ("gpt-6.1-sol", 2.7),
+        ("gpt-6.1-terra", 1.35),
         ("gpt-6-astra", 13.5),
         ("gpt-6-sol", 2.7),
         ("gpt-6-luna", 0.135),
@@ -28702,9 +29183,9 @@ fn process_output_warns_on_suspicious_stderr_with_success_status() {
 }
 
 #[tokio::test]
-async fn bash_prepends_cargo_json_diagnostics_summary() {
+async fn bash_cargo_diagnostics_preserve_exit_status() {
     let root = temp_test_dir("bash-cargo-json-summary");
-    let root = std::fs::canonicalize(&root).unwrap();
+    let _cleanup = RemoveDirOnDrop(root.clone());
     let line = json!({
         "reason": "compiler-message",
         "message": {
@@ -28720,23 +29201,41 @@ async fn bash_prepends_cargo_json_diagnostics_summary() {
         }
     })
     .to_string();
-    let escaped = serde_json::to_string(&line).unwrap();
 
-    let out = execute_bash_async_with_timeout(
-        &format!("printf '%s\\n' {escaped}"),
-        &root,
-        Arc::new(AtomicBool::new(false)),
-        std::time::Duration::from_secs(5),
-        SandboxProfile::WorkspaceWrite,
-    )
-    .await
-    .expect("bash should succeed");
+    for status in [0, 101] {
+        let out = execute_bash_async_with_timeout(
+            &format!(
+                "printf '%s\\n' {}; exit {status}",
+                shell_single_quote(&line)
+            ),
+            &root,
+            Arc::new(AtomicBool::new(false)),
+            std::time::Duration::from_secs(5),
+            SandboxProfile::WorkspaceWrite,
+        )
+        .await
+        .expect("bash should return its output even on a nonzero exit");
 
-    assert!(out.starts_with("cargo diagnostics summary"), "{out}");
-    assert!(out.contains("- error [E0308]: src/main.rs:10:7"), "{out}");
-    assert!(out.contains("exit: 0"), "{out}");
-
-    let _ = std::fs::remove_dir_all(&root);
+        assert!(out.starts_with(&format!("exit: {status}\n")), "{out}");
+        assert!(out.contains("cargo diagnostics summary"), "{out}");
+        assert!(out.contains("- error [E0308]: src/main.rs:10:7"), "{out}");
+        assert!(out.contains(&line), "raw diagnostics were lost: {out}");
+        assert_eq!(parse_bash_exit_code(&out), Some(status));
+        assert_eq!(
+            tool_journal_terminal_status("bash", &Ok(out.clone())),
+            if status == 0 {
+                tool_journal::ToolJournalStatus::Completed
+            } else {
+                tool_journal::ToolJournalStatus::Failed
+            }
+        );
+        let mut noted = out;
+        insert_runtime_notes(&mut noted, &["inspect the diagnostics".to_string()]);
+        assert_eq!(
+            parse_tool_exit_code("bash", status == 0, &noted),
+            Some(status)
+        );
+    }
 }
 
 #[test]
@@ -31533,6 +32032,11 @@ fn normalize_chatgpt_model_slug_accepts_compact_aliases() {
     assert_eq!(normalize_chatgpt_model_slug("GPT 5 6 LUNA"), "gpt-5.6-luna");
     assert_eq!(normalize_chatgpt_model_slug("gpt61sol"), "gpt-6.1-sol");
     assert_eq!(normalize_chatgpt_model_slug("GPT 6.1 SOL"), "gpt-6.1-sol");
+    assert_eq!(normalize_chatgpt_model_slug("gpt61terra"), "gpt-6.1-terra");
+    assert_eq!(
+        normalize_chatgpt_model_slug("GPT 6.1 TERRA"),
+        "gpt-6.1-terra"
+    );
     assert_eq!(normalize_chatgpt_model_slug("gpt6astra"), "gpt-6-astra");
     assert_eq!(normalize_chatgpt_model_slug("GPT 6 SOL"), "gpt-6-sol");
     assert_eq!(normalize_chatgpt_model_slug("gpt6luna"), "gpt-6-luna");
@@ -31586,7 +32090,18 @@ fn provider_catalog_v1_migrates_builtin_metadata_and_current_overrides_it() {
             normalize_provider_model_value(profile, "gpt61sol"),
             "gpt-6.1-sol"
         );
+        assert_eq!(
+            normalize_provider_model_value(profile, "gpt61terra"),
+            "gpt-6.1-terra"
+        );
         for (model, efforts, input, cached, output) in [
+            (
+                "gpt-6.1-terra",
+                &["none", "low", "medium", "high", "xhigh", "max"][..],
+                1.0,
+                0.05,
+                5.0,
+            ),
             (
                 "gpt-6.1-sol",
                 &["low", "medium", "high", "xhigh", "max"][..],
@@ -31764,6 +32279,7 @@ fn openai_responses_routing_is_official_openai_only() -> Result<()> {
         .expect("openai profile");
     for model in [
         "gpt-6.1-sol",
+        "gpt-6.1-terra",
         "gpt-6-astra",
         "gpt-6-sol",
         "gpt-6-luna",
@@ -31784,6 +32300,9 @@ fn openai_responses_routing_is_official_openai_only() -> Result<()> {
         ("https://api.openai.com", "gpt-5.6-preview"),
         ("https://api.openai.com", "gpt-5.6-terrra"),
         ("https://api.openai.com", "gpt-6.1-sol-preview"),
+        ("https://api.openai.com", "gpt-6.1-terra-preview"),
+        ("https://api.openai.com", "gpt-6.1-astra"),
+        ("https://api.openai.com", "gpt-6.1-luna"),
         ("https://api.openai.com", "gpt-6.10-sol"),
         ("https://api.openai.com", "gpt-6-preview"),
         ("https://api.openai.com", "gpt-6-terra"),
@@ -32842,7 +33361,36 @@ fn kimi_builtin_metadata_is_isolated_from_existing_provider_profiles() {
     let k3 = resolve_model_spec(kimi, "k3");
     assert_eq!(k3.context_window, Some(1_048_576));
     assert_eq!(k3.max_output_tokens, Some(131_072));
-    assert_eq!(k3.effort_levels, ["max"]);
+    assert_eq!(k3.effort_levels, ["low", "high", "max"]);
+    for model in [
+        "k3.1-pro",
+        "k3.1-pro-highspeed",
+        "k3-256k",
+        "kimi-for-coding",
+    ] {
+        assert!(kimi.models.iter().any(|id| id == model));
+        let spec = resolve_model_spec(kimi, model);
+        assert_eq!(
+            spec.context_window,
+            Some(if model == "k3-256k" {
+                262_144
+            } else {
+                1_048_576
+            })
+        );
+        assert_eq!(spec.max_output_tokens, Some(131_072));
+        assert_eq!(spec.effort_levels, ["low", "high", "max"]);
+        assert!(spec.tools && spec.reasoning && spec.image_input);
+        assert_eq!(spec.pricing.unwrap().input_usd_per_mtok, 0.0);
+    }
+    assert_eq!(
+        normalize_provider_model_value(kimi, "kimi-k3.1-pro"),
+        "k3.1-pro"
+    );
+    assert_eq!(
+        normalize_provider_model_value(kimi, "kimi-k3.1-pro-highspeed"),
+        "k3.1-pro-highspeed"
+    );
     let k3_pricing = k3.pricing.expect("Kimi coding-plan pricing");
     assert_eq!(k3_pricing.input_usd_per_mtok, 0.0);
     assert_eq!(k3_pricing.output_usd_per_mtok, 0.0);
@@ -33041,6 +33589,7 @@ fn kimi_runtime_auth_uses_plan_api_keys_and_ignores_stale_oauth() -> Result<()> 
 
 #[test]
 fn official_kimi_k3_request_uses_adaptive_thinking_and_empty_signatures_only_there() -> Result<()> {
+    let _guard = env_lock();
     let root = temp_test_dir("kimi-k3-request");
     let root = std::fs::canonicalize(&root)?;
     let kimi = built_in_provider_profiles()
@@ -33114,6 +33663,48 @@ fn official_kimi_k3_request_uses_adaptive_thinking_and_empty_signatures_only_the
         })
     }));
 
+    for model in [
+        "k3",
+        "k3.1-pro",
+        "k3.1-pro-highspeed",
+        "k3-256k",
+        "kimi-for-coding",
+    ] {
+        agent.model = model.to_string();
+        for (effort, expected) in [
+            (ThinkingEffort::Off, "low"),
+            (ThinkingEffort::Low, "low"),
+            (ThinkingEffort::Medium, "high"),
+            (ThinkingEffort::High, "high"),
+            (ThinkingEffort::XHigh, "high"),
+            (ThinkingEffort::Max, "max"),
+        ] {
+            agent.thinking_effort = effort;
+            let (_, bytes) =
+                agent.build_streaming_request("sys", "env", &sys_blocks, &[], "unused")?;
+            let body: Value = serde_json::from_slice(&bytes)?;
+            assert_eq!(body["model"], model);
+            assert_eq!(body["thinking"]["type"], "adaptive", "{model}: {body}");
+            assert_eq!(body["output_config"]["effort"], expected, "{model}: {body}");
+            assert!(body["messages"].as_array().unwrap().iter().any(|message| {
+                message["role"] == "assistant"
+                    && message["content"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|block| block["type"] == "thinking" && block["signature"] == "")
+            }));
+        }
+        let summary: Value = serde_json::from_slice(&agent.build_anthropic_summary_request(
+            model,
+            "summarize",
+            8192,
+        )?)?;
+        assert_eq!(summary["thinking"]["type"], "adaptive");
+        assert_eq!(summary["output_config"]["effort"], "low");
+    }
+    agent.model = "k3".to_string();
+    agent.thinking_effort = ThinkingEffort::Max;
     let mut custom = kimi;
     custom.base_url = "https://example.test/kimi".to_string();
     agent.provider_profile = Some(custom.clone());
@@ -33137,6 +33728,681 @@ fn official_kimi_k3_request_uses_adaptive_thinking_and_empty_signatures_only_the
     );
 
     let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
+fn new_claude_5_5_models_have_verified_limits_efforts_and_prices() -> Result<()> {
+    let _guard = env_lock();
+    let root = std::env::current_dir()?.canonicalize()?;
+    let profile = built_in_provider_profiles()
+        .into_iter()
+        .find(|profile| profile.id == "anthropic")
+        .unwrap();
+    let mut agent = test_agent(&root);
+    agent.provider_id = profile.id.clone();
+    agent.api_provider = profile.api_provider;
+    agent.base_url = profile.base_url.clone();
+    agent.provider_profile = Some(profile.clone());
+    for (model, input, cached, output) in [
+        ("claude-sonnet-5-5", 2.0, 0.1, 10.0),
+        ("claude-haiku-5-5", 0.1, 0.01, 0.5),
+    ] {
+        assert!(profile.models.iter().any(|id| id == model));
+        let spec = resolve_model_spec(&profile, model);
+        assert_eq!(spec.context_window, Some(1_000_000));
+        assert_eq!(spec.max_output_tokens, Some(128_000));
+        assert_eq!(
+            spec.effort_levels,
+            ["low", "medium", "high", "xhigh", "max"]
+        );
+        assert!(spec.tools && spec.reasoning && spec.image_input && spec.prompt_cache);
+        let prices = spec.pricing.unwrap();
+        assert_eq!(prices.input_usd_per_mtok, input);
+        assert_eq!(prices.cache_read_usd_per_mtok, cached);
+        assert_eq!(prices.output_usd_per_mtok, output);
+        assert_eq!(prices.cache_create_usd_per_mtok, input * 1.25);
+        agent.model = model.to_string();
+        for (effort, expected) in [
+            (ThinkingEffort::Off, None),
+            (ThinkingEffort::Low, Some("low")),
+            (ThinkingEffort::Medium, Some("medium")),
+            (ThinkingEffort::High, Some("high")),
+            (ThinkingEffort::XHigh, Some("xhigh")),
+            (ThinkingEffort::Max, Some("max")),
+        ] {
+            agent.thinking_effort = effort;
+            let (_, bytes) = agent.build_streaming_request("sys", "env", &[], &[], "session")?;
+            let body: Value = serde_json::from_slice(&bytes)?;
+            let expected = if model == "claude-sonnet-5-5" && effort == ThinkingEffort::Off {
+                Some("low")
+            } else {
+                expected
+            };
+            let expected_thinking = if expected.is_some() {
+                "adaptive"
+            } else {
+                "disabled"
+            };
+            let expected = if model == "claude-haiku-5-5" && effort == ThinkingEffort::Off {
+                Some("low")
+            } else {
+                expected
+            };
+            assert_eq!(
+                body["output_config"]["effort"].as_str(),
+                expected,
+                "{model}: {body}"
+            );
+            assert_eq!(
+                body["thinking"]["type"].as_str(),
+                Some(expected_thinking),
+                "{model}: {body}"
+            );
+            assert!(body["thinking"].get("budget_tokens").is_none());
+            assert_eq!(body["max_tokens"], 128_000);
+        }
+        let summary: Value = serde_json::from_slice(&agent.build_anthropic_summary_request(
+            model,
+            "summarize",
+            8192,
+        )?)?;
+        if model == "claude-sonnet-5-5" {
+            assert_eq!(summary["thinking"]["type"], "adaptive");
+            assert_eq!(summary["output_config"]["effort"], "low");
+        } else {
+            assert_eq!(summary["thinking"]["type"], "disabled");
+            assert_eq!(summary["output_config"]["effort"], "low");
+        }
+    }
+    assert!(!is_claude_sonnet_5_5_model("claude-sonnet-5-50"));
+    assert!(!is_claude_haiku_5_5_model("claude-haiku-5-50"));
+    Ok(())
+}
+
+#[test]
+fn new_glm_5_3_models_have_verified_metadata_and_always_think() -> Result<()> {
+    let _guard = env_lock();
+    let root = std::env::current_dir()?.canonicalize()?;
+    let profile = built_in_provider_profiles()
+        .into_iter()
+        .find(|profile| profile.id == "glm")
+        .unwrap();
+    let mut agent = test_agent(&root);
+    agent.provider_id = profile.id.clone();
+    agent.api_provider = profile.api_provider;
+    agent.base_url = profile.base_url.clone();
+    agent.provider_profile = Some(profile.clone());
+    for (base_model, vision, input, cached, output) in [
+        ("glm-5.3", false, 1.4, 0.26, 4.4),
+        ("glm-5.3-flashx", true, 0.37, 0.075, 1.25),
+        ("glm-5.3-flashx-legal", false, 0.37, 0.075, 1.25),
+    ] {
+        for model in [base_model.to_string(), format!("{base_model}[1m]")] {
+            assert!(profile.models.contains(&model));
+            let spec = resolve_model_spec(&profile, &model);
+            assert_eq!(spec.context_window, Some(1_000_000));
+            assert_eq!(spec.max_output_tokens, Some(131_072));
+            assert_eq!(spec.effort_levels, ["low", "high", "max"]);
+            assert_eq!(spec.image_input, vision);
+            let pricing = spec.pricing.unwrap();
+            assert_eq!(pricing.input_usd_per_mtok, input);
+            assert_eq!(pricing.cache_read_usd_per_mtok, cached);
+            assert_eq!(pricing.output_usd_per_mtok, output);
+            assert_eq!(pricing.cache_create_usd_per_mtok, 0.0);
+            agent.model = model.clone();
+            for (effort, expected) in [
+                (ThinkingEffort::Off, "low"),
+                (ThinkingEffort::Medium, "high"),
+                (ThinkingEffort::XHigh, "max"),
+            ] {
+                agent.thinking_effort = effort;
+                let (_, bytes) =
+                    agent.build_streaming_request("sys", "env", &[], &[], "session")?;
+                let body: Value = serde_json::from_slice(&bytes)?;
+                assert_eq!(body["thinking"]["type"], "enabled", "{model}: {body}");
+                assert_eq!(body["output_config"]["effort"], expected, "{model}: {body}");
+            }
+            let summary: Value = serde_json::from_slice(&agent.build_anthropic_summary_request(
+                &model,
+                "summarize",
+                8192,
+            )?)?;
+            assert_eq!(summary["thinking"]["type"], "enabled");
+            assert_eq!(summary["output_config"]["effort"], "low");
+        }
+    }
+    assert!(!is_glm_5_3_model("glm-5.3-preview"));
+    Ok(())
+}
+
+#[test]
+fn haiku_5_5_pricing_tier_counts_all_input_buckets_and_preserves_overrides() {
+    let _guard = env_lock();
+    let pricing_env_names = [
+        "DEXT_INPUT_USD_PER_MTOK",
+        "DEXT_OUTPUT_USD_PER_MTOK",
+        "DEXT_CACHE_READ_USD_PER_MTOK",
+        "DEXT_CACHE_CREATE_USD_PER_MTOK",
+    ];
+    let previous = pricing_env_names.map(|name| (name, std::env::var_os(name)));
+    let result = std::panic::catch_unwind(|| {
+        unsafe {
+            for name in [
+                "DEXT_INPUT_USD_PER_MTOK",
+                "DEXT_OUTPUT_USD_PER_MTOK",
+                "DEXT_CACHE_READ_USD_PER_MTOK",
+                "DEXT_CACHE_CREATE_USD_PER_MTOK",
+            ] {
+                std::env::remove_var(name);
+            }
+        }
+        let model = "claude-haiku-5-5";
+        let pricing = crate::usage::anthropic_pricing(model).unwrap();
+        for usage in [
+            Usage {
+                input: 100_001,
+                ..Usage::default()
+            },
+            Usage {
+                cache_read: 100_001,
+                ..Usage::default()
+            },
+            Usage {
+                cache_create: 100_001,
+                ..Usage::default()
+            },
+            Usage {
+                input: 33_334,
+                cache_read: 33_334,
+                cache_create: 33_333,
+                ..Usage::default()
+            },
+        ] {
+            let tier = crate::usage::anthropic_long_context_pricing_with_override_state(
+                model, usage, pricing, false,
+            );
+            assert!((tier.estimate(usage) - pricing.estimate(usage) * 5.0).abs() < 1e-12);
+            let unchanged = crate::usage::anthropic_long_context_pricing_with_override_state(
+                model, usage, pricing, true,
+            );
+            assert_eq!(unchanged.estimate(usage), pricing.estimate(usage));
+        }
+        let boundary = Usage {
+            cache_read: 100_000,
+            output: 1_000_000,
+            ..Usage::default()
+        };
+        assert_eq!(
+            crate::usage::anthropic_long_context_pricing_with_override_state(
+                model, boundary, pricing, false
+            )
+            .estimate(boundary),
+            pricing.estimate(boundary)
+        );
+        let override_pricing = UsagePricing {
+            input: 7.0,
+            output: 11.0,
+            cache_read: 0.5,
+            cache_create: 8.0,
+        };
+        let usage = Usage {
+            input: 100_001,
+            output: 100_000,
+            ..Usage::default()
+        };
+        assert_eq!(
+            crate::usage::anthropic_long_context_pricing_with_override_state(
+                model,
+                usage,
+                override_pricing,
+                false
+            )
+            .estimate(usage),
+            override_pricing.estimate(usage)
+        );
+        let profile = built_in_provider_profiles()
+            .into_iter()
+            .find(|profile| profile.id == "anthropic")
+            .unwrap();
+        let spec = resolve_model_spec(&profile, model);
+        let priced = usage_with_current_pricing(
+            usage,
+            "anthropic",
+            ApiProvider::Anthropic,
+            &profile.base_url,
+            model,
+            spec.pricing.as_ref(),
+        );
+        assert!((priced.cost_usd.unwrap() - pricing.estimate(usage) * 5.0).abs() < 1e-12);
+        unsafe {
+            std::env::set_var("DEXT_INPUT_USD_PER_MTOK", "7");
+        }
+        let priced = usage_with_current_pricing(
+            usage,
+            "anthropic",
+            ApiProvider::Anthropic,
+            &profile.base_url,
+            model,
+            spec.pricing.as_ref(),
+        );
+        let overridden = UsagePricing {
+            input: 7.0,
+            ..pricing
+        };
+        assert_eq!(priced.cost_usd, Some(overridden.estimate(usage)));
+    });
+    for (name, value) in previous {
+        restore_env_var(name, value);
+    }
+    result.unwrap();
+}
+
+#[test]
+fn model_review_haiku_off_disables_default_thinking_and_omits_replay() -> Result<()> {
+    let _guard = env_lock();
+    let root = std::env::current_dir()?.canonicalize()?;
+    let profile = built_in_provider_profiles()
+        .into_iter()
+        .find(|profile| profile.id == "anthropic")
+        .unwrap();
+    let mut agent = test_agent(&root);
+    agent.provider_id = profile.id.clone();
+    agent.api_provider = profile.api_provider;
+    agent.base_url = profile.base_url.clone();
+    agent.provider_profile = Some(profile);
+    agent.model = "claude-haiku-5-5".to_string();
+    agent.thinking_effort = ThinkingEffort::Off;
+    agent.history = vec![
+        Message {
+            role: "user".to_string(),
+            content: vec![Block::Text {
+                text: "inspect".to_string(),
+            }],
+        },
+        Message {
+            role: "assistant".to_string(),
+            content: vec![
+                Block::Thinking {
+                    text: "prior reasoning".to_string(),
+                    signature: Some("signed-reasoning".to_string()),
+                },
+                Block::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "todo_read".to_string(),
+                    input: json!({}),
+                },
+            ],
+        },
+        Message {
+            role: "user".to_string(),
+            content: vec![Block::ToolResult {
+                tool_use_id: "call_1".to_string(),
+                content: "no todos".to_string(),
+                is_error: None,
+                metadata: ToolResultMetadata::default(),
+            }],
+        },
+    ];
+    let original = serde_json::to_value(&agent.history)?;
+    for auth_kind in [RuntimeAuthKind::ApiKey, RuntimeAuthKind::OAuth] {
+        agent.auth_kind = auth_kind;
+        let (_, bytes) = agent.build_streaming_request("sys", "env", &[], &[], "session")?;
+        let body: Value = serde_json::from_slice(&bytes)?;
+        assert_eq!(body["thinking"]["type"], "disabled");
+        assert_eq!(body["output_config"]["effort"], "low");
+        assert!(!body["messages"].to_string().contains("signed-reasoning"));
+        assert!(!body["messages"].to_string().contains("prior reasoning"));
+        assert!(body["messages"].to_string().contains("call_1"));
+        let summary = agent.prepare_summary_request(&agent.history, "")?;
+        let body: Value =
+            serde_json::from_slice(summary.request.body().unwrap().as_bytes().unwrap())?;
+        assert_eq!(body["thinking"]["type"], "disabled");
+        assert_eq!(body["output_config"]["effort"], "low");
+        assert!(body.get("tools").is_none());
+    }
+    assert_eq!(serde_json::to_value(&agent.history)?, original);
+    Ok(())
+}
+
+#[test]
+fn model_review_preserves_priced_session_cost_across_request_tiers_and_models() -> Result<()> {
+    let root = std::env::current_dir()?.canonicalize()?;
+    for (model, input) in [("claude-haiku-5-5", 60_000), ("gpt-6.1-terra", 150_000)] {
+        let id = if model.starts_with("claude") {
+            "anthropic"
+        } else {
+            "openai"
+        };
+        let profile = built_in_provider_profiles()
+            .into_iter()
+            .find(|profile| profile.id == id)
+            .unwrap();
+        let mut agent = test_agent(&root);
+        agent.provider_id = profile.id.clone();
+        agent.api_provider = profile.api_provider;
+        agent.base_url = profile.base_url.clone();
+        agent.model = model.to_string();
+        agent.provider_profile = Some(profile);
+        let request = Usage {
+            input,
+            output: 1000,
+            cost_usd: Some(0.123),
+            ..Usage::default()
+        };
+        agent.session_usage.add(request);
+        agent.session_usage.add(request);
+        assert_eq!(
+            agent.priced_session_usage().cost_usd,
+            Some(0.246),
+            "{model}"
+        );
+        let header = agent.session_header();
+        assert_eq!(
+            analyze_session_history(&header, &[]).usage.cost_usd,
+            Some(0.246),
+            "{model}"
+        );
+        agent.model = "claude-sonnet-5-5".to_string();
+        assert_eq!(agent.priced_session_usage().cost_usd, Some(0.246));
+    }
+    Ok(())
+}
+
+#[test]
+fn model_review_catalog_preserves_legacy_per_model_limits_and_alias_metadata() {
+    for (id, model) in [
+        ("kimi", "k3.1-pro"),
+        ("anthropic", "claude-haiku-5-5"),
+        ("glm", "glm-5.3"),
+        ("openai", "gpt-6.1-terra"),
+    ] {
+        let mut stored = built_in_provider_profiles()
+            .into_iter()
+            .find(|profile| profile.id == id)
+            .unwrap();
+        stored.model_specs.clear();
+        stored.model_context_windows = HashMap::from([(model.to_string(), 64_000)]);
+        stored.model_effort_levels = HashMap::from([(model.to_string(), vec!["high".to_string()])]);
+        let catalog = crate::provider::normalize_provider_catalog(ProviderCatalog {
+            version: 4,
+            active_provider: id.to_string(),
+            providers: vec![stored.clone()],
+        })
+        .unwrap();
+        let profile = find_provider_profile(&catalog, id).unwrap();
+        let spec = resolve_model_spec(&profile, model);
+        assert_eq!(spec.context_window, Some(64_000), "{id}/{model}");
+        assert_eq!(spec.effort_levels, ["high"], "{id}/{model}");
+        stored.model_specs.insert(
+            model.to_string(),
+            ModelSpec {
+                context_window: Some(96_000),
+                effort_levels: vec!["low".to_string()],
+                ..Default::default()
+            },
+        );
+        let catalog = crate::provider::normalize_provider_catalog(ProviderCatalog {
+            version: 4,
+            active_provider: id.to_string(),
+            providers: vec![stored],
+        })
+        .unwrap();
+        let spec = resolve_model_spec(&find_provider_profile(&catalog, id).unwrap(), model);
+        assert_eq!(spec.context_window, Some(96_000));
+        assert_eq!(spec.effort_levels, ["low"]);
+    }
+    let mut stored = built_in_provider_profiles()
+        .into_iter()
+        .find(|profile| profile.id == "kimi")
+        .unwrap();
+    stored.model_aliases.clear();
+    stored.model_context_windows = HashMap::from([
+        ("kimi-k3.1-pro-highspeed".to_string(), 64_000),
+        ("k3.1-pro-highspeed".to_string(), 96_000),
+    ]);
+    stored.model_effort_levels = HashMap::from([
+        (
+            "kimi-k3.1-pro-highspeed".to_string(),
+            vec!["low".to_string()],
+        ),
+        ("k3.1-pro-highspeed".to_string(), vec!["high".to_string()]),
+    ]);
+    stored.model_specs = HashMap::from([
+        (
+            "kimi-k3.1-pro".to_string(),
+            ModelSpec {
+                context_window: Some(64_000),
+                max_output_tokens: Some(8192),
+                ..Default::default()
+            },
+        ),
+        (
+            "k3.1-pro".to_string(),
+            ModelSpec {
+                context_window: Some(96_000),
+                ..Default::default()
+            },
+        ),
+    ]);
+    let catalog = crate::provider::normalize_provider_catalog(ProviderCatalog {
+        version: 4,
+        active_provider: "kimi".to_string(),
+        providers: vec![stored],
+    })
+    .unwrap();
+    let profile = find_provider_profile(&catalog, "kimi").unwrap();
+    let spec = resolve_model_spec(&profile, "kimi-k3.1-pro");
+    assert_eq!(spec.context_window, Some(96_000));
+    assert_eq!(spec.max_output_tokens, Some(8192));
+    assert!(!profile.model_specs.contains_key("kimi-k3.1-pro"));
+    let spec = resolve_model_spec(&profile, "kimi-k3.1-pro-highspeed");
+    assert_eq!(spec.context_window, Some(96_000));
+    assert_eq!(spec.effort_levels, ["high"]);
+    let reloaded = crate::provider::normalize_provider_catalog(catalog).unwrap();
+    let reloaded = find_provider_profile(&reloaded, "kimi").unwrap();
+    assert_eq!(
+        resolve_model_spec(&reloaded, "k3.1-pro").max_output_tokens,
+        Some(8192)
+    );
+    assert_eq!(
+        resolve_model_spec(&reloaded, "k3.1-pro-highspeed").context_window,
+        Some(96_000)
+    );
+}
+
+#[test]
+fn model_review_required_thinking_respects_declared_effort_restrictions() -> Result<()> {
+    let root = std::env::current_dir()?.canonicalize()?;
+    for (id, model, thinking) in [
+        ("anthropic", "claude-sonnet-5-5", "adaptive"),
+        ("kimi", "k3.1-pro", "adaptive"),
+        ("glm", "glm-5.3-flashx", "enabled"),
+    ] {
+        let mut profile = built_in_provider_profiles()
+            .into_iter()
+            .find(|profile| profile.id == id)
+            .unwrap();
+        profile.model_specs.get_mut(model).unwrap().effort_levels = vec!["high".to_string()];
+        let mut agent = test_agent(&root);
+        agent.provider_id = id.to_string();
+        agent.api_provider = profile.api_provider;
+        agent.base_url = profile.base_url.clone();
+        agent.model = model.to_string();
+        agent.provider_profile = Some(profile);
+        for effort in [
+            ThinkingEffort::Off,
+            ThinkingEffort::Low,
+            ThinkingEffort::Max,
+        ] {
+            agent.thinking_effort = effort;
+            let (_, bytes) = agent.build_streaming_request("sys", "env", &[], &[], "session")?;
+            let body: Value = serde_json::from_slice(&bytes)?;
+            assert_eq!(body["thinking"]["type"], thinking, "{model}");
+            assert_eq!(
+                body["output_config"]["effort"], "high",
+                "{model}/{effort:?}"
+            );
+        }
+        let summary: Value = serde_json::from_slice(&agent.build_anthropic_summary_request(
+            model,
+            "summarize",
+            8192,
+        )?)?;
+        assert_eq!(summary["thinking"]["type"], thinking);
+        assert_eq!(summary["output_config"]["effort"], "high", "{model}");
+    }
+    Ok(())
+}
+
+#[test]
+fn model_final_review_haiku_disabled_thinking_obeys_declared_effort() -> Result<()> {
+    let _guard = env_lock();
+    let root = std::env::current_dir()?.canonicalize()?;
+    let mut profile = built_in_provider_profiles()
+        .into_iter()
+        .find(|profile| profile.id == "anthropic")
+        .unwrap();
+    let mut agent = test_agent(&root);
+    agent.provider_id = profile.id.clone();
+    agent.api_provider = profile.api_provider;
+    agent.base_url = profile.base_url.clone();
+    agent.model = "claude-haiku-5-5".to_string();
+    agent.thinking_effort = ThinkingEffort::Off;
+    for level in ["medium", "high", "max", "xhigh", "none"] {
+        profile
+            .model_specs
+            .get_mut(&agent.model)
+            .unwrap()
+            .effort_levels = vec![level.to_string()];
+        agent.provider_profile = Some(profile.clone());
+        let foreground = agent.build_streaming_request("sys", "env", &[], &[], "session");
+        let summary = agent.build_anthropic_summary_request(&agent.model, "summarize", 2048);
+        if matches!(level, "max" | "xhigh" | "none") {
+            assert!(
+                foreground
+                    .unwrap_err()
+                    .to_string()
+                    .contains("disabled thinking")
+            );
+            assert!(
+                summary
+                    .unwrap_err()
+                    .to_string()
+                    .contains("disabled thinking")
+            );
+        } else {
+            let foreground: Value = serde_json::from_slice(&foreground?.1)?;
+            let summary: Value = serde_json::from_slice(&summary?)?;
+            for body in [foreground, summary] {
+                assert_eq!(body["thinking"]["type"], "disabled");
+                assert_eq!(body["output_config"]["effort"], level);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn model_final_review_chat_effort_does_not_escape_declared_levels() -> Result<()> {
+    let root = std::env::current_dir()?.canonicalize()?;
+    let mut profile = built_in_provider_profiles()
+        .into_iter()
+        .find(|profile| profile.id == "openai")
+        .unwrap();
+    profile.id = "custom-terra".to_string();
+    profile.base_url = "https://example.test".to_string();
+    profile.request_contract = Some(RequestContract::OpenAiChatCompletions);
+    profile
+        .model_specs
+        .get_mut("gpt-6.1-terra")
+        .unwrap()
+        .effort_levels = vec!["high".to_string()];
+    let mut agent = test_agent(&root);
+    agent.provider_id = profile.id.clone();
+    agent.api_provider = profile.api_provider;
+    agent.base_url = profile.base_url.clone();
+    agent.model = "gpt-6.1-terra".to_string();
+    agent.provider_profile = Some(profile);
+    agent.tools.clear();
+    agent.thinking_effort = ThinkingEffort::Off;
+    let (_, bytes) = agent.build_streaming_request("sys", "env", &[], &[], "session")?;
+    let body: Value = serde_json::from_slice(&bytes)?;
+    assert!(body.get("reasoning_effort").is_none(), "{body}");
+    agent
+        .provider_profile
+        .as_mut()
+        .unwrap()
+        .model_specs
+        .get_mut(&agent.model)
+        .unwrap()
+        .effort_levels = vec!["high".to_string(), "none".to_string()];
+    let (_, bytes) = agent.build_streaming_request("sys", "env", &[], &[], "session")?;
+    let body: Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(body["reasoning_effort"], "none");
+    agent
+        .provider_profile
+        .as_mut()
+        .unwrap()
+        .model_specs
+        .get_mut(&agent.model)
+        .unwrap()
+        .capabilities
+        .reasoning = Some(false);
+    agent.thinking_effort = ThinkingEffort::Max;
+    let (_, bytes) = agent.build_streaming_request("sys", "env", &[], &[], "session")?;
+    let body: Value = serde_json::from_slice(&bytes)?;
+    assert!(body.get("reasoning_effort").is_none(), "{body}");
+    Ok(())
+}
+
+#[test]
+fn model_final_review_kimi_missing_effort_metadata_keeps_required_adaptive_thinking() -> Result<()>
+{
+    let root = std::env::current_dir()?.canonicalize()?;
+    let mut profile = built_in_provider_profiles()
+        .into_iter()
+        .find(|profile| profile.id == "kimi")
+        .unwrap();
+    profile.model_specs.clear();
+    profile.model_effort_levels.clear();
+    profile.model_defaults.effort_levels.clear();
+    let mut agent = test_agent(&root);
+    agent.provider_id = profile.id.clone();
+    agent.api_provider = profile.api_provider;
+    agent.base_url = profile.base_url.clone();
+    agent.provider_profile = Some(profile);
+    agent.model = "k3.1-pro".to_string();
+    for (effort, expected) in [
+        (ThinkingEffort::Off, "low"),
+        (ThinkingEffort::Medium, "high"),
+        (ThinkingEffort::Max, "max"),
+    ] {
+        agent.thinking_effort = effort;
+        let (_, bytes) = agent.build_streaming_request("sys", "env", &[], &[], "session")?;
+        let body: Value = serde_json::from_slice(&bytes)?;
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert_eq!(body["output_config"]["effort"], expected);
+    }
+    let summary: Value = serde_json::from_slice(&agent.build_anthropic_summary_request(
+        &agent.model,
+        "summarize",
+        8192,
+    )?)?;
+    assert_eq!(summary["thinking"]["type"], "adaptive");
+    assert_eq!(summary["output_config"]["effort"], "low");
+    agent.provider_profile.as_mut().unwrap().model_specs.insert(
+        agent.model.clone(),
+        ModelSpec {
+            effort_levels: vec!["vendor-depth".to_string()],
+            ..Default::default()
+        },
+    );
+    agent.thinking_effort = ThinkingEffort::Max;
+    let (_, bytes) = agent.build_streaming_request("sys", "env", &[], &[], "session")?;
+    let body: Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(body["thinking"]["type"], "adaptive");
+    assert_eq!(body["output_config"]["effort"], "vendor-depth");
     Ok(())
 }
 
@@ -33327,6 +34593,380 @@ fn anthropic_request_strips_dext_only_tool_result_metadata() -> Result<()> {
 }
 
 #[test]
+fn provider_requests_preserve_tool_result_failures_without_mutating_history() -> Result<()> {
+    let root = temp_test_dir("provider-tool-result-failures");
+    let _cleanup = RemoveDirOnDrop(root.clone());
+    let mut agent = test_agent(&root);
+    let cases = [
+        ("empty-error", "", Some(true), "(failed with no output)"),
+        (
+            "blank-error",
+            " \n\t",
+            Some(true),
+            "(failed with no output)",
+        ),
+        (
+            "text-error",
+            "exit: 1\ncompile failed",
+            Some(true),
+            "(failed)\nexit: 1\ncompile failed",
+        ),
+        ("empty-success", "", Some(false), ""),
+        ("blank-success", " \n\t", Some(false), " \n\t"),
+        ("empty-unflagged", "", None, ""),
+        ("blank-unflagged", " \n\t", None, " \n\t"),
+        (
+            "unicode-blank-error",
+            "\u{2003}\u{00a0}",
+            Some(true),
+            "(failed with no output)",
+        ),
+        ("text-success", "exit: 0", Some(false), "exit: 0"),
+        ("text-unflagged", "failure is data", None, "failure is data"),
+    ];
+    agent.history = vec![
+        Message {
+            role: "assistant".to_string(),
+            content: cases
+                .iter()
+                .map(|(id, _, _, _)| Block::ToolUse {
+                    id: (*id).to_string(),
+                    name: "bash".to_string(),
+                    input: json!({"command": "test -f missing"}),
+                })
+                .collect(),
+        },
+        Message {
+            role: "user".to_string(),
+            content: cases
+                .iter()
+                .map(|(id, content, is_error, _)| tool_result_block(id, content, *is_error))
+                .collect(),
+        },
+    ];
+    let saved_history = serde_json::to_value(&agent.history)?;
+    let system = [SystemBlock {
+        kind: "text",
+        text: "sys",
+        cache_control: None,
+    }];
+
+    for (provider_id, contract) in [
+        ("anthropic", RequestContract::AnthropicMessages),
+        ("deepseek", RequestContract::OpenAiChatCompletions),
+        ("openai", RequestContract::OpenAiResponses),
+        ("chatgpt", RequestContract::ChatGptResponses),
+    ] {
+        let mut profile = built_in_provider_profiles()
+            .into_iter()
+            .find(|profile| profile.id == provider_id)
+            .context("provider profile")?;
+        profile.request_contract = Some(contract);
+        agent.provider_id = provider_id.to_string();
+        agent.api_provider = profile.api_provider;
+        agent.model = profile.default_model.clone();
+        agent.provider_profile = Some(profile);
+        let (_, body) = agent.build_streaming_request("sys", "env", &system, &[], "sess")?;
+        let body: Value = serde_json::from_slice(&body)?;
+
+        for (id, content, is_error, flagless_content) in cases {
+            let (result, text_key) = match contract {
+                RequestContract::AnthropicMessages => (
+                    body["messages"][1]["content"]
+                        .as_array()
+                        .context("Anthropic tool results")?
+                        .iter()
+                        .find(|result| result["tool_use_id"] == id)
+                        .context("Anthropic tool result")?,
+                    "content",
+                ),
+                RequestContract::OpenAiChatCompletions => (
+                    body["messages"]
+                        .as_array()
+                        .context("Chat Completions messages")?
+                        .iter()
+                        .find(|result| result["role"] == "tool" && result["tool_call_id"] == id)
+                        .context("Chat Completions tool result")?,
+                    "content",
+                ),
+                RequestContract::OpenAiResponses | RequestContract::ChatGptResponses => (
+                    body["input"]
+                        .as_array()
+                        .context("Responses input")?
+                        .iter()
+                        .find(|result| {
+                            result["type"] == "function_call_output" && result["call_id"] == id
+                        })
+                        .context("Responses tool result")?,
+                    "output",
+                ),
+            };
+            let expected = if contract == RequestContract::AnthropicMessages {
+                assert_eq!(
+                    result.get("is_error"),
+                    is_error.map(|flag| json!(flag)).as_ref()
+                );
+                if is_error == Some(true) && content.trim().is_empty() {
+                    "(failed with no output)"
+                } else {
+                    content
+                }
+            } else {
+                assert!(result.get("is_error").is_none(), "{result}");
+                flagless_content
+            };
+            assert_eq!(result[text_key], expected, "{provider_id}: {id}");
+            assert!(result.get("metadata").is_none(), "{result}");
+        }
+        assert_eq!(serde_json::to_value(&agent.history)?, saved_history);
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn failed_tool_continues_after_provider_retry_without_reexecuting() -> Result<()> {
+    fn tool_response(contract: RequestContract, id: &str, name: &str, input: Value) -> String {
+        let arguments = input.to_string();
+        let events = match contract {
+            RequestContract::AnthropicMessages => vec![
+                json!({"type":"message_start", "message":{"usage":{}}}),
+                json!({"type":"content_block_start", "index":0, "content_block":{
+                    "type":"tool_use", "id":id, "name":name, "input":{}}}),
+                json!({"type":"content_block_delta", "index":0, "delta":{
+                    "type":"input_json_delta", "partial_json":arguments}}),
+                json!({"type":"content_block_stop", "index":0}),
+                json!({"type":"message_delta", "delta":{"stop_reason":"tool_use"}}),
+                json!({"type":"message_stop"}),
+            ],
+            RequestContract::OpenAiChatCompletions => vec![json!({"choices":[{
+                "delta":{"tool_calls":[{"index":0, "id":id, "function":{
+                    "name":name, "arguments":arguments}}]}, "finish_reason":"tool_calls"}]})],
+            RequestContract::OpenAiResponses | RequestContract::ChatGptResponses => {
+                let item_id = format!("fc_{id}");
+                vec![
+                    json!({"type":"response.output_item.added", "item":{
+                        "type":"function_call", "id":item_id, "call_id":id,
+                        "name":name, "arguments":""}}),
+                    json!({"type":"response.function_call_arguments.done",
+                        "item_id":item_id, "arguments":arguments}),
+                    json!({"type":"response.completed", "response":{
+                        "status":"completed", "output":[{"type":"function_call",
+                            "id":item_id, "call_id":id, "name":name, "arguments":arguments}]}}),
+                ]
+            }
+        };
+        events
+            .into_iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect()
+    }
+
+    for contract in [
+        RequestContract::AnthropicMessages,
+        RequestContract::OpenAiChatCompletions,
+        RequestContract::OpenAiResponses,
+        RequestContract::ChatGptResponses,
+    ] {
+        for diagnostics in [false, true] {
+            let root = temp_test_dir("failed-tool-continuation");
+            let _cleanup = RemoveDirOnDrop(root.clone());
+            std::fs::write(root.join("input.txt"), "available")?;
+            let status = if diagnostics { 101 } else { 7 };
+            let line = json!({"reason":"compiler-message", "message":{
+                "level":"error", "message":"mismatched types", "spans":[]}})
+            .to_string();
+            let command = if diagnostics {
+                format!(
+                    "printf x >> attempts.txt; printf '%s\\n' {}; exit {status}",
+                    shell_single_quote(&line)
+                )
+            } else {
+                format!("printf x >> attempts.txt; exit {status}")
+            };
+            let responses = [
+                tool_response(contract, "call_failed", "bash", json!({"command":command})),
+                "temporary upstream failure".to_string(),
+                tool_response(
+                    contract,
+                    "call_recovery",
+                    "read_file",
+                    json!({"path":"input.txt"}),
+                ),
+                stream_recovery_fixture(contract, "success", "Recovered."),
+            ];
+            let listener = TcpListener::bind("127.0.0.1:0")?;
+            let address = listener.local_addr()?;
+            let server = std::thread::spawn(move || -> Result<Vec<Value>> {
+                let mut requests = Vec::new();
+                for (index, response) in responses.into_iter().enumerate() {
+                    let mut stream = accept_test_connection(&listener, Duration::from_secs(10))?;
+                    let mut request = Vec::new();
+                    let mut buffer = [0; 4096];
+                    let header_end = loop {
+                        let count = stream.read(&mut buffer)?;
+                        anyhow::ensure!(count > 0, "truncated request headers");
+                        request.extend_from_slice(&buffer[..count]);
+                        anyhow::ensure!(request.len() <= 2 * 1024 * 1024, "request cap");
+                        if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+                        {
+                            break end + 4;
+                        }
+                    };
+                    let length = String::from_utf8_lossy(&request[..header_end])
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")?
+                                .trim()
+                                .parse::<usize>()
+                                .ok()
+                        })
+                        .context("request content length")?;
+                    anyhow::ensure!(length <= 2 * 1024 * 1024, "request body cap");
+                    while request.len() < header_end + length {
+                        let count = stream.read(&mut buffer)?;
+                        anyhow::ensure!(count > 0, "truncated request body");
+                        request.extend_from_slice(&buffer[..count]);
+                    }
+                    requests.push(serde_json::from_slice(
+                        &request[header_end..header_end + length],
+                    )?);
+                    let status = if index == 1 {
+                        "503 Service Unavailable"
+                    } else {
+                        "200 OK"
+                    };
+                    write!(
+                        stream,
+                        "HTTP/1.1 {status}\r\nContent-Type: text/event-stream\r\nRetry-After: 0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                        response.len()
+                    )?;
+                }
+                anyhow::ensure!(
+                    matches!(accept_test_connection(&listener, Duration::from_millis(100)),
+                        Err(error) if error.kind() == io::ErrorKind::TimedOut),
+                    "unexpected extra provider request"
+                );
+                Ok(requests)
+            });
+
+            let mut agent = test_agent(&root);
+            configure_stream_recovery_agent(&mut agent, contract);
+            agent.base_url = format!("http://{address}");
+            agent.thinking_effort = ThinkingEffort::Off;
+            agent.set_approval_profile(ApprovalProfile::Always);
+            agent.session_enabled = false;
+            agent.max_iterations = Some(3);
+            agent.history = vec![
+                Message {
+                    role: "assistant".to_string(),
+                    content: vec![Block::ToolUse {
+                        id: "call_old_blank_failure".to_string(),
+                        name: "bash".to_string(),
+                        input: json!({"command":"test -f missing"}),
+                    }],
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: vec![tool_result_block("call_old_blank_failure", "", Some(true))],
+                },
+            ];
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            agent.set_sink(Box::new(ChannelSink { tx }));
+            let result = tokio::time::timeout(
+                Duration::from_secs(20),
+                agent.chat("Continue the existing work.".to_string()),
+            )
+            .await;
+            let requests = server.join().expect("continuation server")?;
+            result.context("continuation deadline")??;
+            assert_eq!(requests.len(), 4, "{contract:?}, diagnostics={diagnostics}");
+            assert_eq!(requests[1], requests[2], "HTTP retry changed tool history");
+            assert_eq!(std::fs::read_to_string(root.join("attempts.txt"))?, "x");
+            let failed = agent
+                .history
+                .iter()
+                .flat_map(|message| &message.content)
+                .find_map(|block| {
+                    if let Block::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error,
+                        metadata,
+                    } = block
+                        && tool_use_id == "call_failed"
+                    {
+                        Some((content, is_error, metadata))
+                    } else {
+                        None
+                    }
+                })
+                .context("failed tool result")?;
+            assert_eq!(*failed.1, Some(true));
+            assert_eq!(failed.2.exit_code, Some(status));
+            assert_eq!(failed.2.status.as_deref(), Some("error"));
+            assert!(
+                failed.0.starts_with(&format!("exit: {status}\n")),
+                "{}",
+                failed.0
+            );
+            let retry_wire = requests[2].to_string();
+            assert!(
+                retry_wire.contains("(failed with no output)"),
+                "{retry_wire}"
+            );
+            if contract == RequestContract::AnthropicMessages {
+                assert!(retry_wire.contains("\"is_error\":true"), "{retry_wire}");
+            } else {
+                assert!(retry_wire.contains("(failed)\\nexit:"), "{retry_wire}");
+            }
+            assert!(agent.history.iter().flat_map(|message| &message.content).any(|block| {
+                matches!(block, Block::ToolResult { tool_use_id, content, is_error: Some(true), .. }
+                    if tool_use_id == "call_old_blank_failure" && content.is_empty())
+            }));
+            assert!(
+                agent
+                    .history
+                    .iter()
+                    .flat_map(|message| &message.content)
+                    .any(|block| { matches!(block, Block::Text { text } if text == "Recovered.") })
+            );
+            let events = drain_events(&mut rx);
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event,
+                AgentEvent::ToolCallResult { name, ok: false, .. } if name == "bash"))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event,
+                AgentEvent::ToolCallResult { name, ok: true, .. } if name == "read_file"))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, AgentEvent::HttpRetry { .. }))
+                    .count(),
+                1
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, AgentEvent::TurnEnd { failed: false, .. }))
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn chatgpt_input_serializes_function_call_without_id_field() {
     // Regression: Codex rejects `input[].id` that doesn't start with `fc_`.
     // Dext stores the server's call_id on Block::ToolUse.id and must not echo it
@@ -33373,6 +35013,8 @@ fn openai_responses_replays_only_current_turn_encrypted_reasoning() {
     let root = temp_test_dir("openai-responses-reasoning-replay");
     let root = std::fs::canonicalize(&root).expect("canonical temp dir");
     let mut agent = test_agent(&root);
+    configure_stream_recovery_agent(&mut agent, RequestContract::OpenAiResponses);
+    agent.base_url = "https://api.openai.com".to_string();
     let reasoning = |id: &str, encrypted_content: &str| Block::ResponsesReasoning {
         item: json!({
             "type": "reasoning",
@@ -33415,6 +35057,26 @@ fn openai_responses_replays_only_current_turn_encrypted_reasoning() {
         },
     ];
 
+    let mut parser = streaming::ProviderStreamParser::new(RequestContract::OpenAiResponses, false);
+    for data in [
+        json!({"type": "response.output_item.done", "item": {
+            "type": "reasoning", "id": "rs_current", "encrypted_content": "enc-streamed", "summary": []}}),
+        json!({"type": "response.output_item.added", "item": {
+            "type": "function_call", "id": "fc_current", "call_id": "call_current", "name": "todo_read", "arguments": ""}}),
+        json!({"type": "response.function_call_arguments.done", "item_id": "fc_current", "arguments": "{}"}),
+        json!({"type": "response.completed", "response": {"status": "completed", "output": [
+            {"type": "reasoning", "id": "rs_current", "encrypted_content": "enc-terminal", "summary": []},
+            {"type": "function_call", "id": "fc_current", "call_id": "call_current", "name": "todo_read", "arguments": "{}"}]}}),
+    ] {
+        parser
+            .push_frame(streaming::SseFrame {
+                event: None,
+                data: Some(data.to_string()),
+            })
+            .unwrap();
+    }
+    agent.history[3].content = parser.finish().unwrap().blocks;
+    let history_before = serde_json::to_value(&agent.history).unwrap();
     let openai_items = agent.history_to_openai_responses_input();
     let reasoning_ids = openai_items
         .iter()
@@ -33422,6 +35084,23 @@ fn openai_responses_replays_only_current_turn_encrypted_reasoning() {
         .filter_map(|item| item["id"].as_str())
         .collect::<Vec<_>>();
     assert_eq!(reasoning_ids, ["rs_current"]);
+    let current_reasoning = openai_items
+        .iter()
+        .find(|item| item["type"] == "reasoning")
+        .unwrap();
+    assert_eq!(current_reasoning["encrypted_content"], "enc-terminal");
+    let (url, body) = agent
+        .build_streaming_request("sys", "env", &[], &[], "reasoning-replay")
+        .unwrap();
+    assert_eq!(url, "https://api.openai.com/v1/responses");
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    let wire_reasoning = body["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item["type"] == "reasoning")
+        .collect::<Vec<_>>();
+    assert_eq!(wire_reasoning, [current_reasoning]);
     assert!(
         openai_items
             .iter()
@@ -33432,6 +35111,10 @@ fn openai_responses_replays_only_current_turn_encrypted_reasoning() {
     assert!(
         chatgpt_items.iter().all(|item| item["type"] != "reasoning"),
         "{chatgpt_items:?}"
+    );
+    assert_eq!(
+        serde_json::to_value(&agent.history).unwrap(),
+        history_before
     );
     let _ = std::fs::remove_dir_all(&root);
 }
