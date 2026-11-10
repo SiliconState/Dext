@@ -4885,8 +4885,8 @@ async fn local_auth_console_pty_hides_secret_and_restores_echo() {
                     &mut master,
                     &mut slave,
                     std::ptr::null_mut(),
-                    std::ptr::null(),
-                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
                 )
             },
             0

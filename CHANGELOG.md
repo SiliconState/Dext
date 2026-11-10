@@ -12,6 +12,8 @@
 
 ### Fixed
 
+- The local-auth Unix PTY test uses mutable null termios/winsize pointers for macOS's `openpty` signature; Linux accepts the same pointers. This fixes native macOS test compilation without changing local authentication behavior or assertions.
+
 - Reconciled the checkpoint-warning PTY fixture with the merged cleanup helper: one drop guard owns both child and PTY and uses bounded output-draining termination on failure. This fixes the merged test's compile error without changing runtime behavior or test assertions.
 
 - Runtime checkpoint/hook warnings now enter the inline TUI transcript rather than overwriting the composer, including worker-thread diagnostics. Warning-route installation and stderr fallback are serialized, drafts survive warning replay, and partial terminal setup failures restore raw mode. Console/standalone CLI diagnostics retain stderr output.
