@@ -8071,6 +8071,64 @@ fn resume_preserves_selected_provider_model_and_history() -> Result<()> {
 }
 
 #[test]
+fn resume_migrates_retired_codex_model_before_binding_the_route() -> Result<()> {
+    let _guard = env_lock();
+    let keys = [
+        "DEXT_PROVIDER",
+        "DEXT_PROFILE",
+        "DEXT_API_PROVIDER",
+        "DEXT_MODEL",
+        "DEXT_MODEL_CHATGPT",
+    ];
+    let previous = keys.map(std::env::var_os);
+    for key in keys {
+        unsafe { std::env::remove_var(key) };
+    }
+    let root = temp_test_dir("resume-retired-codex");
+    let path = root.join("session.jsonl");
+    let result = (|| -> Result<()> {
+        let catalog = provider::default_provider_catalog();
+        let profile = find_provider_profile(&catalog, "chatgpt").unwrap();
+        let agent_on_codex = |model: &str| {
+            let mut agent = test_agent(&root);
+            agent.provider_id = profile.id.clone();
+            agent.provider_profile = Some(profile.clone());
+            agent.api_provider = ApiProvider::ChatGpt;
+            agent.base_url = profile.base_url.clone();
+            agent.model = model.to_string();
+            agent
+        };
+        let mut saved = agent_on_codex("gpt-5.4-mini");
+        saved.history = vec![Message {
+            role: "assistant".into(),
+            content: vec![Block::ResponsesReasoning {
+                item: json!({
+                    "type": "reasoning", "id": "rs_old", "encrypted_content": "old-state", "summary": [],
+                }),
+            }],
+        }];
+        saved.save_session_to_path(&path)?;
+        let mut resumed = agent_on_codex("gpt-6.2-sol");
+        resumed.load_session_from_path(&path)?;
+        assert_eq!(resumed.model, "gpt-6-luna");
+        assert!(resumed.history.iter().flat_map(|message| &message.content).any(|block| {
+            matches!(block, Block::Text { text } if text.starts_with(PROVIDER_ROUTE_CONTINUATION_PREFIX))
+        }));
+        let (_, body) = resumed.build_streaming_request("sys", "env", &[], &[], "sess")?;
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body)?["model"],
+            "gpt-6-luna"
+        );
+        Ok(())
+    })();
+    for (key, value) in keys.into_iter().zip(previous) {
+        restore_env_var(key, value);
+    }
+    let _ = std::fs::remove_dir_all(root);
+    result
+}
+
+#[test]
 fn resume_fences_persisted_provider_reasoning_before_first_request() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("resume-provider-route-fence");
@@ -11934,11 +11992,11 @@ fn action_contract_violation_notes_loop_and_fallback_after_repeated_no_mutation(
 
     let notes = agent.action_contract_violation_runtime_notes(2, &mut fallback_emitted);
     assert!(fallback_emitted);
-    assert_eq!(agent.model, "gpt-5.4");
+    assert_eq!(agent.model, "gpt-6.2-sol");
     assert!(
         notes
             .iter()
-            .any(|note| note.contains("switched model to gpt-5.4")),
+            .any(|note| note.contains("switched model to gpt-6.2-sol")),
         "{notes:?}"
     );
 
@@ -22875,7 +22933,7 @@ fn responses_encrypted_reasoning_respects_route_at_off() -> Result<()> {
     agent.provider_id = profile.id.clone();
     agent.api_provider = profile.api_provider;
     agent.provider_profile = Some(profile);
-    for model in ["gpt-6.1-sol", "gpt-6-astra"] {
+    for model in ["gpt-6.2-astra", "gpt-6.2-sol", "gpt-6.1-sol", "gpt-6-astra"] {
         agent.model = model.to_string();
         for effort in [ThinkingEffort::Off, ThinkingEffort::Max] {
             agent.thinking_effort = effort;
@@ -26670,12 +26728,104 @@ fn builtin_chatgpt_profile_declares_codex_context_window() {
         Some(272_000),
         "ChatGPT default context window must come from the catalog as 272k (Codex)"
     );
-    assert_eq!(profile.default_model, "gpt-5.4");
-    // gpt-4.1 override should still be 1M via model_context_windows.
-    assert_eq!(
-        profile.model_context_windows.get("gpt-4.1").copied(),
-        Some(1_000_000)
+    assert_eq!(profile.default_model, "gpt-6.2-sol");
+    for (model, context) in [("gpt-6.2-sol", 500_000), ("gpt-6.2-astra", 272_000)] {
+        assert_eq!(
+            resolve_model_spec(&profile, model).context_window,
+            Some(context)
+        );
+    }
+    let models = provider::curated_provider_models(&profile);
+    assert!(
+        !models
+            .iter()
+            .any(|model| model == "gpt-5.4" || model == "gpt-4o")
     );
+    assert_eq!(
+        normalize_provider_model_value(&profile, "gpt-5-4"),
+        "gpt-6-sol"
+    );
+    assert_eq!(
+        normalize_provider_model_value(&profile, "gpt-5.4-mini"),
+        "gpt-6-luna"
+    );
+}
+
+#[test]
+fn retired_codex_selections_do_not_carry_model_metadata_to_replacements() {
+    let builtin = find_provider_profile(&provider::default_provider_catalog(), "chatgpt").unwrap();
+    let mut stored = builtin.clone();
+    stored.default_model = "gpt-5.4".into();
+    stored.models = vec![
+        "gpt-5.4".into(),
+        "gpt-5.5".into(),
+        "gpt-4o".into(),
+        "my-model".into(),
+    ];
+    stored.model_specs.insert(
+        "gpt-5.4".into(),
+        ModelSpec {
+            context_window: Some(123_000),
+            pricing: Some(ModelPricing {
+                input_usd_per_mtok: 0.0,
+                output_usd_per_mtok: 0.0,
+                cache_read_usd_per_mtok: 0.0,
+                cache_create_usd_per_mtok: 0.0,
+            }),
+            ..Default::default()
+        },
+    );
+    stored
+        .model_effort_levels
+        .insert("gpt-5.4".into(), vec!["high".into()]);
+    stored
+        .model_context_windows
+        .insert("gpt-5.4-mini".into(), 50_000);
+    let catalog = provider::normalize_provider_catalog(ProviderCatalog {
+        version: provider::default_provider_catalog_version(),
+        active_provider: "chatgpt".into(),
+        providers: vec![stored],
+    })
+    .unwrap();
+    let merged = find_provider_profile(&catalog, "chatgpt").unwrap();
+    assert_eq!(merged.default_model, "gpt-6-sol");
+    for slug in ["gpt-6-sol", "gpt-6-luna"] {
+        let before = resolve_model_spec(&builtin, slug);
+        let after = resolve_model_spec(&merged, slug);
+        assert_eq!(after.context_window, before.context_window);
+        assert_eq!(after.effort_levels, before.effort_levels);
+        assert_eq!(after.pricing, before.pricing);
+    }
+    let models = provider::curated_provider_models(&merged);
+    assert!(models.iter().any(|m| m == "my-model"));
+    assert!(
+        !models
+            .iter()
+            .any(|m| matches!(m.as_str(), "gpt-5.4" | "gpt-5.5" | "gpt-4o"))
+    );
+}
+
+#[test]
+fn gpt_6_2_platform_responses_prefix_stable_developer_instructions() {
+    for model in ["gpt-6.2-astra", "gpt-6.2-sol", "gpt-6.1-sol"] {
+        let body = build_responses_summary_body(
+            RequestContract::OpenAiResponses,
+            model,
+            "transcript",
+            None,
+            None,
+            4096,
+        );
+        if model.starts_with("gpt-6.2") {
+            assert!(body.get("instructions").is_none());
+            assert_eq!(body["input"][0]["role"], "developer");
+            assert_eq!(body["input"][0]["content"][0]["text"], COMPACT_SYSTEM);
+            assert_eq!(body["input"][1]["content"][0]["text"], "transcript");
+        } else {
+            assert_eq!(body["instructions"], COMPACT_SYSTEM);
+            assert_eq!(body["input"][0]["role"], "user");
+        }
+    }
 }
 
 #[test]
@@ -26755,7 +26905,7 @@ fn model_context_window_uses_builtin_chatgpt_profile_when_catalog_isolated() -> 
     }
 
     let result = {
-        assert_eq!(model_context_window("gpt-5.4"), 272_000);
+        assert_eq!(model_context_window("gpt-6.2-astra"), 272_000);
         for model in [
             "gpt-6-astra",
             "gpt-6-sol",
@@ -26979,20 +27129,23 @@ fn builtin_provider_merge_preserves_context_window_overrides() {
         .find(|p| p.id == "chatgpt")
         .expect("chatgpt profile");
     let mut stored = builtin.clone();
-    stored.default_model = "gpt-5-4".to_string();
+    stored.default_model = "gpt-6-1-sol".to_string();
     stored.context_window = Some(300_000);
     stored
         .model_context_windows
-        .insert("gpt-5-4".to_string(), 350_000);
+        .insert("gpt-6-1-sol".to_string(), 350_000);
     stored
         .model_context_windows
-        .insert("gpt-5.4-mini".to_string(), 180_000);
+        .insert("gpt-6-luna".to_string(), 180_000);
     let merged = merge_provider_profile(builtin, stored);
-    assert_eq!(merged.default_model, "gpt-5.4");
+    assert_eq!(merged.default_model, "gpt-6.1-sol");
     assert_eq!(merged.context_window, Some(300_000));
-    assert_eq!(merged.model_context_windows.get("gpt-5.4"), Some(&350_000));
     assert_eq!(
-        merged.model_context_windows.get("gpt-5.4-mini"),
+        merged.model_context_windows.get("gpt-6.1-sol"),
+        Some(&350_000)
+    );
+    assert_eq!(
+        merged.model_context_windows.get("gpt-6-luna"),
         Some(&180_000)
     );
 }
@@ -27085,9 +27238,9 @@ fn builtin_provider_merge_drops_foreign_builtin_models_from_non_chatgpt_profiles
         .find(|p| p.id == "glm")
         .expect("glm profile");
     let mut stored = builtin.clone();
-    stored.models.push("gpt-5.4".to_string());
+    stored.models.push("gpt-6.2-sol".to_string());
     let merged = merge_provider_profile(builtin, stored);
-    assert!(!merged.models.iter().any(|m| m == "gpt-5.4"));
+    assert!(!merged.models.iter().any(|m| m == "gpt-6.2-sol"));
 }
 
 #[test]
@@ -28397,7 +28550,12 @@ fn usage_pricing_for_local_provider_is_zero_cost() {
 
 #[test]
 fn gpt_6_1_cached_pricing_and_tier_boundary() {
-    for (model, cache_price) in [("gpt-6.1-sol", 0.1), ("gpt-6.1-terra", 0.05)] {
+    for (model, cache_price) in [
+        ("gpt-6.2-astra", 0.4),
+        ("gpt-6.2-sol", 0.1),
+        ("gpt-6.1-sol", 0.1),
+        ("gpt-6.1-terra", 0.05),
+    ] {
         let pricing = usage_pricing_default_for(
             "openai",
             ApiProvider::OpenAi,
@@ -28434,6 +28592,8 @@ fn openai_responses_pricing_applies_documented_long_context_tier() {
         cost_usd: None,
     };
     for (model, expected) in [
+        ("gpt-6.2-astra", 10.8),
+        ("gpt-6.2-sol", 2.7),
         ("gpt-6.1-sol", 2.7),
         ("gpt-6.1-terra", 1.35),
         ("gpt-6-astra", 13.5),
@@ -28533,6 +28693,7 @@ fn anthropic_generation_pricing_matches_published_rates() {
     };
     for (model, input, output, cache_read, cache_create) in [
         ("claude-sonnet-5", 2.0, 10.0, 0.2, 2.5),
+        ("claude-fable-5-2", 8.0, 40.0, 0.2, 10.0),
         ("claude-opus-5-5", 4.0, 20.0, 0.2, 5.0),
         ("claude-opus-5.5", 4.0, 20.0, 0.2, 5.0),
         ("claude-opus-5", 5.0, 25.0, 0.5, 6.25),
@@ -29724,7 +29885,7 @@ fn global_model_override_respects_provider_compatibility() -> Result<()> {
     let result = (|| -> Result<()> {
         let resolved = resolve_runtime_provider(None, false)?;
         assert_eq!(resolved.profile.id, "chatgpt");
-        assert_eq!(resolved.model, "gpt-5.4");
+        assert_eq!(resolved.model, "gpt-6.2-sol");
 
         unsafe {
             std::env::set_var("DEXT_MODEL_CHATGPT", "gpt-4o");
@@ -30658,13 +30819,13 @@ fn resolve_provider_model_selection_prefers_authenticated_provider_matches() -> 
         );
         save_auth_store(&store)?;
 
-        let selection = resolve_provider_model_selection(&catalog, &store, "glm", "gpt-4o")?;
+        let selection = resolve_provider_model_selection(&catalog, &store, "glm", "gpt-6.2-astra")?;
         assert_eq!(selection.provider_id, "chatgpt");
-        assert_eq!(selection.model, "gpt-4o");
+        assert_eq!(selection.model, "gpt-6.2-astra");
 
-        let compact = resolve_provider_model_selection(&catalog, &store, "glm", "gpt5.3codex")?;
+        let compact = resolve_provider_model_selection(&catalog, &store, "glm", "gpt62sol")?;
         assert_eq!(compact.provider_id, "chatgpt");
-        assert_eq!(compact.model, "gpt-5.3-codex");
+        assert_eq!(compact.model, "gpt-6.2-sol");
 
         let glm = resolve_provider_model_selection(&catalog, &store, "chatgpt", "glm 5.1")?;
         assert_eq!(glm.provider_id, "glm");
@@ -30699,7 +30860,7 @@ fn resolve_provider_model_selection_prefers_authenticated_provider_matches() -> 
         let explicit =
             resolve_provider_model_selection(&catalog, &store, "glm", "chatgpt/gpt-5-4")?;
         assert_eq!(explicit.provider_id, "chatgpt");
-        assert_eq!(explicit.model, "gpt-5.4");
+        assert_eq!(explicit.model, "gpt-6-sol");
 
         store.providers.insert(
             "openai".to_string(),
@@ -30931,7 +31092,8 @@ fn list_models_for_available_providers_shows_authenticated_sections() -> Result<
         assert!(rendered.contains("- glm-5.3-flash"), "{rendered}");
         assert!(rendered.contains("- glm-5.3-flash[1m]"), "{rendered}");
         assert!(rendered.contains("- glm-4.6"), "{rendered}");
-        assert!(rendered.contains("- gpt-4o"), "{rendered}");
+        assert!(rendered.contains("- gpt-6.2-sol"), "{rendered}");
+        assert!(!rendered.contains("- gpt-4o"), "{rendered}");
         Ok(())
     })();
 
@@ -31898,9 +32060,9 @@ fn handle_slash_model_switches_provider_when_model_belongs_elsewhere() -> Result
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         agent.set_sink(Box::new(ChannelSink { tx }));
 
-        assert_eq!(handle_slash("/model gpt-4o", &mut agent), Some(true));
+        assert_eq!(handle_slash("/model gpt-6.2-sol", &mut agent), Some(true));
         assert_eq!(agent.provider_id, "chatgpt");
-        assert_eq!(agent.model, "gpt-4o");
+        assert_eq!(agent.model, "gpt-6.2-sol");
         assert_eq!(
             agent
                 .history
@@ -31931,7 +32093,7 @@ fn handle_slash_model_switches_provider_when_model_belongs_elsewhere() -> Result
         assert!(slash.contains("provider -> chatgpt"), "{slash}");
         assert_eq!(
             diagnostics,
-            Some(("chatgpt".to_string(), "gpt-4o".to_string()))
+            Some(("chatgpt".to_string(), "gpt-6.2-sol".to_string()))
         );
 
         // Native readers may keep the old catalog open across atomic publication.
@@ -32133,7 +32295,12 @@ fn provider_catalog_v1_migrates_builtin_metadata_and_current_overrides_it() {
         ] {
             assert!(profile.models.iter().any(|candidate| candidate == model));
             let spec = resolve_model_spec(profile, model);
-            assert_eq!(spec.context_window, Some(1_050_000), "{model}");
+            let context = if profile.id == "chatgpt" && model == "gpt-6.1-sol" {
+                500_000
+            } else {
+                1_050_000
+            };
+            assert_eq!(spec.context_window, Some(context), "{model}");
             assert_eq!(spec.max_output_tokens, Some(128_000), "{model}");
             assert!(spec.tools && spec.reasoning && spec.image_input && spec.prompt_cache);
             assert_eq!(spec.effort_levels, efforts, "{model}");
@@ -32202,7 +32369,7 @@ fn provider_catalog_v1_migrates_builtin_metadata_and_current_overrides_it() {
         "gpt-5.6-sol"
     );
     assert_eq!(
-        resolve_model_spec(&migrated, "gpt-5.4").max_output_tokens,
+        resolve_model_spec(&migrated, "custom-compact").max_output_tokens,
         Some(8_192)
     );
 
@@ -32214,7 +32381,7 @@ fn provider_catalog_v1_migrates_builtin_metadata_and_current_overrides_it() {
     explicit.model_defaults.max_output_tokens = Some(1_234);
     explicit.model_defaults.capabilities.tools = Some(false);
     explicit.model_specs.insert(
-        "gpt-5.4".to_string(),
+        "custom-compact".to_string(),
         ModelSpec {
             pricing: Some(ModelPricing {
                 input_usd_per_mtok: 2.0,
@@ -32241,7 +32408,7 @@ fn provider_catalog_v1_migrates_builtin_metadata_and_current_overrides_it() {
         normalize_provider_model_value(&explicit, "fast"),
         "custom-fast"
     );
-    let spec = resolve_model_spec(&explicit, "gpt-5.4");
+    let spec = resolve_model_spec(&explicit, "custom-compact");
     assert_eq!(spec.max_output_tokens, Some(1_234));
     assert!(!spec.tools);
     assert_eq!(
@@ -32278,6 +32445,8 @@ fn openai_responses_routing_is_official_openai_only() -> Result<()> {
         .find(|profile| profile.id == "openai")
         .expect("openai profile");
     for model in [
+        "gpt-6.2-astra",
+        "gpt-6.2-sol",
         "gpt-6.1-sol",
         "gpt-6.1-terra",
         "gpt-6-astra",
@@ -32299,6 +32468,7 @@ fn openai_responses_routing_is_official_openai_only() -> Result<()> {
         ("https://api.openai.com", "gpt-5.60"),
         ("https://api.openai.com", "gpt-5.6-preview"),
         ("https://api.openai.com", "gpt-5.6-terrra"),
+        ("https://api.openai.com", "gpt-6.2-sol-preview"),
         ("https://api.openai.com", "gpt-6.1-sol-preview"),
         ("https://api.openai.com", "gpt-6.1-terra-preview"),
         ("https://api.openai.com", "gpt-6.1-astra"),
@@ -32399,7 +32569,7 @@ fn request_capabilities_and_pricing_come_from_active_profile_metadata() -> Resul
         .expect("chatgpt profile");
     let spec = profile
         .model_specs
-        .entry("gpt-5.4".to_string())
+        .entry("gpt-6.2-sol".to_string())
         .or_default();
     spec.max_output_tokens = Some(1_234);
     spec.capabilities = ModelCapabilities {
@@ -32418,7 +32588,7 @@ fn request_capabilities_and_pricing_come_from_active_profile_metadata() -> Resul
     let mut agent = test_agent(&root);
     agent.provider_id = profile.id.clone();
     agent.base_url = profile.base_url.clone();
-    agent.model = "gpt-5.4".to_string();
+    agent.model = "gpt-6.2-sol".to_string();
     agent.api_provider = ApiProvider::Anthropic;
     agent.provider_profile = Some(profile);
     agent.thinking_effort = ThinkingEffort::XHigh;
@@ -32426,7 +32596,7 @@ fn request_capabilities_and_pricing_come_from_active_profile_metadata() -> Resul
     agent
         .provider_profile
         .as_mut()
-        .and_then(|profile| profile.model_specs.get_mut("gpt-5.4"))
+        .and_then(|profile| profile.model_specs.get_mut("gpt-6.2-sol"))
         .expect("ChatGPT model spec")
         .effort_levels = vec!["low".to_string()];
     agent.thinking_effort = ThinkingEffort::Max;
@@ -32437,7 +32607,7 @@ fn request_capabilities_and_pricing_come_from_active_profile_metadata() -> Resul
     agent
         .provider_profile
         .as_mut()
-        .and_then(|profile| profile.model_specs.get_mut("gpt-5.4"))
+        .and_then(|profile| profile.model_specs.get_mut("gpt-6.2-sol"))
         .expect("ChatGPT model spec")
         .capabilities
         .reasoning = Some(false);
@@ -32674,11 +32844,11 @@ fn implementation_model_fallback_switches_codex_53_to_default() {
     let mut fallback_emitted = false;
     let notes = agent.action_contract_violation_runtime_notes(2, &mut fallback_emitted);
     assert!(fallback_emitted);
-    assert_eq!(agent.model, "gpt-5.4");
+    assert_eq!(agent.model, "gpt-6.2-sol");
     assert!(
         notes
             .iter()
-            .any(|note| note.contains("switched model to gpt-5.4")),
+            .any(|note| note.contains("switched model to gpt-6.2-sol")),
         "{notes:?}"
     );
     assert!(
@@ -32696,7 +32866,7 @@ fn implementation_model_fallback_switches_codex_53_to_default() {
             .session_model_pins
             .get(&canonical_provider_id("chatgpt"))
             .map(String::as_str),
-        Some("gpt-5.4")
+        Some("gpt-6.2-sol")
     );
 
     let _ = std::fs::remove_dir_all(&root);
@@ -33199,11 +33369,13 @@ fn claude_anthropic_streaming_request_uses_adaptive_thinking_output_config() -> 
         ("claude-opus-4-8", ThinkingEffort::XHigh, "xhigh"),
         ("claude-opus-5-5", ThinkingEffort::Off, "low"),
         ("claude-opus-5.5", ThinkingEffort::Off, "low"),
-        ("claude-opus-5-5", ThinkingEffort::XHigh, "high"),
+        ("claude-opus-5-5", ThinkingEffort::XHigh, "xhigh"),
         ("claude-opus-5-5", ThinkingEffort::Max, "max"),
+        ("claude-fable-5-2", ThinkingEffort::Off, "low"),
+        ("claude-fable-5-2", ThinkingEffort::XHigh, "xhigh"),
         ("claude-fable-5-1", ThinkingEffort::Off, "low"),
         ("claude-fable-5.1", ThinkingEffort::Off, "low"),
-        ("claude-fable-5-1", ThinkingEffort::XHigh, "high"),
+        ("claude-fable-5-1", ThinkingEffort::XHigh, "xhigh"),
         ("claude-fable-5-1", ThinkingEffort::Max, "max"),
         ("claude-opus-5", ThinkingEffort::XHigh, "xhigh"),
         ("claude-opus-5", ThinkingEffort::Max, "max"),
@@ -33288,7 +33460,10 @@ fn anthropic_builtin_catalog_lists_generation_5_models() {
         }
         if matches!(model, "claude-opus-5-5" | "claude-fable-5-1") {
             let spec = resolve_model_spec(&profile, model);
-            assert_eq!(spec.effort_levels, ["low", "medium", "high", "max"]);
+            assert_eq!(
+                spec.effort_levels,
+                ["low", "medium", "high", "xhigh", "max"]
+            );
         }
     }
 }
@@ -33309,7 +33484,7 @@ fn kimi_builtin_metadata_is_isolated_from_existing_provider_profiles() {
             ApiProvider::ChatGpt,
             RequestContract::ChatGptResponses,
             "https://chatgpt.com/backend-api/codex",
-            "gpt-5.4",
+            "gpt-6.2-sol",
         ),
         (
             "openai",
@@ -33615,7 +33790,7 @@ fn official_kimi_k3_request_uses_adaptive_thinking_and_empty_signatures_only_the
             content: vec![
                 Block::Thinking {
                     text: "reasoning".to_string(),
-                    signature: Some(String::new()),
+                    signature: None,
                 },
                 Block::ToolUse {
                     id: "call_1".to_string(),
@@ -35358,12 +35533,18 @@ async fn chatgpt_compact_summary_honors_summary_model_reasoning_capability() {
     });
 
     let mut agent = test_agent(&root);
-    let profile = built_in_provider_profiles()
+    let mut profile = built_in_provider_profiles()
         .into_iter()
         .find(|profile| profile.id == "chatgpt")
         .expect("chatgpt profile");
     agent.provider_id = profile.id.clone();
     agent.api_provider = profile.api_provider;
+    profile
+        .model_specs
+        .entry("gpt-4o".to_string())
+        .or_default()
+        .capabilities
+        .reasoning = Some(false);
     agent.provider_profile = Some(profile);
     agent.base_url = format!("http://{addr}");
     agent.model = "gpt-5.4".to_string();

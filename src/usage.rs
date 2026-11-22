@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::provider::{
-    ApiProvider, ModelPricing, is_claude_fable_5_1_model, is_claude_haiku_5_5_model,
-    is_claude_opus_5_5_model, is_claude_sonnet_5_5_model,
+    ApiProvider, ModelPricing, is_claude_fable_5_1_model, is_claude_fable_5_2_model,
+    is_claude_haiku_5_5_model, is_claude_opus_5_5_model, is_claude_sonnet_5_5_model,
 };
 use crate::{anthropic_prompt_cache_supported, canonical_provider_id, is_openai_responses_model};
 
@@ -413,7 +413,9 @@ pub(crate) fn normalize_price_model(model: &str) -> String {
 }
 
 pub(crate) fn openai_pricing(model: &str) -> Option<UsagePricing> {
-    if model == "gpt-6.1-sol" {
+    if model == "gpt-6.2-astra" {
+        Some(UsagePricing::new(8.0, 40.0, 0.4, 10.0))
+    } else if matches!(model, "gpt-6.2-sol" | "gpt-6.1-sol") {
         Some(UsagePricing::new(2.0, 10.0, 0.1, 2.5))
     } else if model == "gpt-6.1-terra" {
         Some(UsagePricing::new(1.0, 5.0, 0.05, 1.25))
@@ -478,7 +480,9 @@ pub(crate) fn anthropic_pricing(model: &str) -> Option<UsagePricing> {
     if model.starts_with("glm-") {
         return Some(UsagePricing::default());
     }
-    if is_claude_fable_5_1_model(model) {
+    if is_claude_fable_5_2_model(model) {
+        Some(UsagePricing::new(8.0, 40.0, 0.2, 10.0))
+    } else if is_claude_fable_5_1_model(model) {
         Some(UsagePricing::new(10.0, 50.0, 0.25, 12.5))
     } else if model.contains("fable") {
         Some(UsagePricing::new(10.0, 50.0, 1.0, 12.5))

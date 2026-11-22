@@ -352,45 +352,36 @@ fn checkpoints_manifest_dir(git_root: &Path) -> PathBuf {
 }
 
 fn private_dir_owned_by_current_user(metadata: &std::fs::Metadata) -> bool {
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return false;
-    }
+    let is_directory = !metadata.file_type().is_symlink() && metadata.is_dir();
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
-        if metadata.uid() != unsafe { libc::geteuid() } {
-            return false;
-        }
+        is_directory && metadata.uid() == unsafe { libc::geteuid() }
     }
-    true
+    #[cfg(not(unix))]
+    is_directory
 }
 
 fn safe_checkpoint_storage_parent_metadata(metadata: &std::fs::Metadata) -> bool {
-    if !private_dir_owned_by_current_user(metadata) {
-        return false;
-    }
+    let owned = private_dir_owned_by_current_user(metadata);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        if metadata.permissions().mode() & 0o022 != 0 {
-            return false;
-        }
+        owned && metadata.permissions().mode() & 0o022 == 0
     }
-    true
+    #[cfg(not(unix))]
+    owned
 }
 
 fn safe_private_dir_metadata(metadata: &std::fs::Metadata) -> bool {
-    if !private_dir_owned_by_current_user(metadata) {
-        return false;
-    }
+    let owned = private_dir_owned_by_current_user(metadata);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        if metadata.permissions().mode() & 0o077 != 0 {
-            return false;
-        }
+        owned && metadata.permissions().mode() & 0o077 == 0
     }
-    true
+    #[cfg(not(unix))]
+    owned
 }
 
 fn ensure_private_dir(path: &Path) -> Result<(), String> {
@@ -541,33 +532,27 @@ fn checkpoint_storage_exists(git_root: &Path) -> Result<bool, String> {
 }
 
 fn safe_single_link_file_metadata(metadata: &std::fs::Metadata) -> bool {
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return false;
-    }
+    let is_file = !metadata.file_type().is_symlink() && metadata.is_file();
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
-        if metadata.nlink() != 1 {
-            return false;
-        }
+        is_file && metadata.nlink() == 1
     }
-    true
+    #[cfg(not(unix))]
+    is_file
 }
 
 fn safe_private_file_metadata(metadata: &std::fs::Metadata) -> bool {
-    if !safe_single_link_file_metadata(metadata) {
-        return false;
-    }
+    let is_file = safe_single_link_file_metadata(metadata);
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-        if metadata.uid() != unsafe { libc::geteuid() }
-            || metadata.permissions().mode() & 0o077 != 0
-        {
-            return false;
-        }
+        is_file
+            && metadata.uid() == unsafe { libc::geteuid() }
+            && metadata.permissions().mode() & 0o077 == 0
     }
-    true
+    #[cfg(not(unix))]
+    is_file
 }
 
 fn checkpoint_private_file_integrity(

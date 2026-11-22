@@ -22578,8 +22578,8 @@ mod tests {
         }
 
         let mut state = TuiState::new(
-            "gpt-5.4".to_string(),
-            model_context_window("gpt-5.4"),
+            "gpt-6.2-astra".to_string(),
+            model_context_window("gpt-6.2-astra"),
             ".".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
@@ -22710,11 +22710,11 @@ mod tests {
             let completions = model_arg_completions("");
             let texts: Vec<String> = completions.into_iter().map(|c| c.text).collect();
             assert!(
-                texts.iter().any(|t| t == "/model chatgpt/gpt-4o"),
+                texts.iter().any(|t| t == "/model chatgpt/gpt-6.2-astra"),
                 "{texts:?}"
             );
             assert!(
-                texts.iter().any(|t| t == "/model chatgpt/gpt-5.4"),
+                texts.iter().any(|t| t == "/model chatgpt/gpt-6.2-sol"),
                 "{texts:?}"
             );
             assert!(texts.iter().any(|t| t == "/model glm-5.1"), "{texts:?}");

@@ -50,17 +50,18 @@ use provider::{
     build_chatgpt_request, build_chatgpt_summary_request, build_openai_responses_request,
     built_in_provider_profiles, cancel_pending_oauth_login, canonical_provider_id,
     effective_request_contract, extract_oauth_code_from_callback, find_provider_profile,
-    handle_auth_cli, is_claude_fable_5_1_model, is_claude_haiku_5_5_model,
-    is_claude_opus_5_5_model, is_claude_sonnet_5_5_model, is_glm_5_3_model, is_gpt_5_6_model,
-    is_gpt_6_model, is_gpt_6_responses_tools_only_model, is_gpt_6_sol_or_luna_model,
-    is_kimi_adaptive_model, is_official_anthropic_profile, is_official_kimi_profile,
-    is_openai_responses_model, list_models_for_available_providers, list_models_for_provider,
-    load_auth_store, load_provider_catalog, login_provider, logout_provider,
-    looks_like_login_secret_input, normalize_provider_model_value, official_openai_responses_model,
-    provider_auth_status, provider_catalog_path, provider_id_from_selector, provider_request_url,
-    refresh_local_llama_context_window, render_provider_list, render_provider_picker,
-    request_contract_for_profile, resolve_active_provider_id, resolve_model_spec,
-    resolve_provider_model_selection, resolve_runtime_provider, set_active_provider_in_catalog,
+    handle_auth_cli, is_claude_fable_5_1_model, is_claude_fable_5_2_model,
+    is_claude_haiku_5_5_model, is_claude_opus_5_5_model, is_claude_sonnet_5_5_model,
+    is_glm_5_3_model, is_gpt_5_6_model, is_gpt_6_model, is_gpt_6_responses_tools_only_model,
+    is_gpt_6_sol_or_luna_model, is_kimi_adaptive_model, is_official_anthropic_profile,
+    is_official_kimi_profile, is_openai_responses_model, list_models_for_available_providers,
+    list_models_for_provider, load_auth_store, load_provider_catalog, login_provider,
+    logout_provider, looks_like_login_secret_input, normalize_provider_model_value,
+    official_openai_responses_model, provider_auth_status, provider_catalog_path,
+    provider_id_from_selector, provider_request_url, refresh_local_llama_context_window,
+    render_provider_list, render_provider_picker, request_contract_for_profile,
+    resolve_active_provider_id, resolve_model_spec, resolve_provider_model_selection,
+    resolve_runtime_provider, set_active_provider_in_catalog,
     set_provider_default_model_in_catalog, try_complete_oauth_from_callback,
 };
 #[cfg(unix)]
@@ -2771,12 +2772,13 @@ fn sanitize_anthropic_messages(
                             metadata: ToolResultMetadata::default(),
                         }),
                         Block::Thinking { text, signature } => {
-                            let signature = signature.as_ref().filter(|signature| {
-                                allow_empty_thinking_signature || !signature.is_empty()
-                            })?;
-                            preserve_thinking.then_some(Block::Thinking {
+                            // A stream with no signature can still be replayed on Kimi Code.
+                            let signature = signature.as_deref().unwrap_or_default();
+                            (preserve_thinking
+                                && (allow_empty_thinking_signature || !signature.is_empty()))
+                            .then(|| Block::Thinking {
                                 text: text.clone(),
-                                signature: Some(signature.clone()),
+                                signature: Some(signature.to_string()),
                             })
                         }
                         Block::RedactedThinking { data } => (preserve_thinking && !data.is_empty())
@@ -3311,27 +3313,19 @@ fn provider_model_output_config_effort(
 }
 
 fn anthropic_always_adaptive_effort(model: &str, effort: ThinkingEffort) -> Option<String> {
-    if is_claude_sonnet_5_5_model(model) {
-        return Some(
-            match effort {
-                ThinkingEffort::Off | ThinkingEffort::Minimal | ThinkingEffort::Low => "low",
-                ThinkingEffort::Medium => "medium",
-                ThinkingEffort::High => "high",
-                ThinkingEffort::XHigh => "xhigh",
-                ThinkingEffort::Max => "max",
-            }
-            .to_string(),
-        );
-    }
-    let always_adaptive = is_claude_opus_5_5_model(model) || is_claude_fable_5_1_model(model);
-    if !always_adaptive {
+    if !(is_claude_sonnet_5_5_model(model)
+        || is_claude_opus_5_5_model(model)
+        || is_claude_fable_5_1_model(model)
+        || is_claude_fable_5_2_model(model))
+    {
         return None;
     }
     Some(
         match effort {
             ThinkingEffort::Off | ThinkingEffort::Minimal | ThinkingEffort::Low => "low",
             ThinkingEffort::Medium => "medium",
-            ThinkingEffort::High | ThinkingEffort::XHigh => "high",
+            ThinkingEffort::High => "high",
+            ThinkingEffort::XHigh => "xhigh",
             ThinkingEffort::Max => "max",
         }
         .to_string(),
@@ -3385,8 +3379,7 @@ fn anthropic_output_config_effort(model: &str, effort: ThinkingEffort) -> Option
     Some(effort.to_string())
 }
 
-// Effort availability follows the official effort doc and Models API: Sonnet/Haiku
-// 5.5 support xhigh/max; Opus 5.5 and Fable 5.1 support low/medium/high/max.
+// Claude 5.5 and Fable 5.1/5.2 support all five effort levels.
 // Earlier xhigh models include Sonnet 5, Opus 4.7/4.8/5, and Fable 5;
 // max additionally covers the 4.6 generation.
 fn anthropic_model_supports_xhigh_effort(model: &str) -> bool {
@@ -3395,7 +3388,7 @@ fn anthropic_model_supports_xhigh_effort(model: &str) -> bool {
         return true;
     }
     if anthropic_always_adaptive_effort(&model, ThinkingEffort::XHigh).is_some() {
-        return false;
+        return true;
     }
     model.contains("opus-4-7")
         || model.contains("opus-4.7")
@@ -18452,7 +18445,9 @@ impl Agent {
             && provider_id == saved_provider_id
             && self.api_provider == provenance.api_provider
         {
-            self.model = if self.deepseek_chat_enabled() {
+            self.model = if self.deepseek_chat_enabled()
+                || self.request_contract() == RequestContract::ChatGptResponses
+            {
                 self.provider_profile
                     .as_ref()
                     .map_or(model.clone(), |profile| {
@@ -22904,20 +22899,17 @@ fn project_extensions_approval_path(root: &Path) -> PathBuf {
 }
 
 fn project_extensions_approval_metadata_is_private(metadata: &std::fs::Metadata) -> bool {
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return false;
-    }
+    let is_file = !metadata.file_type().is_symlink() && metadata.is_file();
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-        if metadata.uid() != unsafe { libc::geteuid() }
-            || metadata.nlink() != 1
-            || metadata.permissions().mode() & 0o077 != 0
-        {
-            return false;
-        }
+        is_file
+            && metadata.uid() == unsafe { libc::geteuid() }
+            && metadata.nlink() == 1
+            && metadata.permissions().mode() & 0o077 == 0
     }
-    true
+    #[cfg(not(unix))]
+    is_file
 }
 
 fn project_extensions_always_approved(root: &Path) -> bool {

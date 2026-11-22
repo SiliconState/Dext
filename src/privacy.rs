@@ -289,12 +289,8 @@ pub(crate) fn slash_login_contains_secret(trimmed: &str) -> bool {
     }
     let secret = args[1..].join(" ");
     let lowered = secret.trim().to_ascii_lowercase();
-    if provider::login_arg_requests_web_flow(&lowered)
-        || provider::login_arg_requests_import(&lowered)
-    {
-        return false;
-    }
-    true
+    !(provider::login_arg_requests_web_flow(&lowered)
+        || provider::login_arg_requests_import(&lowered))
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
