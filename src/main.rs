@@ -22899,20 +22899,17 @@ fn project_extensions_approval_path(root: &Path) -> PathBuf {
 }
 
 fn project_extensions_approval_metadata_is_private(metadata: &std::fs::Metadata) -> bool {
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return false;
-    }
+    let is_file = !metadata.file_type().is_symlink() && metadata.is_file();
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-        if metadata.uid() != unsafe { libc::geteuid() }
-            || metadata.nlink() != 1
-            || metadata.permissions().mode() & 0o077 != 0
-        {
-            return false;
-        }
+        is_file
+            && metadata.uid() == unsafe { libc::geteuid() }
+            && metadata.nlink() == 1
+            && metadata.permissions().mode() & 0o077 == 0
     }
-    true
+    #[cfg(not(unix))]
+    is_file
 }
 
 fn project_extensions_always_approved(root: &Path) -> bool {
