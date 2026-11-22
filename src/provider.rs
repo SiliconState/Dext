@@ -473,6 +473,22 @@ fn openai_responses_model_specs(
     );
     let mut specs = HashMap::from([
         (
+            "gpt-6.2-astra".to_string(),
+            spec(
+                &["low", "medium", "high", "xhigh", "max"],
+                &[],
+                model_pricing(8.0, 40.0, 0.4, 10.0),
+            ),
+        ),
+        (
+            "gpt-6.2-sol".to_string(),
+            spec(
+                &["low", "medium", "high", "xhigh", "max"],
+                &[],
+                model_pricing(2.0, 10.0, 0.1, 2.5),
+            ),
+        ),
+        (
             "gpt-6.1-terra".to_string(),
             spec(
                 &["none", "low", "medium", "high", "xhigh", "max"],
@@ -547,6 +563,10 @@ fn model_has_family_fragment(model: &str, fragments: &[&str]) -> bool {
     })
 }
 
+pub(crate) fn is_claude_fable_5_2_model(model: &str) -> bool {
+    model_has_family_fragment(model, &["fable-5-2", "fable-5.2", "fable5.2"])
+}
+
 pub(crate) fn is_claude_fable_5_1_model(model: &str) -> bool {
     model_has_family_fragment(model, &["fable-5-1", "fable-5.1", "fable5.1"])
 }
@@ -618,6 +638,9 @@ fn builtin_model_pricing(provider_id: &str, model: &str) -> Option<ModelPricing>
         }
         "glm" => Some(model_pricing(1.0, 5.0, 0.1, 1.25)),
         "deepseek" => deepseek_model_pricing(&model),
+        "anthropic" if is_claude_fable_5_2_model(&model) => {
+            Some(model_pricing(8.0, 40.0, 0.2, 10.0))
+        }
         "anthropic" if is_claude_fable_5_1_model(&model) => {
             Some(model_pricing(10.0, 50.0, 0.25, 12.5))
         }
@@ -732,7 +755,9 @@ fn hydrate_builtin_model_specs(profiles: &mut [ProviderProfile]) {
         for model in profile.models.clone() {
             let normalized = model.to_ascii_lowercase();
             let mut spec = profile.model_specs.remove(&normalized).unwrap_or_default();
-            spec.pricing = builtin_model_pricing(&provider_id, &normalized);
+            spec.pricing = spec
+                .pricing
+                .or_else(|| builtin_model_pricing(&provider_id, &normalized));
             if provider_id == "glm" {
                 spec.capabilities.image_input = Some(matches!(
                     normalized.trim_end_matches("[1m]"),
@@ -796,6 +821,17 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
         },
         ..Default::default()
     };
+    let mut codex_specs = openai_responses_model_specs(false, false);
+    for (model, window) in [
+        ("gpt-6.2-sol", 500_000),
+        ("gpt-6.2-astra", 272_000),
+        ("gpt-6.1-sol", 500_000),
+    ] {
+        codex_specs
+            .get_mut(model)
+            .expect("listed Codex model")
+            .context_window = Some(window);
+    }
     let mut profiles = vec![
         ProviderProfile {
             id: "glm".to_string(),
@@ -873,8 +909,10 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
             display_name: "ChatGPT".to_string(),
             api_provider: ApiProvider::ChatGpt,
             base_url: "https://chatgpt.com/backend-api/codex".to_string(),
-            default_model: "gpt-5.4".to_string(),
+            default_model: CHATGPT_DEFAULT_MODEL.to_string(),
             models: vec![
+                "gpt-6.2-sol".to_string(),
+                "gpt-6.2-astra".to_string(),
                 "gpt-6.1-sol".to_string(),
                 "gpt-6.1-terra".to_string(),
                 "gpt-6-astra".to_string(),
@@ -883,20 +921,6 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
                 "gpt-5.6-sol".to_string(),
                 "gpt-5.6-terra".to_string(),
                 "gpt-5.6-luna".to_string(),
-                "gpt-5.4".to_string(),
-                "gpt-5.4-mini".to_string(),
-                "gpt-5.5".to_string(),
-                "gpt-5.3-codex".to_string(),
-                "gpt-5.3-codex-spark".to_string(),
-                "gpt-5-codex".to_string(),
-                "gpt-5".to_string(),
-                "gpt-5-mini".to_string(),
-                "gpt-4.1".to_string(),
-                "gpt-4o".to_string(),
-                "gpt-4o-mini".to_string(),
-                "o3".to_string(),
-                "o3-mini".to_string(),
-                "o4-mini".to_string(),
             ],
             env_vars: vec!["CHATGPT_ACCESS_TOKEN".to_string()],
             requires_api_key: true,
@@ -916,21 +940,16 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
                     .to_string(),
             ),
             context_window: Some(272_000),
-            model_context_windows: {
-                let mut m = HashMap::new();
-                m.insert("gpt-4.1".to_string(), 1_000_000);
-                m.insert("gpt-4o".to_string(), 128_000);
-                m.insert("gpt-4o-mini".to_string(), 128_000);
-                m
-            },
+            model_context_windows: HashMap::new(),
             model_effort_levels: HashMap::new(),
             request_contract: Some(RequestContract::ChatGptResponses),
-            model_aliases: HashMap::from([(
-                "gpt-5.6".to_string(),
-                "gpt-5.6-sol".to_string(),
-            )]),
+            model_aliases: HashMap::from([
+                ("gpt-5.6".to_string(), "gpt-5.6-sol".to_string()),
+                ("gpt-5.4".to_string(), "gpt-6-sol".to_string()),
+                ("gpt-5.4-mini".to_string(), "gpt-6-luna".to_string()),
+            ]),
             model_defaults: ModelSpec::default(),
-            model_specs: openai_responses_model_specs(false, false),
+            model_specs: codex_specs,
         },
         ProviderProfile {
             id: "openai".to_string(),
@@ -940,6 +959,8 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
             base_url: "https://api.openai.com".to_string(),
             default_model: "gpt-5".to_string(),
             models: vec![
+                "gpt-6.2-sol".to_string(),
+                "gpt-6.2-astra".to_string(),
                 "gpt-6.1-sol".to_string(),
                 "gpt-6.1-terra".to_string(),
                 "gpt-6-astra".to_string(),
@@ -983,6 +1004,8 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
                 ("gpt56sol".to_string(), "gpt-5.6-sol".to_string()),
                 ("gpt56terra".to_string(), "gpt-5.6-terra".to_string()),
                 ("gpt56luna".to_string(), "gpt-5.6-luna".to_string()),
+                ("gpt62astra".to_string(), "gpt-6.2-astra".to_string()),
+                ("gpt62sol".to_string(), "gpt-6.2-sol".to_string()),
                 ("gpt61sol".to_string(), "gpt-6.1-sol".to_string()),
                 ("gpt61terra".to_string(), "gpt-6.1-terra".to_string()),
                 ("gpt6astra".to_string(), "gpt-6-astra".to_string()),
@@ -1009,6 +1032,7 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
                 "claude-opus-4-8".to_string(),
                 "claude-opus-4-7".to_string(),
                 "claude-opus-4-6".to_string(),
+                "claude-fable-5-2".to_string(),
                 "claude-fable-5-1".to_string(),
                 "claude-fable-5".to_string(),
                 "claude-sonnet-4-5".to_string(),
@@ -1044,6 +1068,7 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
             model_aliases: HashMap::new(),
             model_defaults: ModelSpec::default(),
             model_specs: HashMap::from([
+                ("claude-fable-5-2".to_string(), claude_5_5_spec.clone()),
                 ("claude-sonnet-5-5".to_string(), claude_5_5_spec.clone()),
                 ("claude-haiku-5-5".to_string(), claude_5_5_spec),
                 (
@@ -1065,7 +1090,7 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
                     ModelSpec {
                         context_window: Some(1_000_000),
                         max_output_tokens: Some(128_000),
-                        effort_levels: ["low", "medium", "high", "max"]
+                        effort_levels: ["low", "medium", "high", "xhigh", "max"]
                             .into_iter()
                             .map(str::to_string)
                             .collect(),
@@ -1084,7 +1109,7 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
                     ModelSpec {
                         context_window: Some(1_000_000),
                         max_output_tokens: Some(128_000),
-                        effort_levels: ["low", "medium", "high", "max"]
+                        effort_levels: ["low", "medium", "high", "xhigh", "max"]
                             .into_iter()
                             .map(str::to_string)
                             .collect(),
@@ -1431,11 +1456,6 @@ pub(crate) fn normalize_provider_profile(mut profile: ProviderProfile) -> Option
         _ => None,
     };
 
-    let fallback_model = if profile.id == "local" {
-        DEFAULT_LOCAL_MODEL
-    } else {
-        "glm-5.2[1m]"
-    };
     profile.base_url = profile.base_url.trim().trim_end_matches('/').to_string();
     if profile.display_name.trim().is_empty() {
         profile.display_name = profile.id.clone();
@@ -1461,7 +1481,13 @@ pub(crate) fn normalize_provider_profile(mut profile: ProviderProfile) -> Option
     }
     profile.model_aliases = normalized_aliases;
     if profile.default_model.trim().is_empty() {
-        profile.default_model = fallback_model.to_string();
+        profile.default_model = match (request_contract_for_profile(&profile), profile.id.as_str())
+        {
+            (RequestContract::ChatGptResponses, _) => CHATGPT_DEFAULT_MODEL,
+            (_, "local") => DEFAULT_LOCAL_MODEL,
+            _ => "glm-5.2[1m]",
+        }
+        .to_string();
     }
     profile.default_model = normalize_provider_model_value(&profile, &profile.default_model);
     let mut seen_models = HashSet::new();
@@ -1557,22 +1583,73 @@ fn refresh_retired_builtin_pricing(provider_id: &str, model: &str, spec: &mut Mo
     }
 }
 
+fn is_retired_codex_model(model: &str) -> bool {
+    matches!(
+        normalize_chatgpt_model_slug(model).as_str(),
+        "gpt-5.4" | "gpt-5.4-mini" | "gpt-5.5" | "gpt-5.3-codex-spark"
+    )
+}
+
+fn discard_retired_codex_metadata(profile: &mut ProviderProfile) {
+    profile
+        .model_specs
+        .retain(|model, _| !is_retired_codex_model(model));
+    profile
+        .model_context_windows
+        .retain(|model, _| !is_retired_codex_model(model));
+    profile
+        .model_effort_levels
+        .retain(|model, _| !is_retired_codex_model(model));
+}
+
 fn merge_provider_profile_with_migrations(
     mut builtin: ProviderProfile,
     mut stored: ProviderProfile,
     refresh_retired_generated_prices: bool,
 ) -> ProviderProfile {
     let builtin_id = canonical_provider_id(&builtin.id);
-    let stored_default = stored.default_model.trim();
-    if !stored_default.is_empty() {
-        builtin.default_model = normalize_provider_model_value(&builtin, stored_default);
+    let codex = builtin_id == "chatgpt"
+        && stored
+            .request_contract
+            .unwrap_or(RequestContract::ChatGptResponses)
+            == RequestContract::ChatGptResponses;
+    if codex {
+        // A selection can migrate to a replacement; its model-specific limits and prices cannot.
+        discard_retired_codex_metadata(&mut stored);
+        stored.models.retain(|model| {
+            !is_retired_codex_model(model)
+                && !matches!(
+                    normalize_chatgpt_model_slug(model).as_str(),
+                    "gpt-5.3-codex"
+                        | "gpt-5-codex"
+                        | "gpt-5"
+                        | "gpt-5-mini"
+                        | "gpt-4.1"
+                        | "gpt-4o"
+                        | "gpt-4o-mini"
+                        | "o3"
+                        | "o3-mini"
+                        | "o4-mini"
+                )
+        });
+        // A saved default is a selection, not a picker entry. Only the two
+        // documented replacement aliases migrate it; other explicit choices stay.
     }
     if let Some(contract) = stored.request_contract {
         builtin.request_contract = Some(contract);
         builtin.api_provider = contract.api_provider();
     }
+    if builtin_id == "chatgpt" && !codex {
+        builtin
+            .model_aliases
+            .retain(|model, _| !is_retired_codex_model(model));
+    }
     for (alias, target) in stored.model_aliases {
         builtin.model_aliases.insert(alias, target);
+    }
+    let stored_default = stored.default_model.trim();
+    if !stored_default.is_empty() {
+        builtin.default_model = normalize_provider_model_value(&builtin, stored_default);
     }
     let entries = std::mem::take(&mut stored.model_specs);
     for (model, spec) in ordered_model_entries(&builtin, entries) {
@@ -1773,6 +1850,11 @@ pub(crate) fn normalize_provider_catalog(mut catalog: ProviderCatalog) -> Result
             profile.model_aliases.clear();
             profile.model_defaults = ModelSpec::default();
             profile.model_specs.clear();
+        }
+        if canonical_provider_id(&profile.id) == "chatgpt"
+            && request_contract_for_profile(&profile) == RequestContract::ChatGptResponses
+        {
+            discard_retired_codex_metadata(&mut profile);
         }
         if let Some(profile) = normalize_provider_profile(profile) {
             stored_by_id.insert(canonical_provider_id(&profile.id), profile);
@@ -2603,17 +2685,30 @@ pub(crate) fn is_gpt_5_6_model(model: &str) -> bool {
     )
 }
 
+fn is_gpt_6_2_model(model: &str) -> bool {
+    matches!(
+        model.trim().to_ascii_lowercase().as_str(),
+        "gpt-6.2-astra" | "gpt-6.2-sol"
+    )
+}
+
 pub(crate) fn is_gpt_6_model(model: &str) -> bool {
     matches!(
         model.trim().to_ascii_lowercase().as_str(),
-        "gpt-6.1-sol" | "gpt-6.1-terra" | "gpt-6-astra" | "gpt-6-sol" | "gpt-6-luna"
+        "gpt-6.2-astra"
+            | "gpt-6.2-sol"
+            | "gpt-6.1-sol"
+            | "gpt-6.1-terra"
+            | "gpt-6-astra"
+            | "gpt-6-sol"
+            | "gpt-6-luna"
     )
 }
 
 pub(crate) fn is_gpt_6_responses_tools_only_model(model: &str) -> bool {
     matches!(
         model.trim().to_ascii_lowercase().as_str(),
-        "gpt-6.1-sol" | "gpt-6.1-terra"
+        "gpt-6.2-astra" | "gpt-6.2-sol" | "gpt-6.1-sol" | "gpt-6.1-terra" | "gpt-6-astra"
     )
 }
 
@@ -3050,15 +3145,17 @@ impl ProviderRequestBody {
     }
 }
 
+const CHATGPT_DEFAULT_MODEL: &str = "gpt-6.2-sol";
+
 pub(crate) fn normalize_chatgpt_model_slug(model: &str) -> String {
     let trimmed = model.trim();
     if trimmed.is_empty() {
-        return "gpt-5.4".to_string();
+        return CHATGPT_DEFAULT_MODEL.to_string();
     }
 
     let canonical = trimmed.to_ascii_lowercase().replace(['_', ' '], "-");
     if canonical == "auto" {
-        return "gpt-5.4".to_string();
+        return CHATGPT_DEFAULT_MODEL.to_string();
     }
 
     let compact: String = canonical
@@ -3075,6 +3172,8 @@ pub(crate) fn normalize_chatgpt_model_slug(model: &str) -> String {
         "gpt56" | "gpt56sol" => "gpt-5.6-sol".to_string(),
         "gpt56terra" => "gpt-5.6-terra".to_string(),
         "gpt56luna" => "gpt-5.6-luna".to_string(),
+        "gpt62astra" => "gpt-6.2-astra".to_string(),
+        "gpt62sol" => "gpt-6.2-sol".to_string(),
         "gpt61sol" => "gpt-6.1-sol".to_string(),
         "gpt61terra" => "gpt-6.1-terra".to_string(),
         "gpt6astra" => "gpt-6-astra".to_string(),
@@ -3209,12 +3308,28 @@ pub(crate) fn build_openai_responses_request(
         "model": model.trim(),
         "store": false,
         "stream": true,
-        "instructions": system_text,
         "input": input,
         "max_output_tokens": max_output_tokens,
         "text": { "verbosity": "medium" },
         "prompt_cache_key": prompt_cache_key,
     });
+    if is_gpt_6_2_model(model) {
+        if !system_text.is_empty() {
+            // GPT-6.2 appends top-level instructions after input, outside the stable prefix.
+            body["input"]
+                .as_array_mut()
+                .expect("Responses input is an array")
+                .insert(
+                    0,
+                    json!({
+                        "type": "message", "role": "developer",
+                        "content": [{ "type": "input_text", "text": system_text }],
+                    }),
+                );
+        }
+    } else {
+        body["instructions"] = json!(system_text);
+    }
     if let Some(reasoning) = reasoning {
         body["reasoning"] = json!({
             "effort": reasoning.effort,
